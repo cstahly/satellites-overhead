@@ -10,6 +10,8 @@ os.makedirs(NOAADIR, exist_ok=True)
 
 LOG = os.path.join(HOME, "sdr_scheduler.log")
 PREDICTOR = os.path.join(HOME, "src", "satellites-overhead", "predict.py")
+MONITOR_SCRIPT = os.path.join(HOME, "src", "satellites-overhead", "monitor_capture.py")
+REPO_DIR = os.path.join(HOME, "src", "satellites-overhead")
 RULES_PATH = os.path.join(HOME, "sdr_scheduler_rules.json")
 COMMANDS_PATH = os.path.join(HOME, "sdr_scheduler_commands.json")
 STATUS_PATH = os.path.join(HOME, "sdr_scheduler_status.json")
@@ -19,6 +21,16 @@ LON = -86.88
 ALT_M = 180
 RELOAD_INTERVAL_S = 60
 POLL_INTERVAL_S = 10
+MONITOR_DELAY_S = 90
+
+# Retry variants tried in order when deframer NOSYNC with good signal.
+# First entry is the default; each subsequent entry is tried after a kill.
+LRPT_RETRY_VARIANTS = [
+    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt"},
+    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt"},
+    {"iq_swap": True,  "samplerate": "2e6",  "pipeline": "meteor_m2-x_lrpt"},
+    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2_lrpt"},
+]
 
 def log(msg):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -169,6 +181,110 @@ def append_capture_record(record):
     atomic_write_json(HISTORY_PATH, history)
 
 
+def _invoke_claude_monitor(capdir, monitor_result):
+    """Spawn a claude --print agent to diagnose and act on a failed capture."""
+    status = monitor_result.get("status", "unknown")
+    report = os.path.join(capdir, "diagnostic_report.md")
+    claude_log = capdir + ".claude_monitor.log"
+    prompt = (
+        f"SDR capture monitor alert. Capture at {capdir} has status '{status}'. "
+        f"Diagnostic report: {report}. Log: {capdir}.log. "
+        f"Read CLAUDE.md at {REPO_DIR}/CLAUDE.md for full context. "
+        f"Diagnose the problem, take corrective action if possible (use the "
+        f"satellites-overhead-scheduler MCP to queue captures or adjust rules), "
+        f"and append your findings to the diagnostic report."
+    )
+    try:
+        with open(claude_log, "w") as lf:
+            subprocess.Popen(
+                ["claude", "--print", "-p", prompt],
+                cwd=REPO_DIR,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+            )
+        log(f"MONITOR Claude agent invoked for {os.path.basename(capdir)} — {claude_log}")
+    except Exception as e:
+        log(f"MONITOR Claude invoke FAIL — {e}")
+
+
+def _queue_monitor_retry(orig_kwargs, variant, retry_idx):
+    """Queue a retry scan-now command with the given variant settings."""
+    norad = orig_kwargs.get("_norad")
+    name = orig_kwargs.get("_name") or orig_kwargs.get("label", "unknown")
+    freq = orig_kwargs.get("freq") or orig_kwargs.get("freq_hz") or 137_100_000
+    lna = orig_kwargs.get("lna", 16)
+    vga = orig_kwargs.get("vga", 36)
+    amp = orig_kwargs.get("amp", 1)
+    duration_s = orig_kwargs.get("duration_s", 300)
+    command = {
+        "id": f"scan-retry-{norad or 'x'}-{int(time.time())}",
+        "type": "scan_now",
+        "queued_at": utc_now_iso(),
+        "name": name,
+        "norad": norad,
+        "group": "radio",
+        "profile": "meteor_lrpt_hackrf",
+        "frequency_hz": int(float(freq)),
+        "lna_gain": lna,
+        "vga_gain": vga,
+        "amp": amp,
+        "duration_s": duration_s,
+        "samplerate": variant["samplerate"],
+        "iq_swap": variant["iq_swap"],
+        "pipeline": variant["pipeline"],
+        "_retry_idx": retry_idx,
+        "source": "monitor_retry",
+    }
+    cmds = load_command_queue()
+    cmds.append(command)
+    write_command_queue(cmds)
+    log(f"MONITOR retry {retry_idx + 1}/{len(LRPT_RETRY_VARIANTS)}: "
+        f"iq_swap={variant['iq_swap']} samplerate={variant['samplerate']} "
+        f"pipeline={variant['pipeline']}")
+
+
+def _monitor_satdump(capdir, kwargs):
+    """Background thread: check capture health at T+90s, kill/retry/escalate."""
+    time.sleep(MONITOR_DELAY_S)
+    if not os.path.exists(capdir + ".pid"):
+        return  # capture already finished before we woke up
+    try:
+        raw = subprocess.check_output(
+            ["python3", MONITOR_SCRIPT, capdir],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        result = json.loads(raw)
+    except subprocess.CalledProcessError as e:
+        # exit code 1 means intervention taken — output still has JSON
+        try:
+            result = json.loads(e.output)
+        except Exception:
+            log(f"MONITOR parse FAIL {os.path.basename(capdir)}")
+            return
+    except Exception as e:
+        log(f"MONITOR FAIL {os.path.basename(capdir)} — {e}")
+        return
+
+    status = result.get("status", "unknown")
+    log(f"MONITOR {os.path.basename(capdir)} — {status}: {str(result.get('notes', ''))[:100]}")
+
+    if status == "synced":
+        return  # healthy, nothing to do
+
+    retry_idx = int(kwargs.get("_retry_idx") or 0)
+
+    if result.get("killed_pid"):
+        next_idx = retry_idx + 1
+        if next_idx < len(LRPT_RETRY_VARIANTS):
+            _queue_monitor_retry(kwargs, LRPT_RETRY_VARIANTS[next_idx], next_idx)
+        else:
+            log(f"MONITOR all {len(LRPT_RETRY_VARIANTS)} variants exhausted — escalating")
+            _invoke_claude_monitor(capdir, result)
+    elif status not in ("no_signal", "no_log", "synced"):
+        # Monitor couldn't kill (pid gone) but something is wrong — escalate
+        _invoke_claude_monitor(capdir, result)
+
+
 def load_command_queue():
     if not os.path.exists(COMMANDS_PATH):
         return []
@@ -285,13 +401,18 @@ def build_scan_now_job(command):
     label = f"{name} scan now"
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     slug = safe_name(name)
+    samplerate = str(command.get("samplerate") or LRPT_RETRY_VARIANTS[0]["samplerate"])
+    iq_swap = bool(command.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"]))
+    pipeline = str(command.get("pipeline") or LRPT_RETRY_VARIANTS[0]["pipeline"])
+    retry_idx = int(command.get("_retry_idx") or 0)
     common = {
         "_command_id": command_id,
         "_queued_at": command.get("queued_at"),
         "_norad": int(command["norad"]) if command.get("norad") else None,
         "_name": name,
         "_profile": profile,
-        "_source": "scan_now",
+        "_source": str(command.get("source", "scan_now")),
+        "_retry_idx": retry_idx,
         "duration_s": duration_s,
         "lna": lna,
         "vga": vga,
@@ -306,6 +427,9 @@ def build_scan_now_job(command):
                 **common,
                 "capdir": f"{NOAADIR}/{slug}_{stamp}",
                 "freq": frequency_hz,
+                "samplerate": samplerate,
+                "iq_swap": iq_swap,
+                "pipeline": pipeline,
             },
         )
     return (
@@ -376,8 +500,13 @@ def jobs_signature(jobs):
 
 def run_job(ptype, kwargs):
     run_kwargs = dict(kwargs)
-    for key in ("_command_id", "_queued_at", "_norad", "_name", "_profile", "_source", "_max_el"):
+    for key in ("_command_id", "_queued_at", "_norad", "_name", "_profile", "_source", "_max_el", "_retry_idx"):
         run_kwargs.pop(key, None)
+    if ptype == "satdump":
+        capdir = run_kwargs.get("capdir")
+        if capdir and os.path.exists(MONITOR_SCRIPT):
+            t = threading.Thread(target=_monitor_satdump, args=(capdir, kwargs), daemon=True)
+            t.start()
     if ptype == "iq":
         outfile = hackrf_capture(**run_kwargs)
         if outfile:
@@ -472,6 +601,7 @@ def scheduler_loop():
                     "max_el": kwargs.get("_max_el"),
                     "label": kwargs.get("label", ""),
                     "command_id": kwargs.get("_command_id"),
+                    "retry_idx": kwargs.get("_retry_idx"),
                     "started_at": started_at,
                     "ended_at": ended_at,
                     "output": output,
