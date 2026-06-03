@@ -312,6 +312,21 @@ fn cmd_status(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> 
             let amp = job.get("amp").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
             println!("  Job        {}{}", bold(label), freq_str);
             println!("  Gains      LNA={}  VGA={}  amp={}", lna, vga, amp);
+            if let Some(fire) = job.get("fire_time").and_then(|v| v.as_str()) {
+                if let Some(dur) = job.get("duration_s").and_then(|v| v.as_f64()) {
+                    if let Some(start) = parse_dt(fire) {
+                        let end = start + Duration::seconds(dur as i64);
+                        let end_local = end.with_timezone(&Local).format("%H:%M:%S").to_string();
+                        let remaining = (end - Utc::now()).num_seconds();
+                        let rem_str = if remaining > 0 {
+                            cyan(&format!("{} remaining", fmt_dur(remaining as f64)))
+                        } else {
+                            dim("finishing...")
+                        };
+                        println!("  Runs until {}  {}", bold(&end_local), rem_str);
+                    }
+                }
+            }
             if !out.is_empty() {
                 let log_path = format!("{}.log", out);
                 println!("  Log        {}", dim(&log_path));
