@@ -176,6 +176,7 @@
           <select id="schedProfile">
             <option value="meteor_lrpt_hackrf" selected>Meteor LRPT</option>
             <option value="raw_iq_hackrf">Raw IQ</option>
+            <option value="satdump_hackrf">SatDump (other)</option>
           </select>
         </label>
         <label class="minel">capture band
@@ -808,6 +809,7 @@ function renderRules(rules){
       <td><select class="rule-select ruleProfile">
         <option value="meteor_lrpt_hackrf" ${rule.profile === 'meteor_lrpt_hackrf' ? 'selected' : ''}>Meteor LRPT</option>
         <option value="raw_iq_hackrf" ${rule.profile === 'raw_iq_hackrf' ? 'selected' : ''}>Raw IQ</option>
+        <option value="satdump_hackrf" ${rule.profile === 'satdump_hackrf' ? 'selected' : ''}>SatDump (other)</option>
       </select></td>
       <td class="num"><input class="rule-input ruleFreq" type="number" step="0.001" value="${mhz}"></td>
       <td class="num"><input class="rule-input ruleLna" type="number" step="1" min="0" max="40" value="${lna}"></td>
