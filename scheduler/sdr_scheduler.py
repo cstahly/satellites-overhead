@@ -209,6 +209,8 @@ def build_rule_jobs(rule, hours=24, limit=4):
         lna = int(rule.get("lna_gain", 32))
         vga = int(rule.get("vga_gain", 48))
         amp = int(rule.get("amp", 1))
+        if float(p.get("max_el", 0)) >= 60:
+            vga = max(0, vga - 12)
         aos_local = fire_time.replace(":", "")
         duration_s = max(1, int(p["duration_s"]) - start_offset_s + end_offset_s)
         freq = float(rule["frequency_hz"])
@@ -334,7 +336,10 @@ def job_fire_dt(fire_time):
     now = datetime.datetime.now().astimezone()
     h, m = map(int, str(fire_time).split(":"))
     target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    if target <= now:
+    # Only wrap to tomorrow if we're more than 90s past the fire minute.
+    # Without this, a poll landing at HH:MM:00.xxx would wrongly push the
+    # job to the next day because target (HH:MM:00.000) <= now.
+    if target + datetime.timedelta(seconds=90) < now:
         target += datetime.timedelta(days=1)
     return target
 
