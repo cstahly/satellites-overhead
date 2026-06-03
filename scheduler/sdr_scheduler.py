@@ -13,6 +13,7 @@ PREDICTOR = os.path.join(HOME, "src", "satellites-overhead", "predict.py")
 RULES_PATH = os.path.join(HOME, "sdr_scheduler_rules.json")
 COMMANDS_PATH = os.path.join(HOME, "sdr_scheduler_commands.json")
 STATUS_PATH = os.path.join(HOME, "sdr_scheduler_status.json")
+HISTORY_PATH = os.path.join(HOME, "sdr_capture_history.json")
 LAT = 40.42
 LON = -86.88
 ALT_M = 180
@@ -142,6 +143,20 @@ def write_scheduler_status(state, current_job=None, message=""):
         log(f"STATUS WRITE FAIL — {e}")
 
 
+def append_capture_record(record):
+    history = []
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH, encoding="utf-8") as f:
+                history = json.load(f)
+            if not isinstance(history, list):
+                history = []
+        except Exception:
+            history = []
+    history.append(record)
+    atomic_write_json(HISTORY_PATH, history)
+
+
 def load_command_queue():
     if not os.path.exists(COMMANDS_PATH):
         return []
@@ -199,6 +214,12 @@ def build_rule_jobs(rule, hours=24, limit=4):
         freq = float(rule["frequency_hz"])
         label = f"{rule.get('name', p['name'])} {float(p['max_el']):.1f}deg"
         slug = safe_name(rule.get("name") or p["name"])
+        meta = dict(
+            _norad=int(rule["norad"]),
+            _name=rule.get("name") or p["name"],
+            _profile=rule.get("profile", "raw_iq_hackrf"),
+            _source="rule",
+        )
         if rule.get("profile") == "meteor_lrpt_hackrf":
             jobs.append((
                 fire_time,
@@ -211,6 +232,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     vga=vga,
                     amp=amp,
                     label=f"{label} LRPT",
+                    **meta,
                 ),
             ))
         else:
@@ -225,6 +247,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     amp=amp,
                     outfile=f"{CAPDIR}/{slug}_{aos_local}.iq",
                     label=f"{label} IQ",
+                    **meta,
                 ),
             ))
     return jobs
@@ -247,6 +270,10 @@ def build_scan_now_job(command):
     common = {
         "_command_id": command_id,
         "_queued_at": command.get("queued_at"),
+        "_norad": int(command["norad"]) if command.get("norad") else None,
+        "_name": name,
+        "_profile": profile,
+        "_source": "scan_now",
         "duration_s": duration_s,
         "lna": lna,
         "vga": vga,
@@ -328,8 +355,8 @@ def jobs_signature(jobs):
 
 def run_job(ptype, kwargs):
     run_kwargs = dict(kwargs)
-    run_kwargs.pop("_command_id", None)
-    run_kwargs.pop("_queued_at", None)
+    for key in ("_command_id", "_queued_at", "_norad", "_name", "_profile", "_source"):
+        run_kwargs.pop(key, None)
     if ptype == "iq":
         outfile = hackrf_capture(**run_kwargs)
         if outfile:
@@ -388,10 +415,48 @@ def scheduler_loop():
                 remove_command(command_id)
             write_scheduler_status("running", status_job_payload(fire_time, ptype, kwargs), "capture running")
             log(f"Running: {kwargs['label']} scheduled for {job_time_label(fire_time)}")
+            started_at = utc_now_iso()
             try:
                 run_job(ptype, kwargs)
             finally:
+                ended_at = utc_now_iso()
                 write_scheduler_status("idle", message="last capture finished")
+                output = kwargs.get("outfile") or kwargs.get("capdir")
+                size_bytes = 0
+                cadu_bytes = None
+                if output and os.path.exists(output):
+                    if os.path.isdir(output):
+                        cadu = os.path.join(output, "meteor_m2-x_lrpt.cadu")
+                        cadu_bytes = os.path.getsize(cadu) if os.path.exists(cadu) else 0
+                        size_bytes = sum(
+                            os.path.getsize(os.path.join(dp, fn))
+                            for dp, _, fns in os.walk(output) for fn in fns
+                        )
+                    else:
+                        size_bytes = os.path.getsize(output)
+                record = {
+                    "id": str(uuid.uuid4()),
+                    "norad": kwargs.get("_norad"),
+                    "name": kwargs.get("_name") or kwargs.get("label", ""),
+                    "profile": kwargs.get("_profile") or ptype,
+                    "source": kwargs.get("_source", "manual"),
+                    "frequency_hz": kwargs.get("freq_hz") or kwargs.get("freq"),
+                    "lna_gain": kwargs.get("lna"),
+                    "vga_gain": kwargs.get("vga"),
+                    "amp": kwargs.get("amp"),
+                    "label": kwargs.get("label", ""),
+                    "command_id": kwargs.get("_command_id"),
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "output": output,
+                    "output_type": "directory" if (output and os.path.isdir(output)) else "file",
+                    "size_bytes": size_bytes,
+                    "cadu_bytes": cadu_bytes,
+                }
+                try:
+                    append_capture_record(record)
+                except Exception as e:
+                    log(f"HISTORY WRITE FAIL — {e}")
             next_reload = 0.0
             continue
 

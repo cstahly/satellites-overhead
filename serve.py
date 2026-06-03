@@ -14,6 +14,7 @@ import json
 import os
 import socketserver
 import sys
+import tarfile
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ SAT_CACHE_DIR = os.path.join(ROOT, ".satcache")
 RULES_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_rules.json")
 COMMANDS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_commands.json")
 STATUS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_status.json")
+HISTORY_PATH = os.path.join(os.path.expanduser("~"), "sdr_capture_history.json")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 TX_TTL = 7 * 24 * 3600
 
@@ -181,6 +183,27 @@ def scheduler_status():
         "commands_path": COMMANDS_PATH,
         "status_path": STATUS_PATH,
     }
+
+
+def read_captures(norad=None):
+    if not os.path.exists(HISTORY_PATH):
+        return []
+    with open(HISTORY_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        return []
+    if norad is not None:
+        data = [r for r in data if r.get("norad") == norad]
+    return sorted(data, key=lambda r: r.get("started_at", ""), reverse=True)
+
+
+def safe_output_path(output):
+    """Return resolved path only if it's safely under HOME."""
+    home = os.path.expanduser("~")
+    resolved = os.path.realpath(output)
+    if resolved.startswith(home + os.sep) or resolved == home:
+        return resolved
+    return None
 
 
 def validate_rule(rule):
@@ -545,6 +568,64 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             write_json(self, 200, data)
             sys.stderr.write(f"[satellite] {norad}: {source}\n")
+            return
+        if parsed.path == "/captures":
+            qs = parse_qs(parsed.query)
+            norad_str = first_value(qs, "norad")
+            try:
+                norad = int(norad_str) if norad_str else None
+                data = read_captures(norad)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"could not read capture history: {e}")
+                return
+            write_json(self, 200, data)
+            return
+        if parsed.path.startswith("/captures/") and parsed.path.endswith("/download"):
+            capture_id = parsed.path[len("/captures/"):-len("/download")]
+            try:
+                all_captures = read_captures()
+                record = next((r for r in all_captures if r.get("id") == capture_id), None)
+                if record is None:
+                    self.send_error(404, "capture not found")
+                    return
+                output = record.get("output")
+                if not output:
+                    self.send_error(404, "capture has no output path")
+                    return
+                safe = safe_output_path(output)
+                if not safe or not os.path.exists(safe):
+                    self.send_error(404, "capture output not found on disk")
+                    return
+                basename = os.path.basename(safe.rstrip("/"))
+                if os.path.isdir(safe):
+                    filename = f"{basename}.tar.gz"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/gzip")
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.end_headers()
+                    with tarfile.open(fileobj=self.wfile, mode="w|gz") as tar:
+                        tar.add(safe, arcname=basename)
+                else:
+                    size = os.path.getsize(safe)
+                    filename = basename
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.send_header("Content-Length", str(size))
+                    self.end_headers()
+                    with open(safe, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+            except BrokenPipeError:
+                pass
+            except Exception as e:
+                sys.stderr.write(f"[captures/download] error: {e}\n")
             return
         super().do_GET()
 

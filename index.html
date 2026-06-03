@@ -636,6 +636,7 @@ function updateCountdowns(){
 
 function fmtMhz(hz){ return hz ? (Number(hz)/1e6).toFixed(6).replace(/0+$/,'').replace(/\.$/,'') + ' MHz' : '—'; }
 function fmtDate(value){ return value ? new Date(value).toLocaleString() : '—'; }
+function fmtBytes(n){ if(!n) return '0 B'; const u=['B','KB','MB','GB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(i?1:0)+' '+u[i]; }
 function satelliteImageUrl(details){
   if(!details || !details.image) return '';
   return details.image.startsWith('http') ? details.image : `https://db.satnogs.org/media/${details.image}`;
@@ -659,14 +660,34 @@ function renderTransmittersTable(txs){
     </tr>`).join('')}
   </tbody></table></div>`;
 }
+function renderCapturesSection(captures){
+  const label = '<h3 style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:14px 0 6px;">Captures</h3>';
+  if(!captures || !captures.length) return label + '<div style="color:var(--muted);font-size:13px;padding-bottom:4px;">No captures recorded yet.</div>';
+  const rows = captures.map(c => {
+    const started = c.started_at ? new Date(c.started_at).toLocaleString() : '—';
+    const dur = (c.started_at && c.ended_at) ? fmtDur(new Date(c.ended_at)-new Date(c.started_at)) : '—';
+    const size = fmtBytes(c.size_bytes);
+    const cadu = c.cadu_bytes != null ? ` · ${fmtBytes(c.cadu_bytes)} CADU` : '';
+    const profile = c.profile || c.label || '—';
+    return `<tr>
+      <td style="font-size:12px;">${escapeHtml(started)}</td>
+      <td style="font-size:12px;">${escapeHtml(profile)}</td>
+      <td class="num" style="font-size:12px;">${escapeHtml(dur)}</td>
+      <td class="num" style="font-size:12px;">${escapeHtml(size)}${escapeHtml(cadu)}</td>
+      <td><a href="/captures/${encodeURIComponent(c.id)}/download" download><button class="mini">↓</button></a></td>
+    </tr>`;
+  }).join('');
+  return label + `<div class="tx-list"><table><thead><tr><th>Time</th><th>Profile</th><th>Duration</th><th>Size</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
 async function openSatelliteDetails(pass){
   if(!pass) return;
   $('#detailModal').classList.add('open');
   $('#detailTitle').textContent = pass.name;
   $('#detailBody').innerHTML = `<div style="color:var(--muted)">Loading satellite details…</div>`;
-  const [details] = await Promise.all([
+  const [details, , captures] = await Promise.all([
     fetchSatelliteDetails(pass.norad),
     fetchTransmitters(pass.norad),
+    fetch(`/captures?norad=${encodeURIComponent(pass.norad)}`).then(r => r.ok ? r.json() : []).catch(() => []),
   ]);
   const txs = passTransmitters(pass) || [];
   const img = satelliteImageUrl(details);
@@ -697,6 +718,7 @@ async function openSatelliteDetails(pass){
         <div><span>Equipment bands</span>${escapeHtml(bands)}</div>
       </div>
       ${renderTransmittersTable(txs)}
+      ${renderCapturesSection(captures)}
     </div>`;
 }
 function closeDetails(){ $('#detailModal').classList.remove('open'); }
