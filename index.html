@@ -231,10 +231,16 @@ function transmitterBands(txs){
   }
   return [...bands];
 }
-function passTransmitters(pass){ return state.transmitters[pass.norad]; }
+function passTransmitterState(pass){ return state.transmitters[pass.norad]; }
+function passTransmitters(pass){
+  const entry = passTransmitterState(pass);
+  return entry && entry.status === 'loaded' ? entry.data : null;
+}
 function passBands(pass){
-  const txs = passTransmitters(pass);
-  if(!txs) return ['loading'];
+  const entry = passTransmitterState(pass);
+  if(!entry || entry.status === 'loading') return ['loading'];
+  if(entry.status === 'error') return ['unknown'];
+  const txs = entry.data;
   const bands = transmitterBands(txs);
   return bands.length ? bands : ['unknown'];
 }
@@ -243,6 +249,7 @@ function bandMatches(pass){
   const bands = passBands(pass);
   return bands.includes('loading') || bands.includes(state.bandFilter);
 }
+function bandLabel(band){ return band === 'loading' ? 'checking transmitters' : (bandProfiles[band]?.label || band); }
 function applyBandDefaults(){
   const cfg = bandProfiles[state.bandFilter];
   if(!cfg) return;
@@ -250,20 +257,20 @@ function applyBandDefaults(){
   $('#schedFreq').value = cfg.freq.toFixed(3);
 }
 async function fetchTransmitters(norad){
-  if(!norad || state.transmitters[norad]) return;
-  state.transmitters[norad] = [];
+  if(!norad || state.transmitters[norad]?.status === 'loaded' || state.transmitters[norad]?.status === 'loading') return;
+  state.transmitters[norad] = {status: 'loading', data: []};
   try {
     const res = await fetch(`/transmitters?norad=${encodeURIComponent(norad)}`);
     if(!res.ok) throw new Error(`HTTP ${res.status}`);
-    state.transmitters[norad] = await res.json();
+    state.transmitters[norad] = {status: 'loaded', data: await res.json()};
   } catch(_){
-    state.transmitters[norad] = [];
+    state.transmitters[norad] = {status: 'error', data: []};
   }
+  renderPasses();
 }
 async function loadTransmittersForPasses(passes){
   const ids = [...new Set((passes || []).map(p => p.norad).filter(Boolean))];
-  await Promise.all(ids.map(fetchTransmitters));
-  renderPasses();
+  for(const id of ids) fetchTransmitters(id);
 }
 function filterTleText(text, group){
   if(group !== 'radio') return text;
@@ -521,7 +528,7 @@ function renderPasses(){
   tb.innerHTML = filtered.map(({p,i}) => {
     const cls = p.maxEl>=45?'high':p.maxEl>=20?'mid':'low';
     const rule = trackedRuleFor(p);
-    const band = passBands(p).map(b => bandProfiles[b]?.label || b).join(', ');
+    const band = passBands(p).map(bandLabel).join(', ');
     const buttonClass = rule ? 'mini schedulePass engaged' : 'mini schedulePass';
     const buttonText = rule ? 'Engaged' : 'Track';
     return `<tr data-i="${i}"><td>${escapeHtml(p.name)}</td>
