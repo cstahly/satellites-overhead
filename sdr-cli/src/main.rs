@@ -502,11 +502,19 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
         let id = r["id"].as_str().unwrap_or("—");
         let enabled = if r["enabled"].as_bool().unwrap_or(false) { green("yes") } else { red("no") };
         let freq = r["frequency_hz"].as_f64().map(|f| format!("{:.3}", f / 1e6)).unwrap_or_else(|| "—".to_string());
+        let profile_short = match r["profile"].as_str().unwrap_or("—") {
+            "meteor_lrpt_hackrf" => "lrpt",
+            "raw_iq_hackrf"      => "raw_iq",
+            "satdump_hackrf"     => "satdump",
+            other                => other,
+        }.to_string();
+        let gains = format!("L{}/V{}/A{}",
+            r["lna_gain"].as_i64().unwrap_or(0),
+            r["vga_gain"].as_i64().unwrap_or(0),
+            r["amp"].as_i64().unwrap_or(0));
         let (fire_str, end_str) = if let Some(run) = next_by_rule.get(id) {
             let fire = run["fire_time"].as_str().map(|s| {
-                let local = fmt_local(s);
-                let until = time_until(s);
-                format!("{} {}", local, until)
+                format!("{} {}", fmt_local(s), time_until(s))
             }).unwrap_or_else(|| "—".to_string());
             let end = run["end_time"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
             (fire, end)
@@ -517,13 +525,14 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
             r["name"].as_str().unwrap_or("—").to_string(),
             enabled,
             freq,
-            r["profile"].as_str().unwrap_or("—").to_string(),
+            profile_short,
+            gains,
             format!("{}°", r["min_peak_el"].as_f64().unwrap_or(0.0)),
             fire_str,
             end_str,
         ]
     }).collect();
-    print_table(&["Satellite", "On", "MHz", "Profile", "Min El", "Next fire", "Window end"], &rows);
+    print_table(&["Satellite", "On", "MHz", "Profile", "Gains", "El", "Next fire", "Window end"], &rows);
     println!();
     Ok(())
 }
