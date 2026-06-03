@@ -54,17 +54,19 @@ records from SatNOGS DB, cached under `.txcache/`; satellites without
 transmitter data stay unknown instead of being guessed from their names.
 
 The web UI can also save persistent SDR scheduler rules through the local
-server. Run `python3 serve.py`, predict passes, choose a profile/frequency, and
-click `Track` on a pass. A tracked satellite shows `Engaged`; click it again to
-remove the saved rule. Rules are stored at `~/sdr_scheduler_rules.json`; the
+server. Run `python3 serve.py`, predict passes, choose a capture mode/frequency,
+and click `Track` on a pass. A tracked satellite shows `Engaged`; click it again
+to remove the saved rule. Rules are stored at `~/sdr_scheduler_rules.json`; the
 scheduler reads that file directly, so it does not depend on the web server
-staying online after the rule is saved.
+staying online after the rule is saved. In saved JSON, the capture mode is still
+stored as `profile` for scheduler compatibility.
 
 The Scheduler rules table shows all current rules and lets you edit enabled
-state, profile, frequency, and minimum elevation inline. Clicking an upcoming
-pass row opens satellite details from SatNOGS DB, including image, status,
-launch/country/operator metadata, next pass summary, and active transmitter
-records. Satellite metadata is cached under `.satcache/`.
+state, capture mode, frequency, and minimum elevation inline. Clicking an
+upcoming pass or overhead-now row opens satellite details from SatNOGS DB,
+including image when available, status, launch/country/operator metadata, pass
+summary, and active transmitter records. Satellite metadata is cached under
+`.satcache/`.
 
 ## How it works
 

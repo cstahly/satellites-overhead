@@ -157,7 +157,7 @@
             <option value="40">40°</option>
           </select>
         </label>
-        <label class="minel">profile
+        <label class="minel">capture
           <select id="schedProfile">
             <option value="meteor_lrpt_hackrf" selected>Meteor LRPT</option>
             <option value="raw_iq_hackrf">Raw IQ</option>
@@ -204,7 +204,7 @@
       <div class="scroll" style="max-height:240px">
         <table id="rulesTbl">
           <thead><tr>
-            <th>Target</th><th>Profile</th><th class="num">MHz</th><th class="num">Min el</th><th>Enabled</th><th></th>
+            <th>Target</th><th>Capture</th><th class="num">MHz</th><th class="num">Min el</th><th>Enabled</th><th></th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -229,7 +229,7 @@ const state = {
   observer: null, group: 'radio', minEl: 10, count: 0,
   sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
   overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '', bandFilter: 'all',
-  transmitters: {}, satellites: {}, autoPredictDone: false,
+  transmitters: {}, txPromises: {}, satellites: {}, autoPredictDone: false,
 };
 const $ = (s) => document.querySelector(s);
 const statusEl = $('#status');
@@ -283,16 +283,26 @@ function applyBandDefaults(){
   $('#schedFreq').value = cfg.freq.toFixed(3);
 }
 async function fetchTransmitters(norad){
-  if(!norad || state.transmitters[norad]?.status === 'loaded' || state.transmitters[norad]?.status === 'loading') return;
+  if(!norad) return [];
+  if(state.transmitters[norad]?.status === 'loaded') return state.transmitters[norad].data;
+  if(state.txPromises[norad]) return state.txPromises[norad];
   state.transmitters[norad] = {status: 'loading', data: []};
-  try {
-    const res = await fetch(`/transmitters?norad=${encodeURIComponent(norad)}`);
-    if(!res.ok) throw new Error(`HTTP ${res.status}`);
-    state.transmitters[norad] = {status: 'loaded', data: await res.json()};
-  } catch(_){
-    state.transmitters[norad] = {status: 'error', data: []};
-  }
-  renderPasses();
+  state.txPromises[norad] = (async () => {
+    try {
+      const res = await fetch(`/transmitters?norad=${encodeURIComponent(norad)}`);
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      state.transmitters[norad] = {status: 'loaded', data};
+      return data;
+    } catch(_){
+      state.transmitters[norad] = {status: 'error', data: []};
+      return [];
+    } finally {
+      delete state.txPromises[norad];
+      renderPasses();
+    }
+  })();
+  return state.txPromises[norad];
 }
 async function loadTransmittersForPasses(passes){
   const ids = [...new Set((passes || []).map(p => p.norad).filter(Boolean))];
@@ -366,7 +376,7 @@ self.onmessage = (e) => {
       const r = lookAt(s.satrec, now, gmst);
       if(!r || r.el < m.minEl) continue;
       const geo = satellite.eciToGeodetic(r.eci, gmst);
-      out.push({ name: s.name, el: r.el, az: r.az, range: r.range, alt: geo.height, dir: ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'][Math.round(r.az/22.5)%16] });
+      out.push({ norad: s.norad, name: s.name, el: r.el, az: r.az, range: r.range, alt: geo.height, dir: ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'][Math.round(r.az/22.5)%16] });
     }
     self.postMessage({type:'live', list: out});
   }
@@ -522,8 +532,9 @@ function renderList(list){
   const filtered = list.filter(s => textMatch(s.name, state.overheadFilter));
   filtered.sort((a,b) => typeof a[k]==='string' ? d*a[k].localeCompare(b[k]) : d*(a[k]-b[k]));
   $('#tbl tbody').innerHTML = filtered.map(s => {
+    const i = list.indexOf(s);
     const cls = s.el>=45?'high':s.el>=20?'mid':'low';
-    return `<tr><td>${escapeHtml(s.name)}</td>
+    return `<tr class="row-click" data-i="${i}"><td>${escapeHtml(s.name)}</td>
       <td class="num"><span class="pill ${cls}">${s.el.toFixed(1)}°</span></td>
       <td class="num">${s.az.toFixed(0)}°</td><td>${s.dir}</td>
       <td class="num">${s.range.toFixed(0)}</td><td class="num">${s.alt.toFixed(0)}</td></tr>`;
@@ -599,6 +610,12 @@ function satelliteImageUrl(details){
   if(!details || !details.image) return '';
   return details.image.startsWith('http') ? details.image : `https://db.satnogs.org/media/${details.image}`;
 }
+function noImageCard(pass){
+  return `<div style="height:180px;border:1px solid var(--line);border-radius:8px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;color:var(--muted);background:var(--panel-2);">
+    <div>No image in SatNOGS DB</div>
+    <div style="font-size:12px;">NORAD ${escapeHtml(String(pass.norad || 'unknown'))}</div>
+  </div>`;
+}
 function detailsLink(norad){ return `https://db.satnogs.org/satellite/${encodeURIComponent(norad)}/`; }
 function renderTransmittersTable(txs){
   const rows = (txs || []).filter(txIsUsable).sort((a,b)=>txFrequency(a)-txFrequency(b)).slice(0,24);
@@ -624,10 +641,11 @@ async function openSatelliteDetails(pass){
   const txs = passTransmitters(pass) || [];
   const img = satelliteImageUrl(details);
   const bands = passBands(pass).map(bandLabel).join(', ');
+  const hasPassTimes = Number.isFinite(pass.start) && Number.isFinite(pass.end);
   $('#detailTitle').textContent = details.name || pass.name;
   $('#detailBody').innerHTML = `
     <div>
-      ${img ? `<img src="${escapeHtml(img)}" alt="${escapeHtml(details.name || pass.name)}">` : `<div style="height:180px;border:1px solid var(--line);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);background:var(--panel-2);">No image</div>`}
+      ${img ? `<img src="${escapeHtml(img)}" alt="${escapeHtml(details.name || pass.name)}">` : noImageCard(pass)}
       <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
         <a href="${detailsLink(pass.norad)}" target="_blank" rel="noopener"><button class="mini">SatNOGS DB</button></a>
         ${details.website ? `<a href="${escapeHtml(details.website)}" target="_blank" rel="noopener"><button class="mini">Website</button></a>` : ''}
@@ -641,11 +659,11 @@ async function openSatelliteDetails(pass){
         <div><span>Countries</span>${escapeHtml(details.countries || '—')}</div>
         <div><span>Operator</span>${escapeHtml(details.operator || '—')}</div>
         <div><span>Launched</span>${fmtDate(details.launched)}</div>
-        <div><span>Next AOS</span>${new Date(pass.start).toLocaleString()}</div>
-        <div><span>LOS</span>${new Date(pass.end).toLocaleString()}</div>
-        <div><span>Max elevation</span>${pass.maxEl.toFixed(1)}°</div>
-        <div><span>Path</span>${compass(pass.startAz)} → ${compass(pass.maxAz)}</div>
-        <div><span>Duration</span>${fmtDur(pass.end-pass.start)}</div>
+        <div><span>${hasPassTimes ? 'Next AOS' : 'Current elevation'}</span>${hasPassTimes ? new Date(pass.start).toLocaleString() : (Number.isFinite(pass.el) ? pass.el.toFixed(1) + '°' : '—')}</div>
+        <div><span>${hasPassTimes ? 'LOS' : 'Current azimuth'}</span>${hasPassTimes ? new Date(pass.end).toLocaleString() : (Number.isFinite(pass.az) ? pass.az.toFixed(0) + '° ' + (pass.dir || '') : '—')}</div>
+        <div><span>${hasPassTimes ? 'Max elevation' : 'Range'}</span>${hasPassTimes ? pass.maxEl.toFixed(1) + '°' : (Number.isFinite(pass.range) ? pass.range.toFixed(0) + ' km' : '—')}</div>
+        <div><span>${hasPassTimes ? 'Path' : 'Altitude'}</span>${hasPassTimes ? compass(pass.startAz) + ' → ' + compass(pass.maxAz) : (Number.isFinite(pass.alt) ? pass.alt.toFixed(0) + ' km' : '—')}</div>
+        <div><span>Duration</span>${hasPassTimes ? fmtDur(pass.end-pass.start) : 'currently overhead'}</div>
         <div><span>Equipment bands</span>${escapeHtml(bands)}</div>
       </div>
       ${renderTransmittersTable(txs)}
@@ -809,6 +827,10 @@ document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', 
   if(state.sortKey===k) state.sortDir*=-1; else { state.sortKey=k; state.sortDir=(k==='name')?1:-1; }
   requestLive();
 }));
+$('#tbl').addEventListener('click', e => {
+  const row = e.target.closest('tr[data-i]');
+  if(row) openSatelliteDetails(state.overhead[+row.dataset.i]);
+});
 $('#predictBtn').addEventListener('click', runPrediction);
 $('#passTbl').addEventListener('click', e => {
   const btn = e.target.closest('.schedulePass');
