@@ -27,7 +27,12 @@ RULES_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_rules.json")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 
 # Only allow the catalogs the app exposes (also prevents using us as an open proxy).
-ALLOWED = {"active", "visual", "stations", "starlink", "gps-ops", "science"}
+ALLOWED = {"active", "radio", "visual", "stations", "starlink", "gps-ops", "science"}
+RADIO_NAME_TERMS = (
+    "ISS", "METEOR", "NOAA", "FENGYUN", "METOP", "AQUA", "TERRA", "SUOMI",
+    "LANDSAT", "OKEAN", "SICH", "RESURS", "ELEKTRO", "GOES", "HAMSAT",
+    "AO-", "SO-", "FO-", "IO-", "RS-", "CAS-", "XW-", "TEVEL", "LILACSAT",
+)
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -114,8 +119,22 @@ def validate_rule(rule):
     return clean
 
 
+def filter_radio_tles(text):
+    out = []
+    tles = parse_tles(text)
+    for tle in tles:
+        name = tle.name.upper()
+        if any(term in name for term in RADIO_NAME_TERMS):
+            out.extend([tle.name, tle.line1, tle.line2])
+    return "\n".join(out) + ("\n" if out else "")
+
+
 def fetch_tle(group):
     """Return (text, source) where source describes cache freshness."""
+    if group == "radio":
+        text, source = fetch_tle("active")
+        return filter_radio_tles(text), source + "; radio subset"
+
     path = os.path.join(CACHE_DIR, group + ".tle")
     fresh = os.path.exists(path) and (time.time() - os.path.getmtime(path)) < TTL
     if fresh:

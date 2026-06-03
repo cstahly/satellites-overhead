@@ -72,7 +72,8 @@
     <div class="controls">
       <button id="locBtn" class="primary">Use my location</button>
       <select id="group" title="Satellite catalog">
-        <option value="active" selected>All active (max, ~11k)</option>
+        <option value="radio" selected>Brightest / radio targets</option>
+        <option value="active">All active (max, ~15k)</option>
         <option value="visual">Brightest (visual)</option>
         <option value="stations">Space stations</option>
         <option value="starlink">Starlink</option>
@@ -98,6 +99,7 @@
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
         <h2 style="margin:0"><span class="count" id="overheadCount">—</span> overhead now</h2>
         <div style="display:flex;align-items:center;gap:10px;">
+          <input id="overheadFilter" type="search" placeholder="Filter" title="Filter overhead list">
           <button id="overheadCsv" title="Download current list as CSV">⬇ CSV</button>
           <div style="color:var(--muted);font-size:12px" id="updated"></div>
         </div>
@@ -145,6 +147,7 @@
         <label class="minel">MHz
           <input id="schedFreq" type="number" step="0.001" value="137.100">
         </label>
+        <input id="passFilter" type="search" placeholder="Filter passes" title="Filter upcoming passes">
         <button id="passCsv" title="Download upcoming passes as CSV">⬇ CSV</button>
       </div>
       <div class="progress" id="prog"><div></div></div>
@@ -163,7 +166,10 @@
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
         <h2 style="margin:0">Scheduler rules</h2>
-        <button id="rulesRefresh" class="mini">Refresh</button>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <input id="rulesFilter" type="search" placeholder="Filter" title="Filter scheduler rules">
+          <button id="rulesRefresh" class="mini">Refresh</button>
+        </div>
       </div>
       <div id="ruleStatus" class="rule-status">Rules are saved on the local server for the SDR scheduler to read.</div>
       <div class="scroll" style="max-height:240px">
@@ -181,8 +187,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js"></script>
 <script>
 const state = {
-  observer: null, group: 'active', minEl: 10, count: 0,
+  observer: null, group: 'radio', minEl: 10, count: 0,
   sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
+  overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '',
 };
 const $ = (s) => document.querySelector(s);
 const statusEl = $('#status');
@@ -190,6 +197,18 @@ function setStatus(m, err=false){ statusEl.textContent = m; statusEl.className =
 const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
 const compass = (az) => dirs[Math.round(az/22.5) % 16];
 const escapeHtml = (s) => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const radioTerms = ['ISS','METEOR','NOAA','FENGYUN','METOP','AQUA','TERRA','SUOMI','LANDSAT','OKEAN','SICH','RESURS','ELEKTRO','GOES','HAMSAT','AO-','SO-','FO-','IO-','RS-','CAS-','XW-','TEVEL','LILACSAT'];
+const textMatch = (value, filter) => !filter || String(value || '').toLowerCase().includes(filter.toLowerCase());
+function filterTleText(text, group){
+  if(group !== 'radio') return text;
+  const lines = text.split(/\r?\n/).filter(l => l.length);
+  const out = [];
+  for(let i=0; i+2 < lines.length; i+=3){
+    const name = (lines[i] || '').toUpperCase();
+    if(radioTerms.some(term => name.includes(term))) out.push(lines[i], lines[i+1], lines[i+2]);
+  }
+  return out.join('\n') + (out.length ? '\n' : '');
+}
 
 // ---------- Web Worker (orbital math off the main thread) ----------
 const workerSrc = `
@@ -316,7 +335,6 @@ function onWorkerMessage(e){
     state.overhead = m.list;
     renderList(m.list);
     drawSky(m.list);
-    $('#overheadCount').textContent = m.list.length;
     $('#updated').textContent = 'updated ' + new Date().toLocaleTimeString();
   }
   else if(m.type === 'predictProgress'){
@@ -353,13 +371,14 @@ async function fetchTLEs(group){
   // Prefer the local caching proxy (serve.py); fall back to CelesTrak directly
   // if the app is opened as a static file without the proxy running.
   const viaProxy = location.protocol.startsWith('http');
+  const fetchGroup = (!viaProxy && group === 'radio') ? 'active' : group;
   const url = viaProxy
     ? `/tle?group=${encodeURIComponent(group)}`
-    : `https://celestrak.org/NORAD/elements/gp.php?GROUP=${encodeURIComponent(group)}&FORMAT=tle`;
+    : `https://celestrak.org/NORAD/elements/gp.php?GROUP=${encodeURIComponent(fetchGroup)}&FORMAT=tle`;
   try {
     const res = await fetch(url);
     if(!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
+    const text = filterTleText(await res.text(), group);
     if(!/^1 /m.test(text)) throw new Error('unexpected response (not TLE data)');
     const src = res.headers.get('X-TLE-Source');
     if(src) setStatus(`Loaded “${group}” via local proxy — source: ${src}.`);
@@ -384,14 +403,16 @@ async function load(){
 // ---------- rendering: overhead list ----------
 function renderList(list){
   const k = state.sortKey, d = state.sortDir;
-  list.sort((a,b) => typeof a[k]==='string' ? d*a[k].localeCompare(b[k]) : d*(a[k]-b[k]));
-  $('#tbl tbody').innerHTML = list.map(s => {
+  const filtered = list.filter(s => textMatch(s.name, state.overheadFilter));
+  filtered.sort((a,b) => typeof a[k]==='string' ? d*a[k].localeCompare(b[k]) : d*(a[k]-b[k]));
+  $('#tbl tbody').innerHTML = filtered.map(s => {
     const cls = s.el>=45?'high':s.el>=20?'mid':'low';
     return `<tr><td>${escapeHtml(s.name)}</td>
       <td class="num"><span class="pill ${cls}">${s.el.toFixed(1)}°</span></td>
       <td class="num">${s.az.toFixed(0)}°</td><td>${s.dir}</td>
       <td class="num">${s.range.toFixed(0)}</td><td class="num">${s.alt.toFixed(0)}</td></tr>`;
-  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">Nothing above ${state.minEl}° right now.</td></tr>`;
+  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">Nothing above ${state.minEl}° matches this filter.</td></tr>`;
+  $('#overheadCount').textContent = state.overheadFilter ? `${filtered.length}/${list.length}` : list.length;
 }
 
 // ---------- rendering: sky plot ----------
@@ -424,9 +445,11 @@ function fmtIn(ms){
 }
 function renderPasses(){
   const tb = $('#passTbl tbody');
+  const filtered = state.passes.map((p,i) => ({p,i})).filter(({p}) => textMatch(`${p.name} ${p.norad || ''}`, state.passFilter));
   if(!state.passes.length){ tb.innerHTML = `<tr><td colspan="7" style="color:var(--muted)">No passes above the chosen peak elevation in this window.</td></tr>`; $('#passStatus').textContent='Done.'; return; }
-  $('#passStatus').textContent = `${state.passes.length} passes upcoming.`;
-  tb.innerHTML = state.passes.map((p,i) => {
+  if(!filtered.length){ tb.innerHTML = `<tr><td colspan="7" style="color:var(--muted)">No upcoming passes match this filter.</td></tr>`; $('#passStatus').textContent = `${state.passes.length} passes upcoming.`; return; }
+  $('#passStatus').textContent = state.passFilter ? `${filtered.length}/${state.passes.length} passes shown.` : `${state.passes.length} passes upcoming.`;
+  tb.innerHTML = filtered.map(({p,i}) => {
     const cls = p.maxEl>=45?'high':p.maxEl>=20?'mid':'low';
     return `<tr data-i="${i}"><td>${escapeHtml(p.name)}</td>
       <td>${new Date(p.start).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
@@ -467,8 +490,10 @@ async function loadRules(){
   }
 }
 function renderRules(rules){
-  $('#ruleStatus').textContent = `${rules.length} saved scheduler rule${rules.length===1?'':'s'}.`;
-  $('#rulesTbl tbody').innerHTML = rules.map(rule => {
+  state.rules = rules;
+  const filtered = rules.filter(rule => textMatch(`${rule.name || ''} ${rule.id || ''} ${rule.profile || ''} ${rule.norad || ''}`, state.rulesFilter));
+  $('#ruleStatus').textContent = state.rulesFilter ? `${filtered.length}/${rules.length} saved scheduler rules shown.` : `${rules.length} saved scheduler rule${rules.length===1?'':'s'}.`;
+  $('#rulesTbl tbody').innerHTML = filtered.map(rule => {
     const mhz = (Number(rule.frequency_hz || 0) / 1e6).toFixed(3);
     return `<tr>
       <td>${escapeHtml(rule.name || rule.id)}</td>
@@ -478,7 +503,7 @@ function renderRules(rules){
       <td>${rule.enabled === false ? 'off' : 'on'}</td>
       <td><button class="mini deleteRule" data-id="${escapeHtml(rule.id)}">Delete</button></td>
     </tr>`;
-  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">No saved scheduler rules.</td></tr>`;
+  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">No saved scheduler rules match this filter.</td></tr>`;
 }
 async function schedulePass(index){
   const pass = state.passes[index];
@@ -535,6 +560,9 @@ $('#locBtn').addEventListener('click', () => {
 });
 $('#group').addEventListener('change', e => { state.group = e.target.value; if(state.observer) load(); });
 $('#minEl').addEventListener('change', e => { state.minEl = +e.target.value; requestLive(); });
+$('#overheadFilter').addEventListener('input', e => { state.overheadFilter = e.target.value.trim(); renderList(state.overhead || []); });
+$('#passFilter').addEventListener('input', e => { state.passFilter = e.target.value.trim(); renderPasses(); });
+$('#rulesFilter').addEventListener('input', e => { state.rulesFilter = e.target.value.trim(); renderRules(state.rules || []); });
 document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', () => {
   const k = th.dataset.sort;
   if(state.sortKey===k) state.sortDir*=-1; else { state.sortKey=k; state.sortDir=(k==='name')?1:-1; }

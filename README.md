@@ -44,6 +44,11 @@ curl 'http://localhost:8723/passes?group=active&lat=40.42&lon=-86.88&alt_m=180&h
 The response includes `norad`, `aos`, `los`, `max_el`, `aos_az`, `los_az`,
 `duration_s`, and a sampled `track` of `{t, az, el, range, range_rate}` points.
 
+The default catalog in the web UI is `radio`, a curated subset of active TLEs
+for common radio/weather/station/amateur targets. The full `active` catalog is
+still available, but it is much slower for predictions. Overhead, pass, and
+scheduler-rule tables all have text filters for large lists.
+
 The web UI can also save persistent SDR scheduler rules through the local
 server. Run `python3 serve.py`, predict passes, choose a profile/frequency, and
 click `Track` on a pass. Rules are stored at `~/sdr_scheduler_rules.json`; the
