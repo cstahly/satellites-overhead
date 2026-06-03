@@ -405,7 +405,8 @@ def build_scan_now_job(command):
     slug = safe_name(name)
     samplerate = str(command.get("samplerate") or LRPT_RETRY_VARIANTS[0]["samplerate"])
     iq_swap = bool(command.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"]))
-    pipeline = str(command.get("pipeline") or LRPT_RETRY_VARIANTS[0]["pipeline"])
+    default_pipeline = "meteor_m2-x_lrpt" if profile == "meteor_lrpt_hackrf" else "orbcomm_stx_auto_plotter"
+    pipeline = str(command.get("pipeline") or default_pipeline)
     retry_idx = int(command.get("_retry_idx") or 0)
     common = {
         "_command_id": command_id,
@@ -421,7 +422,7 @@ def build_scan_now_job(command):
         "amp": amp,
         "label": label,
     }
-    if profile == "meteor_lrpt_hackrf":
+    if profile in ("meteor_lrpt_hackrf", "satdump_hackrf"):
         return (
             datetime.datetime.now().astimezone(),
             "satdump",
