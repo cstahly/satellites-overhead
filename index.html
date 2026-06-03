@@ -203,7 +203,7 @@ const state = {
   observer: null, group: 'radio', minEl: 10, count: 0,
   sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
   overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '', bandFilter: 'all',
-  transmitters: {},
+  transmitters: {}, autoPredictDone: false,
 };
 const $ = (s) => document.querySelector(s);
 const statusEl = $('#status');
@@ -403,6 +403,10 @@ function onWorkerMessage(e){
     state.timer = setInterval(requestLive, 3000);
     $('#predictBtn').disabled = false;
     $('#passStatus').textContent = `${m.count} satellites loaded — ready to predict passes.`;
+    if(!state.autoPredictDone && state.observer){
+      state.autoPredictDone = true;
+      runPrediction();
+    }
   }
   else if(m.type === 'live'){
     state.overhead = m.list;
@@ -644,16 +648,31 @@ async function deleteRule(id){
 }
 
 // ---------- events ----------
-$('#locBtn').addEventListener('click', () => {
+function useLocation(){
   if(!navigator.geolocation){ setStatus('Geolocation not supported.', true); return; }
+  $('#locBtn').disabled = true;
   setStatus('Requesting your location…');
   navigator.geolocation.getCurrentPosition(pos => {
     state.observer = { lat: pos.coords.latitude, lon: pos.coords.longitude, altKm: (pos.coords.altitude||0)/1000 };
     setStatus(`Location: ${state.observer.lat.toFixed(3)}, ${state.observer.lon.toFixed(3)}. Loading satellites…`);
     if(!worker) startWorker();
     load();
-  }, err => setStatus(`Could not get location: ${err.message}`, true), { enableHighAccuracy:false, timeout:10000 });
-});
+    $('#locBtn').disabled = false;
+  }, err => {
+    $('#locBtn').disabled = false;
+    setStatus(`Could not get location: ${err.message}`, true);
+  }, { enableHighAccuracy:false, timeout:10000 });
+}
+function runPrediction(){
+  if(!state.observer || !state.count){ $('#passStatus').textContent='Load satellites first.'; return; }
+  const windowHrs = +$('#window').value, peakEl = +$('#peakEl').value;
+  const stepSec = state.count > 4000 ? 30 : 20;
+  $('#predictBtn').disabled = true;
+  $('#prog').style.display = 'block'; $('#prog').firstElementChild.style.width = '0%';
+  $('#passStatus').textContent = `Scanning ${state.count} satellites over the next ${windowHrs}h…`;
+  worker.postMessage({ type:'predict', startMs: Date.now(), windowHrs, stepSec, peakEl });
+}
+$('#locBtn').addEventListener('click', useLocation);
 $('#group').addEventListener('change', e => { state.group = e.target.value; if(state.observer) load(); });
 $('#minEl').addEventListener('change', e => { state.minEl = +e.target.value; requestLive(); });
 $('#overheadFilter').addEventListener('input', e => { state.overheadFilter = e.target.value.trim(); renderList(state.overhead || []); });
@@ -665,15 +684,7 @@ document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', 
   if(state.sortKey===k) state.sortDir*=-1; else { state.sortKey=k; state.sortDir=(k==='name')?1:-1; }
   requestLive();
 }));
-$('#predictBtn').addEventListener('click', () => {
-  if(!state.observer || !state.count){ $('#passStatus').textContent='Load satellites first.'; return; }
-  const windowHrs = +$('#window').value, peakEl = +$('#peakEl').value;
-  const stepSec = state.count > 4000 ? 30 : 20;
-  $('#predictBtn').disabled = true;
-  $('#prog').style.display = 'block'; $('#prog').firstElementChild.style.width = '0%';
-  $('#passStatus').textContent = `Scanning ${state.count} satellites over the next ${windowHrs}h…`;
-  worker.postMessage({ type:'predict', startMs: Date.now(), windowHrs, stepSec, peakEl });
-});
+$('#predictBtn').addEventListener('click', runPrediction);
 $('#passTbl').addEventListener('click', e => {
   const btn = e.target.closest('.schedulePass');
   if(btn) schedulePass(+btn.dataset.i);
@@ -684,6 +695,7 @@ $('#rulesTbl').addEventListener('click', e => {
   if(btn) deleteRule(btn.dataset.id);
 });
 if(location.protocol.startsWith('http')) loadRules();
+useLocation();
 
 // ---------- CSV export ----------
 function toCsv(rows){
