@@ -33,3 +33,6 @@ Thumbs.db
 
 # Node (satellite.js loaded from CDN, but just in case)
 node_modules/
+
+# Rust build artifacts
+sdr-cli/target/
