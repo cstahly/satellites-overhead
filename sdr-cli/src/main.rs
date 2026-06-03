@@ -522,14 +522,15 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
             r["lna_gain"].as_i64().unwrap_or(0),
             r["vga_gain"].as_i64().unwrap_or(0),
             r["amp"].as_i64().unwrap_or(0));
-        let (fire_str, end_str) = if let Some(run) = next_by_rule.get(id) {
+        let (fire_str, end_str, max_el_str) = if let Some(run) = next_by_rule.get(id) {
             let fire = run["fire_time"].as_str().map(|s| {
                 format!("{} {}", fmt_local(s), time_until(s))
             }).unwrap_or_else(|| "—".to_string());
             let end = run["end_time"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
-            (fire, end)
+            let el = run["max_el"].as_f64().map(|e| fmt_el(e)).unwrap_or_else(|| "—".to_string());
+            (fire, end, el)
         } else {
-            (dim("no passes predicted"), String::new())
+            (dim("no passes predicted"), String::new(), "—".to_string())
         };
         vec![
             r["name"].as_str().unwrap_or("—").to_string(),
@@ -537,12 +538,12 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
             freq,
             profile_short,
             gains,
-            format!("{}°", r["min_peak_el"].as_f64().unwrap_or(0.0)),
+            max_el_str,
             fire_str,
             end_str,
         ]
     }).collect();
-    print_table(&["Satellite", "On", "MHz", "Profile", "Gains", "El", "Next fire", "Window end"], &rows);
+    print_table(&["Satellite", "On", "MHz", "Profile", "Gains", "Max El", "Next fire", "Window end"], &rows);
     println!();
     Ok(())
 }
