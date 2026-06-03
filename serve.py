@@ -16,6 +16,7 @@ import socketserver
 import sys
 import time
 import urllib.request
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
 from predict import parse_start, parse_tles, predict_passes, select_tles
@@ -26,6 +27,8 @@ CACHE_DIR = os.path.join(ROOT, ".tlecache")
 TX_CACHE_DIR = os.path.join(ROOT, ".txcache")
 SAT_CACHE_DIR = os.path.join(ROOT, ".satcache")
 RULES_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_rules.json")
+COMMANDS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_commands.json")
+STATUS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_status.json")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 TX_TTL = 7 * 24 * 3600
 
@@ -75,6 +78,7 @@ BAND_RANGES = {
         "amp": 1,
     },
 }
+BAND_PRIORITY = ("vdipole", "amateur", "lband", "adsb")
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(TX_CACHE_DIR, exist_ok=True)
@@ -118,11 +122,65 @@ def read_rules():
 
 
 def write_rules(rules):
-    tmp = RULES_PATH + ".tmp"
+    write_json_file(RULES_PATH, rules)
+
+
+def read_json_file(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+
+def write_json_file(path, payload):
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rules, f, indent=2)
+        json.dump(payload, f, indent=2)
         f.write("\n")
-    os.replace(tmp, RULES_PATH)
+    os.replace(tmp, path)
+
+
+def read_commands():
+    data = read_json_file(COMMANDS_PATH, [])
+    return data if isinstance(data, list) else []
+
+
+def write_commands(commands):
+    write_json_file(COMMANDS_PATH, commands)
+
+
+def enqueue_scheduler_command(command):
+    commands = read_commands()
+    commands.append(command)
+    write_commands(commands)
+    return command
+
+
+def scheduler_status():
+    status = read_json_file(STATUS_PATH, {})
+    if not isinstance(status, dict):
+        status = {}
+    updated_at = status.get("updated_at")
+    age_s = None
+    if updated_at:
+        try:
+            updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            age_s = max(0, datetime.now(timezone.utc).timestamp() - updated.timestamp())
+        except Exception:
+            age_s = None
+    queue = read_commands()
+    is_fresh = age_s is not None and age_s < 120
+    live = bool(status.get("live")) and is_fresh
+    return {
+        **status,
+        "live": live,
+        "fresh": is_fresh,
+        "status_age_s": age_s,
+        "queue_count": len(queue),
+        "commands_path": COMMANDS_PATH,
+        "status_path": STATUS_PATH,
+    }
 
 
 def validate_rule(rule):
@@ -225,13 +283,22 @@ def transmitter_bands(txs):
         for band, cfg in BAND_RANGES.items():
             if any(lo <= freq <= hi for lo, hi in cfg["ranges"]):
                 bands.add(band)
-    return sorted(bands)
+    return [band for band in BAND_PRIORITY if band in bands]
+
+
+def select_capture_band(bands, band=None):
+    if band in BAND_RANGES:
+        return band
+    for candidate in BAND_PRIORITY:
+        if candidate in bands:
+            return candidate
+    return "vdipole"
 
 
 def suggest_capture_settings(norad, band=None):
     txs, source = fetch_transmitters(norad)
     bands = transmitter_bands(txs)
-    selected_band = band if band in BAND_RANGES else (bands[0] if bands else "vdipole")
+    selected_band = select_capture_band(bands, band)
     cfg = BAND_RANGES[selected_band]
     usable = sorted([tx for tx in txs if tx_is_usable(tx)], key=tx_frequency)
     selected = None
@@ -251,6 +318,46 @@ def suggest_capture_settings(norad, band=None):
         "vga_gain": cfg["vga_gain"],
         "amp": cfg["amp"],
         "transmitter": selected,
+    }
+
+
+def validate_scan_now(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("request body must be an object")
+    norad = int(payload.get("norad"))
+    if norad <= 0:
+        raise ValueError("norad must be positive")
+    name = str(payload.get("name") or f"NORAD {norad}")
+    band = payload.get("band") or ""
+    suggested = suggest_capture_settings(norad, band)
+    max_el = float(payload.get("max_el", payload.get("el", 0)) or 0)
+    vga_gain = int(suggested["vga_gain"])
+    if max_el >= 60:
+        vga_gain = max(0, vga_gain - 12)
+    duration_s = int(payload.get("duration_s", 300) or 300)
+    if duration_s < 1 or duration_s > 3600:
+        raise ValueError("duration_s must be between 1 and 3600")
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return {
+        "id": f"scan-{norad}-{int(time.time())}",
+        "type": "scan_now",
+        "queued_at": now,
+        "name": name,
+        "norad": norad,
+        "group": str(payload.get("group") or "radio"),
+        "profile": suggested["profile"],
+        "frequency_hz": int(float(suggested["frequency_hz"])),
+        "lna_gain": int(suggested["lna_gain"]),
+        "vga_gain": vga_gain,
+        "amp": int(suggested["amp"]),
+        "duration_s": duration_s,
+        "source": "web",
+        "capture_settings": suggested,
+        "observer_snapshot": {
+            "el": payload.get("el"),
+            "az": payload.get("az"),
+            "range": payload.get("range"),
+        },
     }
 
 
@@ -388,6 +495,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f"could not read scheduler rules: {e}")
             return
+        if parsed.path == "/scheduler/status":
+            try:
+                write_json(self, 200, scheduler_status())
+            except Exception as e:
+                self.send_error(500, f"could not read scheduler status: {e}")
+            return
         if parsed.path == "/transmitters":
             qs = parse_qs(parsed.query)
             try:
@@ -465,6 +578,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             write_json(self, 200, incoming)
             sys.stderr.write(f"[scheduler] saved rule {incoming['id']}\n")
+            return
+        if parsed.path == "/scheduler/scan-now":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                command = validate_scan_now(json.loads(body))
+                enqueue_scheduler_command(command)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"could not queue scan: {e}")
+                return
+            write_json(self, 200, {"queued": True, "command": command, "status": scheduler_status()})
+            sys.stderr.write(f"[scheduler] queued scan {command['id']}\n")
             return
         super().do_GET()
 

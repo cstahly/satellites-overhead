@@ -60,6 +60,10 @@
   .mini { padding: 5px 8px; font-size: 12px; }
   .mini.engaged { background: rgba(87,227,137,0.18); color: var(--good); border-color: rgba(87,227,137,0.55); }
   .rule-status { font-size:13px;color:var(--muted);margin-bottom:8px;min-height:18px; }
+  .session-status { display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);margin:0 0 8px; }
+  .status-dot { width:9px;height:9px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 1px var(--line); }
+  .status-dot.live { background:var(--good); box-shadow:0 0 10px rgba(87,227,137,0.65); }
+  .status-dot.stale { background:var(--warn); }
   .filterbar { margin: 6px 0 8px; }
   .filterbar input { width: 100%; padding: 6px 10px; }
   .modal-backdrop { position: fixed; inset: 0; background: rgba(2,6,16,0.76); display:none; align-items:center; justify-content:center; padding:20px; z-index:20; }
@@ -132,6 +136,7 @@
             <th data-sort="dir">Dir</th>
             <th data-sort="range" class="num">Range km</th>
             <th data-sort="alt" class="num">Alt km</th>
+            <th></th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -157,13 +162,7 @@
             <option value="40">40°</option>
           </select>
         </label>
-        <label class="minel">capture
-          <select id="schedProfile">
-            <option value="meteor_lrpt_hackrf" selected>Meteor LRPT</option>
-            <option value="raw_iq_hackrf">Raw IQ</option>
-          </select>
-        </label>
-        <label class="minel">band
+        <label class="minel">pass band
           <select id="bandFilter">
             <option value="all" selected>All bands</option>
             <option value="vdipole">V-dipole VHF</option>
@@ -171,6 +170,21 @@
             <option value="lband">L-band / patch</option>
             <option value="adsb">1090 / ADS-B antenna</option>
             <option value="unknown">Unknown/other</option>
+          </select>
+        </label>
+        <label class="minel">capture
+          <select id="schedProfile">
+            <option value="meteor_lrpt_hackrf" selected>Meteor LRPT</option>
+            <option value="raw_iq_hackrf">Raw IQ</option>
+          </select>
+        </label>
+        <label class="minel">capture band
+          <select id="captureBand">
+            <option value="auto" selected>Auto</option>
+            <option value="vdipole">V-dipole VHF</option>
+            <option value="amateur">Amateur VHF/UHF</option>
+            <option value="lband">L-band / patch</option>
+            <option value="adsb">1090 / ADS-B antenna</option>
           </select>
         </label>
         <label class="minel">MHz
@@ -208,6 +222,7 @@
           <button id="rulesRefresh" class="mini">Refresh</button>
         </div>
       </div>
+      <div class="session-status"><span id="sessionDot" class="status-dot stale"></span><span id="sessionText">Scheduler status unknown.</span></div>
       <div id="ruleStatus" class="rule-status">Rules are saved on the local server for the SDR scheduler to read.</div>
       <div class="filterbar"><input id="rulesFilter" type="search" placeholder="Filter scheduler rules" title="Filter scheduler rules"></div>
       <div class="scroll" style="max-height:240px">
@@ -237,7 +252,8 @@
 const state = {
   observer: null, group: 'radio', minEl: 10, count: 0,
   sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
-  overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '', bandFilter: 'all',
+  overhead: [], rules: [], schedulerStatus: null,
+  overheadFilter: '', passFilter: '', rulesFilter: '', bandFilter: 'all', captureBand: 'auto',
   transmitters: {}, txPromises: {}, satellites: {}, autoPredictDone: false,
 };
 const $ = (s) => document.querySelector(s);
@@ -254,6 +270,7 @@ const bandProfiles = {
   lband: { label:'L-band / patch', ranges:[[1525e6, 1710e6]], freq:1545.000, profile:'raw_iq_hackrf', lna:32, vga:48, amp:1 },
   adsb: { label:'1090 / ADS-B antenna', ranges:[[1087e6, 1093e6]], freq:1090.000, profile:'raw_iq_hackrf', lna:32, vga:48, amp:1 },
 };
+const bandPriority = ['vdipole', 'amateur', 'lband', 'adsb'];
 function txFrequency(tx){ return Number(tx.downlink_low || tx.downlink_high || 0); }
 function txIsUsable(tx){ return tx && tx.alive !== false && tx.status !== 'inactive' && txFrequency(tx) > 0; }
 function transmitterBands(txs){
@@ -264,7 +281,7 @@ function transmitterBands(txs){
       if(cfg.ranges.some(([lo, hi]) => f >= lo && f <= hi)) bands.add(band);
     }
   }
-  return [...bands];
+  return bandPriority.filter(b => bands.has(b));
 }
 function passTransmitterState(pass){ return state.transmitters[pass.norad]; }
 function passTransmitters(pass){
@@ -285,8 +302,8 @@ function bandMatches(pass){
   return bands.includes('loading') || bands.includes(state.bandFilter);
 }
 function bandLabel(band){ return band === 'loading' ? 'checking transmitters' : (bandProfiles[band]?.label || band); }
-function applyBandDefaults(){
-  const cfg = bandProfiles[state.bandFilter];
+function applyCaptureBandDefaults(){
+  const cfg = bandProfiles[state.captureBand];
   if(!cfg) return;
   $('#schedProfile').value = cfg.profile;
   $('#schedFreq').value = cfg.freq.toFixed(3);
@@ -549,8 +566,9 @@ function renderList(list){
     return `<tr class="row-click" data-i="${i}"><td>${escapeHtml(s.name)}</td>
       <td class="num"><span class="pill ${cls}">${s.el.toFixed(1)}°</span></td>
       <td class="num">${s.az.toFixed(0)}°</td><td>${s.dir}</td>
-      <td class="num">${s.range.toFixed(0)}</td><td class="num">${s.alt.toFixed(0)}</td></tr>`;
-  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">Nothing above ${state.minEl}° matches this filter.</td></tr>`;
+      <td class="num">${s.range.toFixed(0)}</td><td class="num">${s.alt.toFixed(0)}</td>
+      <td><button class="mini scanNow" data-i="${i}">Scan now</button></td></tr>`;
+  }).join('') || `<tr><td colspan="7" style="color:var(--muted)">Nothing above ${state.minEl}° matches this filter.</td></tr>`;
   $('#overheadCount').textContent = state.overheadFilter ? `${filtered.length}/${list.length}` : list.length;
 }
 
@@ -685,7 +703,7 @@ function closeDetails(){ $('#detailModal').classList.remove('open'); }
 
 function defaultFrequencyMhz(pass){
   const txs = (passTransmitters(pass) || []).filter(txIsUsable);
-  const cfg = bandProfiles[state.bandFilter];
+  const cfg = bandProfiles[state.captureBand];
   if(cfg){
     const tx = txs.find(t => cfg.ranges.some(([lo, hi]) => txFrequency(t) >= lo && txFrequency(t) <= hi));
     if(tx) return txFrequency(tx) / 1e6;
@@ -694,13 +712,14 @@ function defaultFrequencyMhz(pass){
   return +$('#schedFreq').value || 137.100;
 }
 function captureBandForPass(pass){
-  if(bandProfiles[state.bandFilter]) return state.bandFilter;
+  if(bandProfiles[state.captureBand]) return state.captureBand;
   const bands = passBands(pass).filter(b => bandProfiles[b]);
   return bands[0] || 'vdipole';
 }
 async function suggestCaptureSettings(pass){
-  const band = captureBandForPass(pass);
-  const qs = new URLSearchParams({norad: pass.norad, band});
+  const band = state.captureBand === 'auto' ? '' : captureBandForPass(pass);
+  const qs = new URLSearchParams({norad: pass.norad});
+  if(band) qs.set('band', band);
   try {
     const res = await fetch(`/capture-settings?${qs}`);
     if(!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -856,6 +875,69 @@ async function deleteRule(id){
     $('#ruleStatus').textContent = `Could not delete rule: ${e.message}`;
   }
 }
+function schedulerIsLive(){
+  return !!(state.schedulerStatus && state.schedulerStatus.live);
+}
+function renderSchedulerStatus(status){
+  state.schedulerStatus = status;
+  const dot = $('#sessionDot');
+  const text = $('#sessionText');
+  dot.className = 'status-dot';
+  if(!status || !status.fresh){
+    dot.classList.add('stale');
+    text.textContent = 'Scheduler status stale or unavailable.';
+    return;
+  }
+  if(status.live){
+    dot.classList.add('live');
+    const job = status.current_job || {};
+    text.textContent = `Live capture: ${job.label || 'running'}${status.queue_count ? `; ${status.queue_count} queued` : ''}.`;
+    return;
+  }
+  text.textContent = status.queue_count ? `Scheduler idle; ${status.queue_count} scan${status.queue_count===1?'':'s'} queued.` : 'Scheduler idle.';
+}
+async function loadSchedulerStatus(){
+  try {
+    const res = await fetch('/scheduler/status');
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    renderSchedulerStatus(await res.json());
+  } catch(_){
+    renderSchedulerStatus(null);
+  }
+}
+async function scanNow(index){
+  const sat = state.overhead[index];
+  if(!sat || !sat.norad){ setStatus('Selected satellite has no NORAD ID; reload TLEs first.', true); return; }
+  if(schedulerIsLive()){
+    setStatus('Scheduler is already running a capture; scan request not queued.', true);
+    return;
+  }
+  const body = {
+    name: sat.name,
+    norad: sat.norad,
+    group: state.group,
+    band: state.captureBand === 'auto' ? '' : state.captureBand,
+    el: sat.el,
+    az: sat.az,
+    range: sat.range,
+    max_el: sat.el,
+    duration_s: 300,
+  };
+  try {
+    setStatus(`Queueing scan for ${sat.name}…`);
+    const res = await fetch('/scheduler/scan-now', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderSchedulerStatus(data.status);
+    setStatus(`Scan queued for ${sat.name}. The scheduler will run it when the radio is free.`);
+  } catch(e){
+    setStatus(`Could not queue scan: ${e.message}`, true);
+  }
+}
 
 // ---------- events ----------
 function useLocation(){
@@ -887,7 +969,8 @@ $('#group').addEventListener('change', e => { state.group = e.target.value; if(s
 $('#minEl').addEventListener('change', e => { state.minEl = +e.target.value; requestLive(); });
 $('#overheadFilter').addEventListener('input', e => { state.overheadFilter = e.target.value.trim(); renderList(state.overhead || []); });
 $('#passFilter').addEventListener('input', e => { state.passFilter = e.target.value.trim(); renderPasses(); });
-$('#bandFilter').addEventListener('change', e => { state.bandFilter = e.target.value; applyBandDefaults(); renderPasses(); });
+$('#bandFilter').addEventListener('change', e => { state.bandFilter = e.target.value; renderPasses(); });
+$('#captureBand').addEventListener('change', e => { state.captureBand = e.target.value; applyCaptureBandDefaults(); });
 $('#rulesFilter').addEventListener('input', e => { state.rulesFilter = e.target.value.trim(); renderRules(state.rules || []); });
 document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', () => {
   const k = th.dataset.sort;
@@ -895,6 +978,8 @@ document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', 
   requestLive();
 }));
 $('#tbl').addEventListener('click', e => {
+  const scan = e.target.closest('.scanNow');
+  if(scan){ e.stopPropagation(); scanNow(+scan.dataset.i); return; }
   const row = e.target.closest('tr[data-i]');
   if(row) openSatelliteDetails(state.overhead[+row.dataset.i]);
 });
@@ -915,6 +1000,10 @@ $('#rulesTbl').addEventListener('click', e => {
   if(btn) deleteRule(btn.dataset.id);
 });
 if(location.protocol.startsWith('http')) loadRules();
+if(location.protocol.startsWith('http')) {
+  loadSchedulerStatus();
+  setInterval(loadSchedulerStatus, 5000);
+}
 useLocation();
 
 // ---------- CSV export ----------

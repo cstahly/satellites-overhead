@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SDR pass scheduler. Run once, handles everything, logs everything."""
-import json, subprocess, time, os, datetime, threading
+import json, subprocess, time, os, datetime, threading, uuid
 
 HOME = os.path.expanduser("~")
 CAPDIR = os.path.join(HOME, "cosmos_captures")
@@ -11,6 +11,8 @@ os.makedirs(NOAADIR, exist_ok=True)
 LOG = os.path.join(HOME, "sdr_scheduler.log")
 PREDICTOR = os.path.join(HOME, "src", "satellites-overhead", "predict.py")
 RULES_PATH = os.path.join(HOME, "sdr_scheduler_rules.json")
+COMMANDS_PATH = os.path.join(HOME, "sdr_scheduler_commands.json")
+STATUS_PATH = os.path.join(HOME, "sdr_scheduler_status.json")
 LAT = 40.42
 LON = -86.88
 ALT_M = 180
@@ -113,6 +115,56 @@ def safe_name(value):
     return "_".join("".join(keep).strip("_").lower().split("_"))[:40] or "capture"
 
 
+def utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def atomic_write_json(path, payload):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def write_scheduler_status(state, current_job=None, message=""):
+    payload = {
+        "state": state,
+        "live": state == "running",
+        "pid": os.getpid(),
+        "updated_at": utc_now_iso(),
+        "current_job": current_job,
+        "message": message,
+    }
+    try:
+        atomic_write_json(STATUS_PATH, payload)
+    except Exception as e:
+        log(f"STATUS WRITE FAIL — {e}")
+
+
+def load_command_queue():
+    if not os.path.exists(COMMANDS_PATH):
+        return []
+    try:
+        with open(COMMANDS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log(f"COMMAND READ FAIL — {e}")
+        return []
+
+
+def write_command_queue(commands):
+    atomic_write_json(COMMANDS_PATH, commands)
+
+
+def remove_command(command_id):
+    commands = load_command_queue()
+    next_commands = [cmd for cmd in commands if str(cmd.get("id")) != str(command_id)]
+    if len(next_commands) != len(commands):
+        write_command_queue(next_commands)
+
+
 def load_scheduler_rules():
     if not os.path.exists(RULES_PATH):
         return []
@@ -177,6 +229,62 @@ def build_rule_jobs(rule, hours=24, limit=4):
             ))
     return jobs
 
+
+def build_scan_now_job(command):
+    if command.get("type") != "scan_now":
+        return None
+    command_id = str(command.get("id") or uuid.uuid4())
+    frequency_hz = int(float(command["frequency_hz"]))
+    duration_s = max(1, int(command.get("duration_s", 300)))
+    lna = int(command.get("lna_gain", 32))
+    vga = int(command.get("vga_gain", 48))
+    amp = int(command.get("amp", 1))
+    profile = str(command.get("profile") or "raw_iq_hackrf")
+    name = str(command.get("name") or f"NORAD {command.get('norad', 'unknown')}")
+    label = f"{name} scan now"
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = safe_name(name)
+    common = {
+        "_command_id": command_id,
+        "_queued_at": command.get("queued_at"),
+        "duration_s": duration_s,
+        "lna": lna,
+        "vga": vga,
+        "amp": amp,
+        "label": label,
+    }
+    if profile == "meteor_lrpt_hackrf":
+        return (
+            datetime.datetime.now().astimezone(),
+            "satdump",
+            {
+                **common,
+                "capdir": f"{NOAADIR}/{slug}_{stamp}",
+                "freq": frequency_hz,
+            },
+        )
+    return (
+        datetime.datetime.now().astimezone(),
+        "iq",
+        {
+            **common,
+            "outfile": f"{CAPDIR}/{slug}_{stamp}.iq",
+            "freq_hz": frequency_hz,
+        },
+    )
+
+
+def command_jobs():
+    jobs = []
+    for command in load_command_queue():
+        try:
+            job = build_scan_now_job(command)
+            if job:
+                jobs.append(job)
+        except Exception as e:
+            log(f"COMMAND BUILD FAIL {command.get('id', '?')} — {e}")
+    return jobs
+
 def optional_rule_jobs(log_loaded=True):
     jobs = []
     for rule in load_scheduler_rules():
@@ -211,7 +319,7 @@ def job_key(job):
     return (job_fire_dt(fire_time).isoformat(timespec="minutes"), ptype, kwargs.get("label", ""))
 
 def collect_jobs(log_loaded=False):
-    jobs = MANUAL_JOBS + optional_rule_jobs(log_loaded=log_loaded)
+    jobs = command_jobs() + MANUAL_JOBS + optional_rule_jobs(log_loaded=log_loaded)
     jobs.sort(key=lambda job: job_fire_dt(job[0]))
     return jobs
 
@@ -219,22 +327,43 @@ def jobs_signature(jobs):
     return tuple((job_fire_dt(j[0]).isoformat(timespec="minutes"), j[1], j[2].get("label", "")) for j in jobs)
 
 def run_job(ptype, kwargs):
+    run_kwargs = dict(kwargs)
+    run_kwargs.pop("_command_id", None)
+    run_kwargs.pop("_queued_at", None)
     if ptype == "iq":
-        outfile = hackrf_capture(**kwargs)
+        outfile = hackrf_capture(**run_kwargs)
         if outfile:
-            analyze_150mhz(outfile, kwargs["label"])
+            analyze_150mhz(outfile, run_kwargs["label"])
     elif ptype == "satdump":
-        satdump_capture(**kwargs)
+        satdump_capture(**run_kwargs)
     else:
-        log(f"UNKNOWN JOB TYPE {ptype} — {kwargs}")
+        log(f"UNKNOWN JOB TYPE {ptype} — {run_kwargs}")
+
+
+def status_job_payload(fire_time, ptype, kwargs):
+    return {
+        "type": ptype,
+        "label": kwargs.get("label", ""),
+        "fire_time": job_fire_dt(fire_time).isoformat(),
+        "command_id": kwargs.get("_command_id"),
+        "queued_at": kwargs.get("_queued_at"),
+        "frequency_hz": kwargs.get("freq_hz") or kwargs.get("freq"),
+        "duration_s": kwargs.get("duration_s"),
+        "lna_gain": kwargs.get("lna"),
+        "vga_gain": kwargs.get("vga"),
+        "amp": kwargs.get("amp"),
+        "output": kwargs.get("outfile") or kwargs.get("capdir"),
+    }
 
 def scheduler_loop():
     completed = set()
     jobs = []
     last_sig = None
     last_next = None
+    last_status_update = 0.0
     next_reload = 0.0
     log("SDR scheduler running — dynamic rule reload enabled")
+    write_scheduler_status("idle", message="scheduler started")
 
     while True:
         now_ts = time.time()
@@ -254,8 +383,15 @@ def scheduler_loop():
             job = sorted(due, key=lambda item: job_fire_dt(item[0]))[0]
             completed.add(job_key(job))
             fire_time, ptype, kwargs = job
+            command_id = kwargs.get("_command_id")
+            if command_id:
+                remove_command(command_id)
+            write_scheduler_status("running", status_job_payload(fire_time, ptype, kwargs), "capture running")
             log(f"Running: {kwargs['label']} scheduled for {job_time_label(fire_time)}")
-            run_job(ptype, kwargs)
+            try:
+                run_job(ptype, kwargs)
+            finally:
+                write_scheduler_status("idle", message="last capture finished")
             next_reload = 0.0
             continue
 
@@ -267,12 +403,22 @@ def scheduler_loop():
             next_id = job_key(job)
             if next_id != last_next:
                 log(f"Next: {job[2]['label']} at {fire_dt.strftime('%H:%M')} (in {wait:.0f}s)")
+                write_scheduler_status("idle", status_job_payload(job[0], job[1], job[2]), "next capture pending")
+                last_status_update = now_ts
                 last_next = next_id
+            elif now_ts - last_status_update >= 30:
+                write_scheduler_status("idle", status_job_payload(job[0], job[1], job[2]), "next capture pending")
+                last_status_update = now_ts
             sleep_s = min(POLL_INTERVAL_S, wait, max(1, next_reload - now_ts))
         else:
             if last_next is not None:
                 log("No scheduled jobs pending.")
+                write_scheduler_status("idle", message="no scheduled jobs pending")
+                last_status_update = now_ts
                 last_next = None
+            elif now_ts - last_status_update >= 30:
+                write_scheduler_status("idle", message="no scheduled jobs pending")
+                last_status_update = now_ts
             sleep_s = min(POLL_INTERVAL_S, max(1, next_reload - now_ts))
         time.sleep(max(1, sleep_s))
 

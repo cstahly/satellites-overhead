@@ -68,9 +68,11 @@ for common radio/weather/station/amateur targets. The full `active` catalog is
 still available, but it is much slower for predictions. Overhead, pass, and
 scheduler-rule tables all have full-width text filters for large lists.
 Upcoming passes also have an equipment/band filter for common VHF, amateur,
-L-band, and 1090 MHz antenna setups. Band matches are based on transmitter
-records from SatNOGS DB, cached under `.txcache/`; satellites without
-transmitter data stay unknown instead of being guessed from their names.
+L-band, and 1090 MHz antenna setups. That filter only controls which rows are
+shown. Capture settings for new rules live in the separate capture controls; the
+`Auto` capture band asks `/capture-settings` to choose from SatNOGS transmitter
+records, cached under `.txcache/`. Satellites without transmitter data stay
+unknown instead of being guessed from their names.
 
 The web UI can also save persistent SDR scheduler rules through the local
 server. Run `python3 serve.py`, predict passes, choose a capture mode/frequency,
@@ -85,6 +87,15 @@ running. New Track rules call `/capture-settings` first, which mirrors the MCP
 `suggest_capture_settings` tool, then applies one pass-specific tweak: if the
 pass peaks at 60 degrees or higher, VGA is reduced by 12 dB while LNA and amp
 are left unchanged.
+
+Overhead-now rows also have `Scan now`. This does not start hardware from the
+web server. The server writes a `scan_now` command to
+`~/sdr_scheduler_commands.json`; the scheduler polls that queue, removes the
+command when it starts, and runs captures synchronously so only one SDR session
+can be active at a time. Live/idle state is written by the scheduler to
+`~/sdr_scheduler_status.json` and shown in the UI. This is the single-device
+model; add device ids/locks to those command and status records when multiple
+receivers are added.
 
 The Scheduler rules table shows all current rules and lets you edit enabled
 state, capture mode, frequency, LNA gain, VGA gain, amp, and minimum elevation
@@ -101,8 +112,10 @@ adding, updating, enabling/disabling, and deleting scheduler rules; predicting
 passes; checking overhead satellites; reading SatNOGS satellite/transmitter
 metadata; suggesting capture settings; listing upcoming generated scheduler
 runs; dry-running a rule; starting an immediate confirmed capture; and reading
-scheduler status. The MCP server uses the same `~/sdr_scheduler_rules.json`,
-TLE cache, SatNOGS cache, and Python predictor as the web/server side.
+scheduler status. Confirmed immediate captures are queued through
+`~/sdr_scheduler_commands.json`; the MCP server does not launch HackRF/SatDump
+directly. The MCP server uses the same `~/sdr_scheduler_rules.json`, TLE cache,
+SatNOGS cache, and Python predictor as the web/server side.
 
 The registered command uses a repo-local virtualenv:
 

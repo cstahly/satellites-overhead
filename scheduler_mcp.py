@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import time
 import urllib.request
@@ -29,6 +28,8 @@ except ImportError as exc:
 ROOT = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
 RULES_PATH = os.path.join(HOME, "sdr_scheduler_rules.json")
+COMMANDS_PATH = os.path.join(HOME, "sdr_scheduler_commands.json")
+STATUS_PATH = os.path.join(HOME, "sdr_scheduler_status.json")
 SCHEDULER_PATH = os.path.join(HOME, "sdr_scheduler.py")
 SCHEDULER_BACKUP = os.path.join(ROOT, "scheduler", "sdr_scheduler.py")
 LOG_PATH = os.path.join(HOME, "sdr_scheduler.log")
@@ -53,6 +54,7 @@ BAND_RANGES = {
     "lband": {"label": "L-band / patch", "ranges": [(1525e6, 1710e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_545_000_000, "lna_gain": 32, "vga_gain": 48, "amp": 1},
     "adsb": {"label": "1090 / ADS-B antenna", "ranges": [(1087e6, 1093e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_090_000_000, "lna_gain": 32, "vga_gain": 48, "amp": 1},
 }
+BAND_PRIORITY = ("vdipole", "amateur", "lband", "adsb")
 
 
 def debug(message: str) -> None:
@@ -82,11 +84,38 @@ def read_rules() -> list[dict[str, Any]]:
 
 
 def write_rules(rules: list[dict[str, Any]]) -> None:
-    tmp = RULES_PATH + ".tmp"
+    write_json_file(RULES_PATH, rules)
+
+
+def read_json_file(path: str, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json_file(path: str, payload) -> None:
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(rules, f, indent=2)
+        json.dump(payload, f, indent=2)
         f.write("\n")
-    os.replace(tmp, RULES_PATH)
+    os.replace(tmp, path)
+
+
+def read_commands() -> list[dict[str, Any]]:
+    data = read_json_file(COMMANDS_PATH, [])
+    return data if isinstance(data, list) else []
+
+
+def write_commands(commands: list[dict[str, Any]]) -> None:
+    write_json_file(COMMANDS_PATH, commands)
+
+
+def enqueue_scheduler_command(command: dict[str, Any]) -> dict[str, Any]:
+    commands = read_commands()
+    commands.append(command)
+    write_commands(commands)
+    return command
 
 
 def validate_rule(rule: dict[str, Any]) -> dict[str, Any]:
@@ -231,7 +260,16 @@ def transmitter_bands(txs: list[dict[str, Any]]) -> list[str]:
         for band, cfg in BAND_RANGES.items():
             if any(lo <= freq <= hi for lo, hi in cfg["ranges"]):
                 bands.add(band)
-    return sorted(bands)
+    return [band for band in BAND_PRIORITY if band in bands]
+
+
+def select_capture_band(bands: list[str], band: str = "") -> str:
+    if band in BAND_RANGES:
+        return band
+    for candidate in BAND_PRIORITY:
+        if candidate in bands:
+            return candidate
+    return "vdipole"
 
 
 def predict_for_args(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -324,10 +362,17 @@ def get_status() -> dict[str, Any]:
     if os.path.exists(LOG_PATH):
         with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
             log_tail = f.readlines()[-20:]
+    scheduler_status = read_json_file(STATUS_PATH, {})
+    if not isinstance(scheduler_status, dict):
+        scheduler_status = {}
     return {
         "rules_path": RULES_PATH,
         "rule_count": len(read_rules()),
         "enabled_rule_count": sum(1 for r in read_rules() if r.get("enabled", True)),
+        "commands_path": COMMANDS_PATH,
+        "queued_command_count": len(read_commands()),
+        "status_path": STATUS_PATH,
+        "scheduler_status": scheduler_status,
         "scheduler_path": SCHEDULER_PATH,
         "scheduler_exists": os.path.exists(SCHEDULER_PATH),
         "scheduler_backup": SCHEDULER_BACKUP,
@@ -348,27 +393,25 @@ def run_now(args: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("no upcoming pass found for rule")
     job = jobs[0]
     duration_s = int(args.get("duration_s") or min(job["duration_s"], 600))
-    freq = int(float(rule["frequency_hz"]))
-    lna_gain = str(int(rule.get("lna_gain", 32)))
-    vga_gain = str(int(rule.get("vga_gain", 48)))
-    amp = str(int(rule.get("amp", 1)))
-    label = str(rule.get("name") or rule["id"]).replace("/", "_")
-    outdir = os.path.join(HOME, "cosmos_captures")
-    os.makedirs(outdir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if rule.get("profile") == "meteor_lrpt_hackrf":
-        capdir = os.path.join(HOME, "noaa_captures", f"{label}_{stamp}")
-        cmd = [
-            "satdump", "live", "meteor_m2-x_lrpt", capdir,
-            "--source", "hackrf", "--samplerate", "2e6",
-            "--frequency", str(freq), "--lna_gain", lna_gain, "--vga_gain", vga_gain, "--amp", amp,
-            "--timeout", str(duration_s),
-        ]
-    else:
-        outfile = os.path.join(outdir, f"{label}_{stamp}.iq")
-        cmd = ["hackrf_transfer", "-r", outfile, "-f", str(freq), "-s", "2000000", "-l", lna_gain, "-g", vga_gain, "-a", amp]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"pid": proc.pid, "command": cmd, "duration_s": duration_s, "source_job": job}
+    command = {
+        "id": f"scan-{rule['norad']}-{int(time.time())}",
+        "type": "scan_now",
+        "queued_at": now_iso(),
+        "name": rule.get("name") or f"NORAD {rule['norad']}",
+        "norad": int(rule["norad"]),
+        "group": rule.get("group", "radio"),
+        "profile": rule.get("profile", "raw_iq_hackrf"),
+        "frequency_hz": int(float(rule["frequency_hz"])),
+        "lna_gain": int(rule.get("lna_gain", 32)),
+        "vga_gain": int(rule.get("vga_gain", 48)),
+        "amp": int(rule.get("amp", 1)),
+        "duration_s": duration_s,
+        "source": "mcp",
+        "source_rule_id": rule["id"],
+        "source_job": job,
+    }
+    enqueue_scheduler_command(command)
+    return {"queued": True, "command": command, "source_job": job}
 
 
 def list_radio_targets(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -403,7 +446,7 @@ def suggest_capture_settings(args: dict[str, Any]) -> dict[str, Any]:
     norad = int(args["norad"])
     txs, source = fetch_transmitters(norad)
     bands = transmitter_bands(txs)
-    band = str(args.get("band") or (bands[0] if bands else "vdipole"))
+    band = select_capture_band(bands, str(args.get("band") or ""))
     cfg = BAND_RANGES.get(band, BAND_RANGES["vdipole"])
     usable = sorted([tx for tx in txs if tx_is_usable(tx)], key=tx_frequency)
     selected = None
