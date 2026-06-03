@@ -41,7 +41,7 @@ TX_TTL = 7 * 24 * 3600
 DEFAULT_LAT = 40.42
 DEFAULT_LON = -86.88
 DEFAULT_ALT_M = 180.0
-CAPTURE_PROFILES = {"meteor_lrpt_hackrf", "raw_iq_hackrf"}
+CAPTURE_PROFILES = {"meteor_lrpt_hackrf", "raw_iq_hackrf", "satdump_hackrf"}
 RADIO_NAME_TERMS = (
     "ISS", "METEOR", "NOAA", "FENGYUN", "METOP", "AQUA", "TERRA", "SUOMI",
     "LANDSAT", "OKEAN", "SICH", "RESURS", "ELEKTRO", "GOES", "HAMSAT",

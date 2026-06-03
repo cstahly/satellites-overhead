@@ -485,21 +485,45 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
 
     let rules = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
     if rules.is_empty() { println!("{}", dim("  No rules configured.")); return Ok(()); }
+
+    // Fetch upcoming runs and index by rule_id
+    let upcoming = get(client, &format!("{}/scheduler/upcoming?hours=48&limit_per_rule=1", base))
+        .unwrap_or(serde_json::json!([]));
+    let upcoming_arr = upcoming.as_array().cloned().unwrap_or_default();
+    let mut next_by_rule: std::collections::HashMap<&str, &Value> = std::collections::HashMap::new();
+    for run in &upcoming_arr {
+        if let Some(id) = run["rule_id"].as_str() {
+            next_by_rule.entry(id).or_insert(run);
+        }
+    }
+
     println!();
     let rows: Vec<Vec<String>> = rules.iter().map(|r| {
+        let id = r["id"].as_str().unwrap_or("—");
         let enabled = if r["enabled"].as_bool().unwrap_or(false) { green("yes") } else { red("no") };
         let freq = r["frequency_hz"].as_f64().map(|f| format!("{:.3}", f / 1e6)).unwrap_or_else(|| "—".to_string());
+        let (fire_str, end_str) = if let Some(run) = next_by_rule.get(id) {
+            let fire = run["fire_time"].as_str().map(|s| {
+                let local = fmt_local(s);
+                let until = time_until(s);
+                format!("{} {}", local, until)
+            }).unwrap_or_else(|| "—".to_string());
+            let end = run["end_time"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
+            (fire, end)
+        } else {
+            (dim("no passes predicted"), String::new())
+        };
         vec![
-            r["id"].as_str().unwrap_or("—").to_string(),
             r["name"].as_str().unwrap_or("—").to_string(),
             enabled,
             freq,
             r["profile"].as_str().unwrap_or("—").to_string(),
-            format!("{} / {} / {}", r["lna_gain"], r["vga_gain"], r["amp"]),
             format!("{}°", r["min_peak_el"].as_f64().unwrap_or(0.0)),
+            fire_str,
+            end_str,
         ]
     }).collect();
-    print_table(&["ID", "Satellite", "On", "MHz", "Profile", "LNA/VGA/Amp", "Min El"], &rows);
+    print_table(&["Satellite", "On", "MHz", "Profile", "Min El", "Next fire", "Window end"], &rows);
     println!();
     Ok(())
 }

@@ -351,7 +351,9 @@ def build_rule_jobs(rule, hours=24, limit=4):
             _source="rule",
             _max_el=float(p.get("max_el", 0)),
         )
-        if rule.get("profile") == "meteor_lrpt_hackrf":
+        if rule.get("profile") in ("meteor_lrpt_hackrf", "satdump_hackrf"):
+            default_pipeline = "meteor_m2-x_lrpt" if rule.get("profile") == "meteor_lrpt_hackrf" else "orbcomm_stx_auto_plotter"
+            suffix = "LRPT" if rule.get("profile") == "meteor_lrpt_hackrf" else "SDR"
             jobs.append((
                 fire_time,
                 "satdump",
@@ -362,10 +364,10 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     lna=lna,
                     vga=vga,
                     amp=amp,
-                    label=f"{label} LRPT",
+                    label=f"{label} {suffix}",
                     samplerate=str(rule.get("samplerate", "1e6")),
-                    iq_swap=bool(rule.get("iq_swap", True)),
-                    pipeline=str(rule.get("pipeline", "meteor_m2-x_lrpt")),
+                    iq_swap=bool(rule.get("iq_swap", False)),
+                    pipeline=str(rule.get("pipeline", default_pipeline)),
                     **meta,
                 ),
             ))

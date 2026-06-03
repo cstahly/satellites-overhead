@@ -82,6 +82,10 @@ BAND_RANGES = {
 }
 BAND_PRIORITY = ("vdipole", "amateur", "lband", "adsb")
 
+LAT = 40.42
+LON = -86.88
+ALT_M = 180
+
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(TX_CACHE_DIR, exist_ok=True)
 os.makedirs(SAT_CACHE_DIR, exist_ok=True)
@@ -231,7 +235,7 @@ def validate_rule(rule):
     if min_el < 0 or min_el > 90:
         raise ValueError("rule.min_peak_el must be between 0 and 90")
     profile = str(rule.get("profile", "raw_iq_hackrf"))
-    if profile not in {"meteor_lrpt_hackrf", "raw_iq_hackrf"}:
+    if profile not in {"meteor_lrpt_hackrf", "raw_iq_hackrf", "satdump_hackrf"}:
         raise ValueError("unsupported rule.profile")
     lna_gain = int(rule.get("lna_gain", 32))
     vga_gain = int(rule.get("vga_gain", 48))
@@ -257,6 +261,9 @@ def validate_rule(rule):
         "min_peak_el": min_el,
         "start_offset_s": int(rule.get("start_offset_s", -30)),
         "end_offset_s": int(rule.get("end_offset_s", 60)),
+        "pipeline": str(rule.get("pipeline") or ""),
+        "samplerate": str(rule.get("samplerate") or ""),
+        "iq_swap": bool(rule.get("iq_swap", False)),
         "created_at": str(rule.get("created_at") or ""),
         "updated_at": str(rule.get("updated_at") or ""),
     }
@@ -575,6 +582,56 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             write_json(self, 200, data)
             sys.stderr.write(f"[satellite] {norad}: {source}\n")
+            return
+        if parsed.path == "/scheduler/upcoming":
+            qs = parse_qs(parsed.query)
+            hours = float(first_value(qs, "hours", "24"))
+            limit_per_rule = int(first_value(qs, "limit_per_rule", "4"))
+            try:
+                rules = read_rules()
+                results = []
+                for rule in rules:
+                    if not rule.get("enabled", True):
+                        continue
+                    if rule.get("type") != "satellite_recurring":
+                        continue
+                    try:
+                        tles_text, _ = fetch_tle(rule.get("group", "radio"))
+                        tles = select_tles(parse_tles(tles_text), set(), {int(rule["norad"])})
+                        passes = predict_passes(tles, lat=LAT, lon=LON, alt_m=ALT_M,
+                                               start=parse_start(None), hours=hours,
+                                               min_el=rule.get("min_peak_el", 10),
+                                               track_step_s=60, limit=limit_per_rule)
+                        start_offset_s = int(rule.get("start_offset_s", -30))
+                        end_offset_s = int(rule.get("end_offset_s", 60))
+                        from datetime import timedelta as _td
+                        for p in passes:
+                            aos = datetime.fromisoformat(p["aos"].replace("Z", "+00:00"))
+                            los = datetime.fromisoformat(p["los"].replace("Z", "+00:00"))
+                            fire = aos + _td(seconds=start_offset_s)
+                            end = los + _td(seconds=end_offset_s)
+                            vga = int(rule.get("vga_gain", 48))
+                            if float(p.get("max_el", 0)) >= 60:
+                                vga = max(0, vga - 12)
+                            results.append({
+                                "rule_id": rule["id"],
+                                "name": rule.get("name", p["name"]),
+                                "norad": rule["norad"],
+                                "fire_time": fire.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "aos": p["aos"],
+                                "los": p["los"],
+                                "max_el": p["max_el"],
+                                "duration_s": int(p["duration_s"]) - start_offset_s + end_offset_s,
+                                "vga_gain": vga,
+                            })
+                    except Exception:
+                        continue
+                results.sort(key=lambda r: r["fire_time"])
+            except Exception as e:
+                self.send_error(500, f"could not compute upcoming runs: {e}")
+                return
+            write_json(self, 200, results)
             return
         if parsed.path == "/captures":
             qs = parse_qs(parsed.query)
