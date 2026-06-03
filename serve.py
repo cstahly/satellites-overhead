@@ -23,8 +23,10 @@ from predict import parse_start, parse_tles, predict_passes, select_tles
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8723
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(ROOT, ".tlecache")
+TX_CACHE_DIR = os.path.join(ROOT, ".txcache")
 RULES_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_rules.json")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
+TX_TTL = 7 * 24 * 3600
 
 # Only allow the catalogs the app exposes (also prevents using us as an open proxy).
 ALLOWED = {"active", "radio", "visual", "stations", "starlink", "gps-ops", "science"}
@@ -36,6 +38,7 @@ RADIO_NAME_TERMS = (
 )
 
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(TX_CACHE_DIR, exist_ok=True)
 
 
 def first_value(qs, name, default=None):
@@ -128,6 +131,31 @@ def filter_radio_tles(text):
         if any(term in name for term in RADIO_NAME_TERMS):
             out.extend([tle.name, tle.line1, tle.line2])
     return "\n".join(out) + ("\n" if out else "")
+
+
+def fetch_transmitters(norad):
+    path = os.path.join(TX_CACHE_DIR, f"{int(norad)}.json")
+    fresh = os.path.exists(path) and (time.time() - os.path.getmtime(path)) < TX_TTL
+    if fresh:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f), "cache"
+
+    url = f"https://db.satnogs.org/api/transmitters/?satellite__norad_cat_id={int(norad)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "satellites-overhead/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("unexpected SatNOGS response")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        return data, "satnogs"
+    except Exception:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return json.load(f), "stale cache"
+        raise
 
 
 def fetch_tle(group):
@@ -237,6 +265,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 write_json(self, 200, read_rules())
             except Exception as e:
                 self.send_error(500, f"could not read scheduler rules: {e}")
+            return
+        if parsed.path == "/transmitters":
+            qs = parse_qs(parsed.query)
+            try:
+                norad = int(first_value(qs, "norad"))
+                data, source = fetch_transmitters(norad)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(502, f"could not fetch transmitters: {e}")
+                return
+            write_json(self, 200, data)
+            sys.stderr.write(f"[transmitters] {norad}: {source}, {len(data)} records\n")
             return
         super().do_GET()
 

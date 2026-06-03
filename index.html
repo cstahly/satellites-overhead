@@ -203,6 +203,7 @@ const state = {
   observer: null, group: 'radio', minEl: 10, count: 0,
   sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
   overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '', bandFilter: 'all',
+  transmitters: {},
 };
 const $ = (s) => document.querySelector(s);
 const statusEl = $('#status');
@@ -213,26 +214,56 @@ const escapeHtml = (s) => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>'
 const radioTerms = ['ISS','METEOR','NOAA','FENGYUN','METOP','AQUA','TERRA','SUOMI','LANDSAT','OKEAN','SICH','RESURS','ELEKTRO','GOES','HAMSAT','AO-','SO-','FO-','IO-','RS-','CAS-','XW-','TEVEL','LILACSAT','SKYTERRA','INMARSAT','IRIDIUM','GLOBALSTAR','ORBCOMM'];
 const textMatch = (value, filter) => !filter || String(value || '').toLowerCase().includes(filter.toLowerCase());
 const bandProfiles = {
-  vdipole: { terms:['METEOR','NOAA','OKEAN','SICH','RESURS','ISS'], freq:137.100, profile:'meteor_lrpt_hackrf' },
-  amateur: { terms:['ISS','AO-','SO-','FO-','IO-','RS-','CAS-','XW-','TEVEL','LILACSAT','HAMSAT'], freq:145.825, profile:'raw_iq_hackrf' },
-  lband: { terms:['SKYTERRA','INMARSAT','IRIDIUM','GLOBALSTAR','ORBCOMM','GOES','FENGYUN','METOP','AQUA','TERRA','SUOMI','LANDSAT'], freq:1545.000, profile:'raw_iq_hackrf' },
-  adsb: { terms:['ADS-B','ADSB'], freq:1090.000, profile:'raw_iq_hackrf' },
+  vdipole: { label:'V-dipole VHF', ranges:[[136e6, 138e6]], freq:137.100, profile:'meteor_lrpt_hackrf' },
+  amateur: { label:'Amateur VHF/UHF', ranges:[[144e6, 148e6], [430e6, 450e6]], freq:145.825, profile:'raw_iq_hackrf' },
+  lband: { label:'L-band / patch', ranges:[[1525e6, 1710e6]], freq:1545.000, profile:'raw_iq_hackrf' },
+  adsb: { label:'1090 / ADS-B antenna', ranges:[[1087e6, 1093e6]], freq:1090.000, profile:'raw_iq_hackrf' },
 };
-function passBand(pass){
-  const name = String(pass.name || '').toUpperCase();
-  for(const [band, cfg] of Object.entries(bandProfiles)){
-    if(cfg.terms.some(term => name.includes(term))) return band;
+function txFrequency(tx){ return Number(tx.downlink_low || tx.downlink_high || 0); }
+function txIsUsable(tx){ return tx && tx.alive !== false && tx.status !== 'inactive' && txFrequency(tx) > 0; }
+function transmitterBands(txs){
+  const bands = new Set();
+  for(const tx of (txs || []).filter(txIsUsable)){
+    const f = txFrequency(tx);
+    for(const [band, cfg] of Object.entries(bandProfiles)){
+      if(cfg.ranges.some(([lo, hi]) => f >= lo && f <= hi)) bands.add(band);
+    }
   }
-  return 'unknown';
+  return [...bands];
+}
+function passTransmitters(pass){ return state.transmitters[pass.norad]; }
+function passBands(pass){
+  const txs = passTransmitters(pass);
+  if(!txs) return ['loading'];
+  const bands = transmitterBands(txs);
+  return bands.length ? bands : ['unknown'];
 }
 function bandMatches(pass){
-  return state.bandFilter === 'all' || passBand(pass) === state.bandFilter;
+  if(state.bandFilter === 'all') return true;
+  const bands = passBands(pass);
+  return bands.includes('loading') || bands.includes(state.bandFilter);
 }
 function applyBandDefaults(){
   const cfg = bandProfiles[state.bandFilter];
   if(!cfg) return;
   $('#schedProfile').value = cfg.profile;
   $('#schedFreq').value = cfg.freq.toFixed(3);
+}
+async function fetchTransmitters(norad){
+  if(!norad || state.transmitters[norad]) return;
+  state.transmitters[norad] = [];
+  try {
+    const res = await fetch(`/transmitters?norad=${encodeURIComponent(norad)}`);
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.transmitters[norad] = await res.json();
+  } catch(_){
+    state.transmitters[norad] = [];
+  }
+}
+async function loadTransmittersForPasses(passes){
+  const ids = [...new Set((passes || []).map(p => p.norad).filter(Boolean))];
+  await Promise.all(ids.map(fetchTransmitters));
+  renderPasses();
 }
 function filterTleText(text, group){
   if(group !== 'radio') return text;
@@ -380,6 +411,7 @@ function onWorkerMessage(e){
     $('#predictBtn').disabled = false;
     state.passes = m.passes;
     renderPasses();
+    loadTransmittersForPasses(m.passes);
     if(state.countdownTimer) clearInterval(state.countdownTimer);
     state.countdownTimer = setInterval(updateCountdowns, 1000);
   }
@@ -489,7 +521,7 @@ function renderPasses(){
   tb.innerHTML = filtered.map(({p,i}) => {
     const cls = p.maxEl>=45?'high':p.maxEl>=20?'mid':'low';
     const rule = trackedRuleFor(p);
-    const band = passBand(p);
+    const band = passBands(p).map(b => bandProfiles[b]?.label || b).join(', ');
     const buttonClass = rule ? 'mini schedulePass engaged' : 'mini schedulePass';
     const buttonText = rule ? 'Engaged' : 'Track';
     return `<tr data-i="${i}"><td>${escapeHtml(p.name)}</td>
@@ -513,9 +545,13 @@ function updateCountdowns(){
 }
 
 function defaultFrequencyMhz(pass){
-  const band = passBand(pass);
-  if(bandProfiles[band]) return bandProfiles[band].freq;
-  if(/METEOR-M2\s*4/i.test(pass.name)) return 137.100;
+  const txs = (passTransmitters(pass) || []).filter(txIsUsable);
+  const cfg = bandProfiles[state.bandFilter];
+  if(cfg){
+    const tx = txs.find(t => cfg.ranges.some(([lo, hi]) => txFrequency(t) >= lo && txFrequency(t) <= hi));
+    if(tx) return txFrequency(tx) / 1e6;
+  }
+  if(txs[0]) return txFrequency(txs[0]) / 1e6;
   return +$('#schedFreq').value || 137.100;
 }
 function ruleIdFor(pass, profile){

@@ -49,8 +49,9 @@ for common radio/weather/station/amateur targets. The full `active` catalog is
 still available, but it is much slower for predictions. Overhead, pass, and
 scheduler-rule tables all have full-width text filters for large lists.
 Upcoming passes also have an equipment/band filter for common VHF, amateur,
-L-band, and 1090 MHz antenna setups. These band matches are name-based
-heuristics because TLEs do not include transmitter frequencies.
+L-band, and 1090 MHz antenna setups. Band matches are based on transmitter
+records from SatNOGS DB, cached under `.txcache/`; satellites without
+transmitter data stay unknown instead of being guessed from their names.
 
 The web UI can also save persistent SDR scheduler rules through the local
 server. Run `python3 serve.py`, predict passes, choose a profile/frequency, and
