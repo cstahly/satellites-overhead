@@ -497,8 +497,18 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
         }
     }
 
+    // Sort rules by next fire time, rules with no predicted pass go last
+    let mut rules_sorted: Vec<&Value> = rules.iter().collect();
+    rules_sorted.sort_by_key(|r| {
+        let id = r["id"].as_str().unwrap_or("—");
+        next_by_rule.get(id)
+            .and_then(|run| run["fire_time"].as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "9999".to_string())
+    });
+
     println!();
-    let rows: Vec<Vec<String>> = rules.iter().map(|r| {
+    let rows: Vec<Vec<String>> = rules_sorted.iter().map(|r| {
         let id = r["id"].as_str().unwrap_or("—");
         let enabled = if r["enabled"].as_bool().unwrap_or(false) { green("yes") } else { red("no") };
         let freq = r["frequency_hz"].as_f64().map(|f| format!("{:.3}", f / 1e6)).unwrap_or_else(|| "—".to_string());
