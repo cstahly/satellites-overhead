@@ -30,10 +30,11 @@
   }
   .card h2 { margin: 0 0 10px; font-size: 15px; }
   .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
-  button, select {
+  button, select, input {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
     border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer;
   }
+  input { cursor: text; width: 92px; }
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: default; }
   button.primary { background: var(--accent); color: #042231; border-color: var(--accent); font-weight: 600; }
@@ -56,6 +57,8 @@
   .progress { height: 6px; background: var(--panel-2); border:1px solid var(--line); border-radius: 999px; overflow: hidden; margin: 8px 0; display:none; }
   .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.1s; }
   .soon { color: var(--good); font-weight: 600; }
+  .mini { padding: 5px 8px; font-size: 12px; }
+  .rule-status { font-size:13px;color:var(--muted);margin-bottom:8px;min-height:18px; }
 </style>
 </head>
 <body>
@@ -133,6 +136,15 @@
             <option value="40">40°</option>
           </select>
         </label>
+        <label class="minel">profile
+          <select id="schedProfile">
+            <option value="meteor_lrpt_hackrf" selected>Meteor LRPT</option>
+            <option value="raw_iq_hackrf">Raw IQ</option>
+          </select>
+        </label>
+        <label class="minel">MHz
+          <input id="schedFreq" type="number" step="0.001" value="137.100">
+        </label>
         <button id="passCsv" title="Download upcoming passes as CSV">⬇ CSV</button>
       </div>
       <div class="progress" id="prog"><div></div></div>
@@ -141,7 +153,23 @@
         <table id="passTbl">
           <thead><tr>
             <th>Satellite</th><th>Starts</th><th>In</th>
-            <th class="num">Max el</th><th>Appears</th><th class="num">Dur</th>
+            <th class="num">Max el</th><th>Appears</th><th class="num">Dur</th><th>Schedule</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
+        <h2 style="margin:0">Scheduler rules</h2>
+        <button id="rulesRefresh" class="mini">Refresh</button>
+      </div>
+      <div id="ruleStatus" class="rule-status">Rules are saved on the local server for the SDR scheduler to read.</div>
+      <div class="scroll" style="max-height:240px">
+        <table id="rulesTbl">
+          <thead><tr>
+            <th>Target</th><th>Profile</th><th class="num">MHz</th><th class="num">Min el</th><th>State</th><th></th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -191,7 +219,11 @@ self.onmessage = (e) => {
     for(let i=0; i+2 < lines.length+1; i+=3){
       const name=(lines[i]||'').trim(), l1=lines[i+1], l2=lines[i+2];
       if(!l1||!l2||l1[0]!=='1'||l2[0]!=='2') continue;
-      try { const sr = satellite.twoline2satrec(l1,l2); if(!sr.error) sats.push({name, satrec: sr}); } catch(_){}
+      try {
+        const sr = satellite.twoline2satrec(l1,l2);
+        const norad = parseInt(l1.slice(2,7), 10);
+        if(!sr.error) sats.push({name, norad, satrec: sr});
+      } catch(_){}
     }
     self.postMessage({type:'loaded', count: sats.length});
   }
@@ -254,7 +286,7 @@ function finish(passes, sat, st, belowT, peakEl){
   const pk = lookAt(sr, d, g);
   if(!pk || pk.el < peakEl) return;
   const rd = new Date(rise), ri = lookAt(sr, rd, satellite.gstime(rd));
-  passes.push({ name: sat.name, start: rise, end: set, maxEl: pk.el, maxAz: pk.az, startAz: ri?ri.az:pk.az });
+  passes.push({ norad: sat.norad, name: sat.name, start: rise, end: set, maxEl: pk.el, maxAz: pk.az, startAz: ri?ri.az:pk.az });
 }
 function bisect(sr, below, above){ // time where el crosses 0
   for(let j=0;j<20 && above-below>500;j++){ const mid=(below+above)/2; if(elAt(sr,mid) < 0) below=mid; else above=mid; }
@@ -392,7 +424,7 @@ function fmtIn(ms){
 }
 function renderPasses(){
   const tb = $('#passTbl tbody');
-  if(!state.passes.length){ tb.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">No passes above the chosen peak elevation in this window.</td></tr>`; $('#passStatus').textContent='Done.'; return; }
+  if(!state.passes.length){ tb.innerHTML = `<tr><td colspan="7" style="color:var(--muted)">No passes above the chosen peak elevation in this window.</td></tr>`; $('#passStatus').textContent='Done.'; return; }
   $('#passStatus').textContent = `${state.passes.length} passes upcoming.`;
   tb.innerHTML = state.passes.map((p,i) => {
     const cls = p.maxEl>=45?'high':p.maxEl>=20?'mid':'low';
@@ -401,7 +433,8 @@ function renderPasses(){
       <td class="in"></td>
       <td class="num"><span class="pill ${cls}">${p.maxEl.toFixed(0)}°</span></td>
       <td>${compass(p.startAz)}→${compass(p.maxAz)}</td>
-      <td class="num">${fmtDur(p.end-p.start)}</td></tr>`;
+      <td class="num">${fmtDur(p.end-p.start)}</td>
+      <td><button class="mini schedulePass" data-i="${i}">Track</button></td></tr>`;
   }).join('');
   updateCountdowns();
 }
@@ -413,6 +446,80 @@ function updateCountdowns(){
     cell.textContent = fmtIn(delta);
     cell.className = 'in' + ((delta>0 && delta<600000) ? ' soon' : '');
   });
+}
+
+function defaultFrequencyMhz(pass){
+  if(/METEOR-M2\s*4/i.test(pass.name)) return 137.100;
+  return +$('#schedFreq').value || 137.100;
+}
+function ruleIdFor(pass, profile){
+  return `sat-${pass.norad}-${profile}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+}
+async function loadRules(){
+  try {
+    const res = await fetch('/scheduler/rules');
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const rules = await res.json();
+    renderRules(rules);
+  } catch(e){
+    $('#ruleStatus').textContent = `Rule list unavailable: ${e.message}`;
+    $('#rulesTbl tbody').innerHTML = `<tr><td colspan="6" style="color:var(--muted)">Run python3 serve.py to use scheduler rules.</td></tr>`;
+  }
+}
+function renderRules(rules){
+  $('#ruleStatus').textContent = `${rules.length} saved scheduler rule${rules.length===1?'':'s'}.`;
+  $('#rulesTbl tbody').innerHTML = rules.map(rule => {
+    const mhz = (Number(rule.frequency_hz || 0) / 1e6).toFixed(3);
+    return `<tr>
+      <td>${escapeHtml(rule.name || rule.id)}</td>
+      <td>${escapeHtml(rule.profile || '')}</td>
+      <td class="num">${mhz}</td>
+      <td class="num">${Number(rule.min_peak_el || 0).toFixed(0)}°</td>
+      <td>${rule.enabled === false ? 'off' : 'on'}</td>
+      <td><button class="mini deleteRule" data-id="${escapeHtml(rule.id)}">Delete</button></td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">No saved scheduler rules.</td></tr>`;
+}
+async function schedulePass(index){
+  const pass = state.passes[index];
+  if(!pass || !pass.norad){ $('#passStatus').textContent = 'Pass has no NORAD ID; reload TLEs and predict again.'; return; }
+  const profile = $('#schedProfile').value;
+  const freqMhz = +$('#schedFreq').value || defaultFrequencyMhz(pass);
+  $('#schedFreq').value = freqMhz.toFixed(3);
+  const rule = {
+    id: ruleIdFor(pass, profile),
+    enabled: true,
+    type: 'satellite_recurring',
+    name: pass.name,
+    norad: pass.norad,
+    group: state.group,
+    frequency_hz: Math.round(freqMhz * 1e6),
+    profile,
+    min_peak_el: +$('#peakEl').value,
+    start_offset_s: -30,
+    end_offset_s: 60,
+  };
+  try {
+    const res = await fetch('/scheduler/rules', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(rule),
+    });
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    $('#passStatus').textContent = `Scheduler rule saved for ${pass.name}.`;
+    await loadRules();
+  } catch(e){
+    $('#passStatus').textContent = `Could not save scheduler rule: ${e.message}`;
+  }
+}
+async function deleteRule(id){
+  try {
+    const res = await fetch(`/scheduler/rules/${encodeURIComponent(id)}`, {method:'DELETE'});
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    await loadRules();
+  } catch(e){
+    $('#ruleStatus').textContent = `Could not delete rule: ${e.message}`;
+  }
 }
 
 // ---------- events ----------
@@ -442,6 +549,16 @@ $('#predictBtn').addEventListener('click', () => {
   $('#passStatus').textContent = `Scanning ${state.count} satellites over the next ${windowHrs}h…`;
   worker.postMessage({ type:'predict', startMs: Date.now(), windowHrs, stepSec, peakEl });
 });
+$('#passTbl').addEventListener('click', e => {
+  const btn = e.target.closest('.schedulePass');
+  if(btn) schedulePass(+btn.dataset.i);
+});
+$('#rulesRefresh').addEventListener('click', loadRules);
+$('#rulesTbl').addEventListener('click', e => {
+  const btn = e.target.closest('.deleteRule');
+  if(btn) deleteRule(btn.dataset.id);
+});
+if(location.protocol.startsWith('http')) loadRules();
 
 // ---------- CSV export ----------
 function toCsv(rows){
@@ -479,8 +596,9 @@ $('#passCsv').addEventListener('click', () => {
   const rows = [
     [`# Satellite passes — generated ${new Date().toISOString()}`],
     [`# observer_lat=${obs.lat} observer_lon=${obs.lon} catalog=${state.group}`],
-    ['name','start_local','start_iso','end_iso','duration_s','max_elevation_deg','rise_direction','peak_direction'],
+    ['norad','name','start_local','start_iso','end_iso','duration_s','max_elevation_deg','rise_direction','peak_direction'],
     ...list.map(p => [
+      p.norad || '',
       p.name,
       new Date(p.start).toLocaleString(),
       new Date(p.start).toISOString(),

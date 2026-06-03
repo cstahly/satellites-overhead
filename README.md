@@ -20,9 +20,35 @@ python3 serve.py            # defaults to port 8723
 ```
 
 No build step, no npm install. Needs Python 3 and internet (for the CDN script
-and CelesTrak). To reach it from a phone on the same LAN, it already binds
+and CelesTrak). The headless pass predictor also needs PyEphem
+(`python3 -m pip install ephem` if your distro does not already package it).
+To reach it from a phone on the same LAN, it already binds
 `0.0.0.0` — browse to `http://<host-ip>:8723` (note: mobile browsers may block
 geolocation over a plain LAN IP without HTTPS).
+
+## Headless pass JSON
+
+For scheduler integrations, use the Python predictor instead of the browser:
+
+```bash
+python3 predict.py --lat 40.42 --lon -86.88 --alt-m 180 \
+  --hours 8 --min-el 5 --norad 59051 --track-step-s 10
+```
+
+Or run the server and query `/passes`:
+
+```bash
+curl 'http://localhost:8723/passes?group=active&lat=40.42&lon=-86.88&alt_m=180&hours=8&min_el=5&norad=59051&track_step_s=10'
+```
+
+The response includes `norad`, `aos`, `los`, `max_el`, `aos_az`, `los_az`,
+`duration_s`, and a sampled `track` of `{t, az, el, range, range_rate}` points.
+
+The web UI can also save persistent SDR scheduler rules through the local
+server. Run `python3 serve.py`, predict passes, choose a profile/frequency, and
+click `Track` on a pass. Rules are stored at `~/sdr_scheduler_rules.json`; the
+scheduler reads that file directly, so it does not depend on the web server
+staying online after the rule is saved.
 
 ## How it works
 

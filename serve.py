@@ -10,6 +10,7 @@ fetch fails, the last good copy on disk is served instead.
 Usage:  python3 serve.py [port]        (default 8723)
 """
 import http.server
+import json
 import os
 import socketserver
 import sys
@@ -17,15 +18,100 @@ import time
 import urllib.request
 from urllib.parse import urlparse, parse_qs
 
+from predict import parse_start, parse_tles, predict_passes, select_tles
+
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8723
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(ROOT, ".tlecache")
+RULES_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_rules.json")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 
 # Only allow the catalogs the app exposes (also prevents using us as an open proxy).
 ALLOWED = {"active", "visual", "stations", "starlink", "gps-ops", "science"}
 
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def first_value(qs, name, default=None):
+    return qs.get(name, [default])[0]
+
+
+def float_param(qs, name, default=None, required=False):
+    value = first_value(qs, name, default)
+    if value is None:
+        if required:
+            raise ValueError(f"missing required parameter: {name}")
+        return None
+    return float(value)
+
+
+def int_param(qs, name, default=None):
+    value = first_value(qs, name, default)
+    return None if value is None else int(value)
+
+
+def write_json(handler, status, payload):
+    body = json.dumps(payload, indent=2).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def read_rules():
+    if not os.path.exists(RULES_PATH):
+        return []
+    with open(RULES_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else []
+
+
+def write_rules(rules):
+    tmp = RULES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rules, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, RULES_PATH)
+
+
+def validate_rule(rule):
+    if not isinstance(rule, dict):
+        raise ValueError("rule must be an object")
+    rule_id = str(rule.get("id") or "").strip()
+    if not rule_id:
+        raise ValueError("rule.id is required")
+    if rule.get("type") != "satellite_recurring":
+        raise ValueError("only satellite_recurring rules are supported")
+    norad = int(rule.get("norad"))
+    if norad <= 0:
+        raise ValueError("rule.norad must be positive")
+    freq_hz = float(rule.get("frequency_hz"))
+    if freq_hz <= 0:
+        raise ValueError("rule.frequency_hz must be positive")
+    min_el = float(rule.get("min_peak_el", 10))
+    if min_el < 0 or min_el > 90:
+        raise ValueError("rule.min_peak_el must be between 0 and 90")
+    profile = str(rule.get("profile", "raw_iq_hackrf"))
+    if profile not in {"meteor_lrpt_hackrf", "raw_iq_hackrf"}:
+        raise ValueError("unsupported rule.profile")
+    clean = {
+        "id": rule_id,
+        "enabled": bool(rule.get("enabled", True)),
+        "type": "satellite_recurring",
+        "name": str(rule.get("name") or f"NORAD {norad}"),
+        "norad": norad,
+        "group": str(rule.get("group") or "active"),
+        "frequency_hz": freq_hz,
+        "profile": profile,
+        "min_peak_el": min_el,
+        "start_offset_s": int(rule.get("start_offset_s", -30)),
+        "end_offset_s": int(rule.get("end_offset_s", 60)),
+        "created_at": str(rule.get("created_at") or ""),
+        "updated_at": str(rule.get("updated_at") or ""),
+    }
+    return clean
 
 
 def fetch_tle(group):
@@ -80,6 +166,106 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             sys.stderr.write(f"[tle] {group}: {source}, {len(body)} bytes\n")
+            return
+        if parsed.path == "/passes":
+            qs = parse_qs(parsed.query)
+            group = first_value(qs, "group", "active").lower()
+            if group not in ALLOWED:
+                self.send_error(400, "unknown group")
+                return
+            try:
+                lat = float_param(qs, "lat", required=True)
+                lon = float_param(qs, "lon", required=True)
+                alt_m = float_param(qs, "alt_m", 0.0)
+                hours = float_param(qs, "hours", 24.0)
+                min_el = float_param(qs, "min_el", 10.0)
+                min_duration_s = int_param(qs, "min_duration_s", 0)
+                track_step_s = int_param(qs, "track_step_s", 1)
+                limit = int_param(qs, "limit", 100)
+                start = parse_start(first_value(qs, "start"))
+                if track_step_s < 1:
+                    raise ValueError("track_step_s must be >= 1")
+                text, source = fetch_tle(group)
+                names = set(qs.get("name", []))
+                norads = {int(n) for n in qs.get("norad", [])}
+                tles = select_tles(parse_tles(text), names, norads)
+                passes = predict_passes(
+                    tles,
+                    lat=lat,
+                    lon=lon,
+                    alt_m=alt_m,
+                    start=start,
+                    hours=hours,
+                    min_el=min_el,
+                    track_step_s=track_step_s,
+                    min_duration_s=min_duration_s,
+                    limit=limit,
+                )
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(502, f"could not predict passes: {e}")
+                return
+            write_json(self, 200, passes)
+            sys.stderr.write(
+                f"[passes] {group}: {source}, {len(tles)} sats, {len(passes)} passes\n"
+            )
+            return
+        if parsed.path == "/scheduler/rules":
+            try:
+                write_json(self, 200, read_rules())
+            except Exception as e:
+                self.send_error(500, f"could not read scheduler rules: {e}")
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/scheduler/rules":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                incoming = validate_rule(json.loads(body))
+                now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                incoming["updated_at"] = now
+                if not incoming["created_at"]:
+                    incoming["created_at"] = now
+                rules = read_rules()
+                replaced = False
+                for i, rule in enumerate(rules):
+                    if rule.get("id") == incoming["id"]:
+                        incoming["created_at"] = rule.get("created_at") or incoming["created_at"]
+                        rules[i] = incoming
+                        replaced = True
+                        break
+                if not replaced:
+                    rules.append(incoming)
+                write_rules(rules)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"could not save scheduler rule: {e}")
+                return
+            write_json(self, 200, incoming)
+            sys.stderr.write(f"[scheduler] saved rule {incoming['id']}\n")
+            return
+        super().do_GET()
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/scheduler/rules/"):
+            rule_id = parsed.path.rsplit("/", 1)[-1]
+            try:
+                rules = read_rules()
+                next_rules = [rule for rule in rules if str(rule.get("id")) != rule_id]
+                write_rules(next_rules)
+            except Exception as e:
+                self.send_error(500, f"could not delete scheduler rule: {e}")
+                return
+            write_json(self, 200, {"deleted": rule_id, "count": len(next_rules)})
+            sys.stderr.write(f"[scheduler] deleted rule {rule_id}\n")
             return
         super().do_GET()
 
