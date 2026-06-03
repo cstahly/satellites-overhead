@@ -472,19 +472,24 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
 
 def read_message() -> dict[str, Any] | None:
     header = b""
-    while not header.endswith(b"\r\n\r\n"):
+    while b"\r\n\r\n" not in header and b"\n\n" not in header:
         ch = sys.stdin.buffer.read(1)
         if not ch:
             return None
         header += ch
+    if b"\r\n\r\n" in header:
+        header_bytes, rest = header.split(b"\r\n\r\n", 1)
+    else:
+        header_bytes, rest = header.split(b"\n\n", 1)
     length = None
-    for line in header.decode("ascii", errors="replace").splitlines():
+    for line in header_bytes.decode("ascii", errors="replace").splitlines():
         if line.lower().startswith("content-length:"):
             length = int(line.split(":", 1)[1].strip())
             break
     if length is None:
         raise RuntimeError("missing Content-Length")
-    return json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+    body = rest + sys.stdin.buffer.read(length - len(rest))
+    return json.loads(body[:length].decode("utf-8"))
 
 
 def write_message(message: dict[str, Any]) -> None:
