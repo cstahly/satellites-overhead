@@ -1,5 +1,35 @@
+# TLE and SatNOGS caches — regenerated on demand
+.tlecache/
+.txcache/
+.satcache/
+
+# Python
 __pycache__/
 *.py[cod]
-.venv-mcp/
-.satcache/
-.txcache/
+*.pyo
+.venv*/
+venv/
+env/
+
+# Atomic write temporaries
+*.tmp
+
+# Capture sidecar files written at runtime
+*.pid
+*.claude_monitor.log
+
+# Claude Code worktrees
+.claude/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (satellite.js loaded from CDN, but just in case)
+node_modules/
