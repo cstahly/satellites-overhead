@@ -62,6 +62,22 @@
   .rule-status { font-size:13px;color:var(--muted);margin-bottom:8px;min-height:18px; }
   .filterbar { margin: 6px 0 8px; }
   .filterbar input { width: 100%; padding: 6px 10px; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(2,6,16,0.76); display:none; align-items:center; justify-content:center; padding:20px; z-index:20; }
+  .modal-backdrop.open { display:flex; }
+  .modal { width:min(920px, 96vw); max-height:92vh; overflow:auto; background: var(--panel); border:1px solid var(--line); border-radius:10px; box-shadow:0 24px 80px rgba(0,0,0,0.5); }
+  .modal-head { display:flex; justify-content:space-between; align-items:center; padding:14px 16px; border-bottom:1px solid var(--line); }
+  .modal-body { padding:16px; display:grid; grid-template-columns: minmax(180px, 260px) 1fr; gap:16px; }
+  .modal-body img { width:100%; border-radius:8px; border:1px solid var(--line); background: var(--panel-2); }
+  .detail-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:8px 14px; font-size:13px; }
+  .detail-grid div span { color: var(--muted); display:block; font-size:11px; margin-bottom:2px; }
+  .tx-list { margin-top:14px; max-height:220px; overflow:auto; border-top:1px solid var(--line); }
+  .tx-list table { font-size:12px; }
+  .rule-input { width: 82px; padding: 5px 7px; }
+  .rule-select { padding: 5px 7px; }
+  .ruleEnabled { width: auto; }
+  .row-click { cursor:pointer; }
+  .row-click:hover td:first-child { color: var(--accent); }
+  @media (max-width: 720px) { .modal-body { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -188,12 +204,22 @@
       <div class="scroll" style="max-height:240px">
         <table id="rulesTbl">
           <thead><tr>
-            <th>Target</th><th>Profile</th><th class="num">MHz</th><th class="num">Min el</th><th>State</th><th></th>
+            <th>Target</th><th>Profile</th><th class="num">MHz</th><th class="num">Min el</th><th>Enabled</th><th></th>
           </tr></thead>
           <tbody></tbody>
         </table>
       </div>
     </div>
+  </div>
+</div>
+
+<div id="detailModal" class="modal-backdrop">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="detailTitle" style="margin:0;font-size:16px;">Satellite details</h2>
+      <button id="detailClose" class="mini">Close</button>
+    </div>
+    <div id="detailBody" class="modal-body"></div>
   </div>
 </div>
 
@@ -203,7 +229,7 @@ const state = {
   observer: null, group: 'radio', minEl: 10, count: 0,
   sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
   overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '', bandFilter: 'all',
-  transmitters: {}, autoPredictDone: false,
+  transmitters: {}, satellites: {}, autoPredictDone: false,
 };
 const $ = (s) => document.querySelector(s);
 const statusEl = $('#status');
@@ -271,6 +297,18 @@ async function fetchTransmitters(norad){
 async function loadTransmittersForPasses(passes){
   const ids = [...new Set((passes || []).map(p => p.norad).filter(Boolean))];
   for(const id of ids) fetchTransmitters(id);
+}
+async function fetchSatelliteDetails(norad){
+  if(!norad) return {};
+  if(state.satellites[norad]) return state.satellites[norad];
+  try {
+    const res = await fetch(`/satellite?norad=${encodeURIComponent(norad)}`);
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.satellites[norad] = await res.json();
+  } catch(_){
+    state.satellites[norad] = {};
+  }
+  return state.satellites[norad];
 }
 function filterTleText(text, group){
   if(group !== 'radio') return text;
@@ -535,7 +573,7 @@ function renderPasses(){
     const band = passBands(p).map(bandLabel).join(', ');
     const buttonClass = rule ? 'mini schedulePass engaged' : 'mini schedulePass';
     const buttonText = rule ? 'Engaged' : 'Track';
-    return `<tr data-i="${i}"><td>${escapeHtml(p.name)}</td>
+    return `<tr class="row-click" data-i="${i}"><td>${escapeHtml(p.name)}</td>
       <td>${new Date(p.start).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
       <td class="in"></td>
       <td class="num"><span class="pill ${cls}">${p.maxEl.toFixed(0)}°</span></td>
@@ -554,6 +592,66 @@ function updateCountdowns(){
     cell.className = 'in' + ((delta>0 && delta<600000) ? ' soon' : '');
   });
 }
+
+function fmtMhz(hz){ return hz ? (Number(hz)/1e6).toFixed(6).replace(/0+$/,'').replace(/\.$/,'') + ' MHz' : '—'; }
+function fmtDate(value){ return value ? new Date(value).toLocaleString() : '—'; }
+function satelliteImageUrl(details){
+  if(!details || !details.image) return '';
+  return details.image.startsWith('http') ? details.image : `https://db.satnogs.org/media/${details.image}`;
+}
+function detailsLink(norad){ return `https://db.satnogs.org/satellite/${encodeURIComponent(norad)}/`; }
+function renderTransmittersTable(txs){
+  const rows = (txs || []).filter(txIsUsable).sort((a,b)=>txFrequency(a)-txFrequency(b)).slice(0,24);
+  if(!rows.length) return '<div class="tx-list" style="color:var(--muted);padding-top:10px;">No active transmitter records found.</div>';
+  return `<div class="tx-list"><table><thead><tr><th>Downlink</th><th>Mode</th><th>Description</th><th>Status</th></tr></thead><tbody>
+    ${rows.map(tx => `<tr>
+      <td class="num">${fmtMhz(txFrequency(tx))}</td>
+      <td>${escapeHtml(tx.mode || '')}</td>
+      <td>${escapeHtml(tx.description || tx.service || '')}</td>
+      <td>${escapeHtml(tx.status || (tx.alive ? 'active' : ''))}</td>
+    </tr>`).join('')}
+  </tbody></table></div>`;
+}
+async function openSatelliteDetails(pass){
+  if(!pass) return;
+  $('#detailModal').classList.add('open');
+  $('#detailTitle').textContent = pass.name;
+  $('#detailBody').innerHTML = `<div style="color:var(--muted)">Loading satellite details…</div>`;
+  const [details] = await Promise.all([
+    fetchSatelliteDetails(pass.norad),
+    fetchTransmitters(pass.norad),
+  ]);
+  const txs = passTransmitters(pass) || [];
+  const img = satelliteImageUrl(details);
+  const bands = passBands(pass).map(bandLabel).join(', ');
+  $('#detailTitle').textContent = details.name || pass.name;
+  $('#detailBody').innerHTML = `
+    <div>
+      ${img ? `<img src="${escapeHtml(img)}" alt="${escapeHtml(details.name || pass.name)}">` : `<div style="height:180px;border:1px solid var(--line);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);background:var(--panel-2);">No image</div>`}
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <a href="${detailsLink(pass.norad)}" target="_blank" rel="noopener"><button class="mini">SatNOGS DB</button></a>
+        ${details.website ? `<a href="${escapeHtml(details.website)}" target="_blank" rel="noopener"><button class="mini">Website</button></a>` : ''}
+      </div>
+    </div>
+    <div>
+      <div class="detail-grid">
+        <div><span>NORAD</span>${pass.norad || '—'}</div>
+        <div><span>Status</span>${escapeHtml(details.status || '—')}</div>
+        <div><span>Also known as</span>${escapeHtml(details.names || '—')}</div>
+        <div><span>Countries</span>${escapeHtml(details.countries || '—')}</div>
+        <div><span>Operator</span>${escapeHtml(details.operator || '—')}</div>
+        <div><span>Launched</span>${fmtDate(details.launched)}</div>
+        <div><span>Next AOS</span>${new Date(pass.start).toLocaleString()}</div>
+        <div><span>LOS</span>${new Date(pass.end).toLocaleString()}</div>
+        <div><span>Max elevation</span>${pass.maxEl.toFixed(1)}°</div>
+        <div><span>Path</span>${compass(pass.startAz)} → ${compass(pass.maxAz)}</div>
+        <div><span>Duration</span>${fmtDur(pass.end-pass.start)}</div>
+        <div><span>Equipment bands</span>${escapeHtml(bands)}</div>
+      </div>
+      ${renderTransmittersTable(txs)}
+    </div>`;
+}
+function closeDetails(){ $('#detailModal').classList.remove('open'); }
 
 function defaultFrequencyMhz(pass){
   const txs = (passTransmitters(pass) || []).filter(txIsUsable);
@@ -586,18 +684,45 @@ function renderRules(rules){
   state.rules = rules;
   const filtered = rules.filter(rule => textMatch(`${rule.name || ''} ${rule.id || ''} ${rule.profile || ''} ${rule.norad || ''}`, state.rulesFilter));
   $('#ruleStatus').textContent = state.rulesFilter ? `${filtered.length}/${rules.length} saved scheduler rules shown.` : `${rules.length} saved scheduler rule${rules.length===1?'':'s'}.`;
-  $('#rulesTbl tbody').innerHTML = filtered.map(rule => {
+  $('#rulesTbl tbody').innerHTML = filtered.map((rule, i) => {
     const mhz = (Number(rule.frequency_hz || 0) / 1e6).toFixed(3);
-    return `<tr>
+    return `<tr data-rule-id="${escapeHtml(rule.id)}">
       <td>${escapeHtml(rule.name || rule.id)}</td>
-      <td>${escapeHtml(rule.profile || '')}</td>
-      <td class="num">${mhz}</td>
-      <td class="num">${Number(rule.min_peak_el || 0).toFixed(0)}°</td>
-      <td>${rule.enabled === false ? 'off' : 'on'}</td>
-      <td><button class="mini deleteRule" data-id="${escapeHtml(rule.id)}">Delete</button></td>
+      <td><select class="rule-select ruleProfile">
+        <option value="meteor_lrpt_hackrf" ${rule.profile === 'meteor_lrpt_hackrf' ? 'selected' : ''}>Meteor LRPT</option>
+        <option value="raw_iq_hackrf" ${rule.profile === 'raw_iq_hackrf' ? 'selected' : ''}>Raw IQ</option>
+      </select></td>
+      <td class="num"><input class="rule-input ruleFreq" type="number" step="0.001" value="${mhz}"></td>
+      <td class="num"><input class="rule-input ruleMinEl" type="number" step="1" min="0" max="90" value="${Number(rule.min_peak_el || 0).toFixed(0)}"></td>
+      <td><input class="ruleEnabled" type="checkbox" ${rule.enabled === false ? '' : 'checked'}></td>
+      <td><button class="mini saveRule" data-id="${escapeHtml(rule.id)}">Save</button> <button class="mini deleteRule" data-id="${escapeHtml(rule.id)}">Delete</button></td>
     </tr>`;
   }).join('') || `<tr><td colspan="6" style="color:var(--muted)">No saved scheduler rules match this filter.</td></tr>`;
   if(state.passes.length) renderPasses();
+}
+async function saveRule(id){
+  const rule = (state.rules || []).find(r => String(r.id) === String(id));
+  const row = [...document.querySelectorAll('#rulesTbl tr[data-rule-id]')].find(tr => tr.dataset.ruleId === String(id));
+  if(!rule || !row) return;
+  const updated = {
+    ...rule,
+    enabled: row.querySelector('.ruleEnabled').checked,
+    profile: row.querySelector('.ruleProfile').value,
+    frequency_hz: Math.round((+row.querySelector('.ruleFreq').value || 0) * 1e6),
+    min_peak_el: +row.querySelector('.ruleMinEl').value,
+  };
+  try {
+    const res = await fetch('/scheduler/rules', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(updated),
+    });
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    $('#ruleStatus').textContent = `Saved ${rule.name || rule.id}.`;
+    await loadRules();
+  } catch(e){
+    $('#ruleStatus').textContent = `Could not save rule: ${e.message}`;
+  }
 }
 async function schedulePass(index){
   const pass = state.passes[index];
@@ -687,10 +812,16 @@ document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', 
 $('#predictBtn').addEventListener('click', runPrediction);
 $('#passTbl').addEventListener('click', e => {
   const btn = e.target.closest('.schedulePass');
-  if(btn) schedulePass(+btn.dataset.i);
+  if(btn){ schedulePass(+btn.dataset.i); return; }
+  const row = e.target.closest('tr[data-i]');
+  if(row) openSatelliteDetails(state.passes[+row.dataset.i]);
 });
+$('#detailClose').addEventListener('click', closeDetails);
+$('#detailModal').addEventListener('click', e => { if(e.target.id === 'detailModal') closeDetails(); });
 $('#rulesRefresh').addEventListener('click', loadRules);
 $('#rulesTbl').addEventListener('click', e => {
+  const save = e.target.closest('.saveRule');
+  if(save){ saveRule(save.dataset.id); return; }
   const btn = e.target.closest('.deleteRule');
   if(btn) deleteRule(btn.dataset.id);
 });

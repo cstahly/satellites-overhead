@@ -60,6 +60,12 @@ remove the saved rule. Rules are stored at `~/sdr_scheduler_rules.json`; the
 scheduler reads that file directly, so it does not depend on the web server
 staying online after the rule is saved.
 
+The Scheduler rules table shows all current rules and lets you edit enabled
+state, profile, frequency, and minimum elevation inline. Clicking an upcoming
+pass row opens satellite details from SatNOGS DB, including image, status,
+launch/country/operator metadata, next pass summary, and active transmitter
+records. Satellite metadata is cached under `.satcache/`.
+
 ## How it works
 
 1. Browser gets geolocation, then `fetch('/tle?group=active')`.

@@ -24,6 +24,7 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8723
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(ROOT, ".tlecache")
 TX_CACHE_DIR = os.path.join(ROOT, ".txcache")
+SAT_CACHE_DIR = os.path.join(ROOT, ".satcache")
 RULES_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_rules.json")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 TX_TTL = 7 * 24 * 3600
@@ -39,6 +40,7 @@ RADIO_NAME_TERMS = (
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(TX_CACHE_DIR, exist_ok=True)
+os.makedirs(SAT_CACHE_DIR, exist_ok=True)
 
 
 def first_value(qs, name, default=None):
@@ -151,6 +153,32 @@ def fetch_transmitters(norad):
             json.dump(data, f, indent=2)
             f.write("\n")
         return data, "satnogs"
+    except Exception:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return json.load(f), "stale cache"
+        raise
+
+
+def fetch_satellite(norad):
+    path = os.path.join(SAT_CACHE_DIR, f"{int(norad)}.json")
+    fresh = os.path.exists(path) and (time.time() - os.path.getmtime(path)) < TX_TTL
+    if fresh:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f), "cache"
+
+    url = f"https://db.satnogs.org/api/satellites/?norad_cat_id={int(norad)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "satellites-overhead/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("unexpected SatNOGS response")
+        payload = data[0] if data else {}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+        return payload, "satnogs"
     except Exception:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
@@ -279,6 +307,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             write_json(self, 200, data)
             sys.stderr.write(f"[transmitters] {norad}: {source}, {len(data)} records\n")
+            return
+        if parsed.path == "/satellite":
+            qs = parse_qs(parsed.query)
+            try:
+                norad = int(first_value(qs, "norad"))
+                data, source = fetch_satellite(norad)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(502, f"could not fetch satellite details: {e}")
+                return
+            write_json(self, 200, data)
+            sys.stderr.write(f"[satellite] {norad}: {source}\n")
             return
         super().do_GET()
 
