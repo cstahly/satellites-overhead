@@ -84,10 +84,12 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
                     samplerate="1e6", iq_swap=True, pipeline="meteor_m2-x_lrpt"):
     logfile = capdir + ".log"
     pidfile = capdir + ".pid"
-    flags = ("--iq_swap " if iq_swap else "") + f"sr={samplerate}"
+    # Convert samplerate to integer — satdump rejects scientific notation strings
+    sr_int = int(float(samplerate)) if samplerate else 1_000_000
+    flags = ("--iq_swap " if iq_swap else "") + f"sr={sr_int}"
     log(f"START {label} — satdump {pipeline} {freq/1e6:.1f} MHz [{flags}] → {capdir} (tail -f {logfile})")
     cmd = ["satdump", "live", pipeline, capdir,
-           "--source", "hackrf", "--samplerate", str(samplerate),
+           "--source", "hackrf", "--samplerate", str(sr_int),
            "--frequency", str(freq),
            "--lna_gain", str(lna), "--vga_gain", str(vga),
            "--amp", str(amp),
@@ -271,7 +273,8 @@ def _monitor_satdump(capdir, kwargs):
     if status == "synced":
         return  # healthy, nothing to do
 
-    retry_idx = int(kwargs.get("_retry_idx") or 0)
+    _ri = kwargs.get("_retry_idx")
+    retry_idx = int(_ri) if _ri is not None else -1  # -1 so next_idx=0 picks variant[0]
 
     if result.get("killed_pid"):
         next_idx = retry_idx + 1
@@ -407,7 +410,8 @@ def build_scan_now_job(command):
     iq_swap = bool(command.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"]))
     default_pipeline = "meteor_m2-x_lrpt" if profile == "meteor_lrpt_hackrf" else "orbcomm_stx_auto_plotter"
     pipeline = str(command.get("pipeline") or default_pipeline)
-    retry_idx = int(command.get("_retry_idx") or 0)
+    _ri = command.get("_retry_idx")
+    retry_idx = int(_ri) if _ri is not None else -1  # -1 so first retry picks variant[0]
     common = {
         "_command_id": command_id,
         "_queued_at": command.get("queued_at"),

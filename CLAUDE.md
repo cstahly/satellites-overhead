@@ -105,19 +105,33 @@ intervened or found a problem, 2 if the log isn't there yet.
 ### NOSYNC troubleshooting order
 
 The persistent `Viterbi SYNCED + BER 0.000 + Deframer NOSYNC` issue has been
-seen on every capture so far. Root cause is OQPSK phase ambiguity or IQ swap.
-Try in this order, killing and requeuing after ~60s of NOSYNC with good SNR:
+seen on every M2-4 capture so far (~27 dB SNR, BER=0.000, no CCSDS lock).
+Root cause is OQPSK phase ambiguity or IQ swap. The scheduler auto-retries
+all 4 variants below via `LRPT_RETRY_VARIANTS` (monitor fires at T+90s):
 
-1. `--iq_swap --samplerate 1e6 --pipeline meteor_m2-x_lrpt` (current default)
+1. `--iq_swap --samplerate 1e6 --pipeline meteor_m2-x_lrpt`
 2. No `--iq_swap`, `--samplerate 1e6`
 3. `--iq_swap`, `--samplerate 2e6`
-4. Pipeline `meteor_m2_lrpt` (older QPSK decoder, different decode chain)
+4. No `--iq_swap`, pipeline `meteor_m2_lrpt` (older QPSK decoder)
+
+**Important:** Variant 1 (iq_swap=True, 1e6) was NEVER actually tried on any
+pass before June 3 — due to a retry_idx off-by-one bug that skipped variant[0]
+and started at variant[1]. Fixed June 3 2026. This means iq_swap=True+1e6 is
+still untested — it's the most likely fix. Watch the next M2-4 pass closely.
+
+Next M2-4 pass: **June 4 15:21 EDT, 42°**
 
 SatDump v1.2.3 is installed. The pre-1.0 Viterbi padding bug is not present.
 The CCSDS ASM (0x1ACFFC1D) repeats every frame — NOSYNC is not caused by
 joining mid-pass. It is a pipeline configuration issue.
 
 ## Scheduler known bugs / quirks
+
+**Retry variant off-by-one (FIXED June 3 2026):** The monitor retry loop was
+using `int(kwargs.get("_retry_idx") or 0)` — when `_retry_idx` was None (initial
+rule job) or 0 (new scan-now), this yielded 0, so `next_idx = 1` and
+`LRPT_RETRY_VARIANTS[0]` (iq_swap=True, 1e6) was NEVER tried. Fixed by using
+`-1` as the sentinel for "no retry yet", so `next_idx = 0` picks variant[0].
 
 **Fire-time boundary bug (FIXED June 3 2026):** `job_fire_dt("HH:MM")` used to
 wrap to the next day if a poll landed at exactly `HH:MM:00.xxx`. Fixed with a
