@@ -107,6 +107,15 @@ def validate_rule(rule):
     profile = str(rule.get("profile", "raw_iq_hackrf"))
     if profile not in {"meteor_lrpt_hackrf", "raw_iq_hackrf"}:
         raise ValueError("unsupported rule.profile")
+    lna_gain = int(rule.get("lna_gain", 32))
+    vga_gain = int(rule.get("vga_gain", 48))
+    amp = int(rule.get("amp", 1))
+    if lna_gain < 0 or lna_gain > 40:
+        raise ValueError("rule.lna_gain must be between 0 and 40")
+    if vga_gain < 0 or vga_gain > 62:
+        raise ValueError("rule.vga_gain must be between 0 and 62")
+    if amp not in {0, 1}:
+        raise ValueError("rule.amp must be 0 or 1")
     clean = {
         "id": rule_id,
         "enabled": bool(rule.get("enabled", True)),
@@ -116,6 +125,9 @@ def validate_rule(rule):
         "group": str(rule.get("group") or "active"),
         "frequency_hz": freq_hz,
         "profile": profile,
+        "lna_gain": lna_gain,
+        "vga_gain": vga_gain,
+        "amp": amp,
         "min_peak_el": min_el,
         "start_offset_s": int(rule.get("start_offset_s", -30)),
         "end_offset_s": int(rule.get("end_offset_s", 60)),

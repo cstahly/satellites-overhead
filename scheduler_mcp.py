@@ -48,10 +48,10 @@ RADIO_NAME_TERMS = (
     "SKYTERRA", "INMARSAT", "IRIDIUM", "GLOBALSTAR", "ORBCOMM",
 )
 BAND_RANGES = {
-    "vdipole": {"label": "V-dipole VHF", "ranges": [(136e6, 138e6)], "profile": "meteor_lrpt_hackrf", "frequency_hz": 137_100_000},
-    "amateur": {"label": "Amateur VHF/UHF", "ranges": [(144e6, 148e6), (430e6, 450e6)], "profile": "raw_iq_hackrf", "frequency_hz": 145_825_000},
-    "lband": {"label": "L-band / patch", "ranges": [(1525e6, 1710e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_545_000_000},
-    "adsb": {"label": "1090 / ADS-B antenna", "ranges": [(1087e6, 1093e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_090_000_000},
+    "vdipole": {"label": "V-dipole VHF", "ranges": [(136e6, 138e6)], "profile": "meteor_lrpt_hackrf", "frequency_hz": 137_100_000, "lna_gain": 16, "vga_gain": 36, "amp": 1},
+    "amateur": {"label": "Amateur VHF/UHF", "ranges": [(144e6, 148e6), (430e6, 450e6)], "profile": "raw_iq_hackrf", "frequency_hz": 145_825_000, "lna_gain": 32, "vga_gain": 48, "amp": 1},
+    "lband": {"label": "L-band / patch", "ranges": [(1525e6, 1710e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_545_000_000, "lna_gain": 32, "vga_gain": 48, "amp": 1},
+    "adsb": {"label": "1090 / ADS-B antenna", "ranges": [(1087e6, 1093e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_090_000_000, "lna_gain": 32, "vga_gain": 48, "amp": 1},
 }
 
 
@@ -107,6 +107,15 @@ def validate_rule(rule: dict[str, Any]) -> dict[str, Any]:
     profile = str(rule.get("profile") or "raw_iq_hackrf")
     if profile not in CAPTURE_PROFILES:
         raise ValueError(f"unsupported rule.profile: {profile}")
+    lna_gain = int(rule.get("lna_gain", 32))
+    vga_gain = int(rule.get("vga_gain", 48))
+    amp = int(rule.get("amp", 1))
+    if lna_gain < 0 or lna_gain > 40:
+        raise ValueError("rule.lna_gain must be between 0 and 40")
+    if vga_gain < 0 or vga_gain > 62:
+        raise ValueError("rule.vga_gain must be between 0 and 62")
+    if amp not in {0, 1}:
+        raise ValueError("rule.amp must be 0 or 1")
     return {
         "id": rule_id,
         "enabled": bool(rule.get("enabled", True)),
@@ -116,6 +125,9 @@ def validate_rule(rule: dict[str, Any]) -> dict[str, Any]:
         "group": str(rule.get("group") or "radio"),
         "frequency_hz": frequency_hz,
         "profile": profile,
+        "lna_gain": lna_gain,
+        "vga_gain": vga_gain,
+        "amp": amp,
         "min_peak_el": min_peak_el,
         "start_offset_s": int(rule.get("start_offset_s", -30)),
         "end_offset_s": int(rule.get("end_offset_s", 60)),
@@ -257,6 +269,9 @@ def make_rule_from_args(args: dict[str, Any]) -> dict[str, Any]:
         "group": str(args.get("group") or "radio"),
         "frequency_hz": float(args["frequency_hz"]),
         "profile": profile,
+        "lna_gain": int(args.get("lna_gain", 32)),
+        "vga_gain": int(args.get("vga_gain", 48)),
+        "amp": int(args.get("amp", 1)),
         "min_peak_el": float(args.get("min_peak_el", 10)),
         "start_offset_s": int(args.get("start_offset_s", -30)),
         "end_offset_s": int(args.get("end_offset_s", 60)),
@@ -283,6 +298,9 @@ def rule_jobs(rule: dict[str, Any], hours: float = 24, limit: int = 4) -> list[d
             "norad": rule["norad"],
             "profile": rule.get("profile"),
             "frequency_hz": rule.get("frequency_hz"),
+            "lna_gain": rule.get("lna_gain", 32),
+            "vga_gain": rule.get("vga_gain", 48),
+            "amp": rule.get("amp", 1),
             "fire_time": iso(fire_dt),
             "aos": p["aos"],
             "los": p["los"],
@@ -331,6 +349,9 @@ def run_now(args: dict[str, Any]) -> dict[str, Any]:
     job = jobs[0]
     duration_s = int(args.get("duration_s") or min(job["duration_s"], 600))
     freq = int(float(rule["frequency_hz"]))
+    lna_gain = str(int(rule.get("lna_gain", 32)))
+    vga_gain = str(int(rule.get("vga_gain", 48)))
+    amp = str(int(rule.get("amp", 1)))
     label = str(rule.get("name") or rule["id"]).replace("/", "_")
     outdir = os.path.join(HOME, "cosmos_captures")
     os.makedirs(outdir, exist_ok=True)
@@ -340,12 +361,12 @@ def run_now(args: dict[str, Any]) -> dict[str, Any]:
         cmd = [
             "satdump", "live", "meteor_m2-x_lrpt", capdir,
             "--source", "hackrf", "--samplerate", "2e6",
-            "--frequency", str(freq), "--lna_gain", "32", "--vga_gain", "48",
+            "--frequency", str(freq), "--lna_gain", lna_gain, "--vga_gain", vga_gain, "--amp", amp,
             "--timeout", str(duration_s),
         ]
     else:
         outfile = os.path.join(outdir, f"{label}_{stamp}.iq")
-        cmd = ["hackrf_transfer", "-r", outfile, "-f", str(freq), "-s", "2000000", "-l", "32", "-g", "40", "-a", "1"]
+        cmd = ["hackrf_transfer", "-r", outfile, "-f", str(freq), "-s", "2000000", "-l", lna_gain, "-g", vga_gain, "-a", amp]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"pid": proc.pid, "command": cmd, "duration_s": duration_s, "source_job": job}
 
@@ -398,6 +419,9 @@ def suggest_capture_settings(args: dict[str, Any]) -> dict[str, Any]:
         "selected_band": band,
         "profile": cfg["profile"],
         "frequency_hz": tx_frequency(selected) if selected else cfg["frequency_hz"],
+        "lna_gain": cfg["lna_gain"],
+        "vga_gain": cfg["vga_gain"],
+        "amp": cfg["amp"],
         "transmitter": selected,
     }
 
@@ -425,6 +449,9 @@ def add_satellite_rule(
     profile: str = "raw_iq_hackrf",
     group: str = "radio",
     min_peak_el: float = 10,
+    lna_gain: int = 32,
+    vga_gain: int = 48,
+    amp: int = 1,
     start_offset_s: int = -30,
     end_offset_s: int = 60,
     enabled: bool = True,

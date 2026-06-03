@@ -74,7 +74,7 @@
   .tx-list table { font-size:12px; }
   .rule-input { width: 82px; padding: 5px 7px; }
   .rule-select { padding: 5px 7px; }
-  .ruleEnabled { width: auto; }
+  .ruleEnabled, .ruleAmp { width: auto; }
   .row-click { cursor:pointer; }
   .row-click:hover td:first-child { color: var(--accent); }
   @media (max-width: 720px) { .modal-body { grid-template-columns: 1fr; } }
@@ -176,6 +176,15 @@
         <label class="minel">MHz
           <input id="schedFreq" type="number" step="0.001" value="137.100">
         </label>
+        <label class="minel">LNA
+          <input id="schedLna" type="number" step="1" min="0" max="40" value="16">
+        </label>
+        <label class="minel">VGA
+          <input id="schedVga" type="number" step="1" min="0" max="62" value="36">
+        </label>
+        <label class="minel">amp
+          <input id="schedAmp" type="checkbox" checked style="width:auto">
+        </label>
         <button id="passCsv" title="Download upcoming passes as CSV">⬇ CSV</button>
       </div>
       <div class="progress" id="prog"><div></div></div>
@@ -204,7 +213,7 @@
       <div class="scroll" style="max-height:240px">
         <table id="rulesTbl">
           <thead><tr>
-            <th>Target</th><th>Capture</th><th class="num">MHz</th><th class="num">Min el</th><th>Enabled</th><th></th>
+            <th>Target</th><th>Capture</th><th class="num">MHz</th><th class="num">LNA</th><th class="num">VGA</th><th>Amp</th><th class="num">Min el</th><th>Enabled</th><th></th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -240,10 +249,10 @@ const escapeHtml = (s) => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>'
 const radioTerms = ['ISS','METEOR','NOAA','FENGYUN','METOP','AQUA','TERRA','SUOMI','LANDSAT','OKEAN','SICH','RESURS','ELEKTRO','GOES','HAMSAT','AO-','SO-','FO-','IO-','RS-','CAS-','XW-','TEVEL','LILACSAT','SKYTERRA','INMARSAT','IRIDIUM','GLOBALSTAR','ORBCOMM'];
 const textMatch = (value, filter) => !filter || String(value || '').toLowerCase().includes(filter.toLowerCase());
 const bandProfiles = {
-  vdipole: { label:'V-dipole VHF', ranges:[[136e6, 138e6]], freq:137.100, profile:'meteor_lrpt_hackrf' },
-  amateur: { label:'Amateur VHF/UHF', ranges:[[144e6, 148e6], [430e6, 450e6]], freq:145.825, profile:'raw_iq_hackrf' },
-  lband: { label:'L-band / patch', ranges:[[1525e6, 1710e6]], freq:1545.000, profile:'raw_iq_hackrf' },
-  adsb: { label:'1090 / ADS-B antenna', ranges:[[1087e6, 1093e6]], freq:1090.000, profile:'raw_iq_hackrf' },
+  vdipole: { label:'V-dipole VHF', ranges:[[136e6, 138e6]], freq:137.100, profile:'meteor_lrpt_hackrf', lna:16, vga:36, amp:1 },
+  amateur: { label:'Amateur VHF/UHF', ranges:[[144e6, 148e6], [430e6, 450e6]], freq:145.825, profile:'raw_iq_hackrf', lna:32, vga:48, amp:1 },
+  lband: { label:'L-band / patch', ranges:[[1525e6, 1710e6]], freq:1545.000, profile:'raw_iq_hackrf', lna:32, vga:48, amp:1 },
+  adsb: { label:'1090 / ADS-B antenna', ranges:[[1087e6, 1093e6]], freq:1090.000, profile:'raw_iq_hackrf', lna:32, vga:48, amp:1 },
 };
 function txFrequency(tx){ return Number(tx.downlink_low || tx.downlink_high || 0); }
 function txIsUsable(tx){ return tx && tx.alive !== false && tx.status !== 'inactive' && txFrequency(tx) > 0; }
@@ -281,6 +290,9 @@ function applyBandDefaults(){
   if(!cfg) return;
   $('#schedProfile').value = cfg.profile;
   $('#schedFreq').value = cfg.freq.toFixed(3);
+  $('#schedLna').value = cfg.lna;
+  $('#schedVga').value = cfg.vga;
+  $('#schedAmp').checked = !!cfg.amp;
 }
 async function fetchTransmitters(norad){
   if(!norad) return [];
@@ -695,7 +707,7 @@ async function loadRules(){
     renderRules(rules);
   } catch(e){
     $('#ruleStatus').textContent = `Rule list unavailable: ${e.message}`;
-    $('#rulesTbl tbody').innerHTML = `<tr><td colspan="6" style="color:var(--muted)">Run python3 serve.py to use scheduler rules.</td></tr>`;
+    $('#rulesTbl tbody').innerHTML = `<tr><td colspan="9" style="color:var(--muted)">Run python3 serve.py to use scheduler rules.</td></tr>`;
   }
 }
 function renderRules(rules){
@@ -704,6 +716,9 @@ function renderRules(rules){
   $('#ruleStatus').textContent = state.rulesFilter ? `${filtered.length}/${rules.length} saved scheduler rules shown.` : `${rules.length} saved scheduler rule${rules.length===1?'':'s'}.`;
   $('#rulesTbl tbody').innerHTML = filtered.map((rule, i) => {
     const mhz = (Number(rule.frequency_hz || 0) / 1e6).toFixed(3);
+    const lna = Number.isFinite(Number(rule.lna_gain)) ? Number(rule.lna_gain) : 16;
+    const vga = Number.isFinite(Number(rule.vga_gain)) ? Number(rule.vga_gain) : 36;
+    const amp = Number.isFinite(Number(rule.amp)) ? Number(rule.amp) : 1;
     return `<tr data-rule-id="${escapeHtml(rule.id)}">
       <td>${escapeHtml(rule.name || rule.id)}</td>
       <td><select class="rule-select ruleProfile">
@@ -711,11 +726,14 @@ function renderRules(rules){
         <option value="raw_iq_hackrf" ${rule.profile === 'raw_iq_hackrf' ? 'selected' : ''}>Raw IQ</option>
       </select></td>
       <td class="num"><input class="rule-input ruleFreq" type="number" step="0.001" value="${mhz}"></td>
+      <td class="num"><input class="rule-input ruleLna" type="number" step="1" min="0" max="40" value="${lna}"></td>
+      <td class="num"><input class="rule-input ruleVga" type="number" step="1" min="0" max="62" value="${vga}"></td>
+      <td><input class="ruleAmp" type="checkbox" ${amp ? 'checked' : ''}></td>
       <td class="num"><input class="rule-input ruleMinEl" type="number" step="1" min="0" max="90" value="${Number(rule.min_peak_el || 0).toFixed(0)}"></td>
       <td><input class="ruleEnabled" type="checkbox" ${rule.enabled === false ? '' : 'checked'}></td>
       <td><button class="mini saveRule" data-id="${escapeHtml(rule.id)}">Save</button> <button class="mini deleteRule" data-id="${escapeHtml(rule.id)}">Delete</button></td>
     </tr>`;
-  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">No saved scheduler rules match this filter.</td></tr>`;
+  }).join('') || `<tr><td colspan="9" style="color:var(--muted)">No saved scheduler rules match this filter.</td></tr>`;
   if(state.passes.length) renderPasses();
 }
 async function saveRule(id){
@@ -727,6 +745,9 @@ async function saveRule(id){
     enabled: row.querySelector('.ruleEnabled').checked,
     profile: row.querySelector('.ruleProfile').value,
     frequency_hz: Math.round((+row.querySelector('.ruleFreq').value || 0) * 1e6),
+    lna_gain: +row.querySelector('.ruleLna').value,
+    vga_gain: +row.querySelector('.ruleVga').value,
+    amp: row.querySelector('.ruleAmp').checked ? 1 : 0,
     min_peak_el: +row.querySelector('.ruleMinEl').value,
   };
   try {
@@ -754,6 +775,8 @@ async function schedulePass(index){
   const profile = $('#schedProfile').value;
   const freqMhz = +$('#schedFreq').value || defaultFrequencyMhz(pass);
   $('#schedFreq').value = freqMhz.toFixed(3);
+  const lnaGain = Number.isFinite(+$('#schedLna').value) ? +$('#schedLna').value : 16;
+  const vgaGain = Number.isFinite(+$('#schedVga').value) ? +$('#schedVga').value : 36;
   const rule = {
     id: ruleIdFor(pass, profile),
     enabled: true,
@@ -763,6 +786,9 @@ async function schedulePass(index){
     group: state.group,
     frequency_hz: Math.round(freqMhz * 1e6),
     profile,
+    lna_gain: lnaGain,
+    vga_gain: vgaGain,
+    amp: $('#schedAmp').checked ? 1 : 0,
     min_peak_el: +$('#peakEl').value,
     start_offset_s: -30,
     end_offset_s: 60,

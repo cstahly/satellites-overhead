@@ -112,10 +112,6 @@ def safe_name(value):
         keep.append(ch if ch.isalnum() else "_")
     return "_".join("".join(keep).strip("_").lower().split("_"))[:40] or "capture"
 
-def m2_4_gain(max_el):
-    if max_el >= 60:
-        return 24, 36
-    return 32, 48
 
 def load_scheduler_rules():
     if not os.path.exists(RULES_PATH):
@@ -143,12 +139,13 @@ def build_rule_jobs(rule, hours=24, limit=4):
         end_offset_s = int(rule.get("end_offset_s", 60))
         fire_dt = iso_to_local_dt(p["aos"]) + datetime.timedelta(seconds=start_offset_s)
         fire_time = fire_dt.strftime("%H:%M")
-        max_el = float(p["max_el"])
-        lna, vga = m2_4_gain(max_el)
+        lna = int(rule.get("lna_gain", 32))
+        vga = int(rule.get("vga_gain", 48))
+        amp = int(rule.get("amp", 1))
         aos_local = fire_time.replace(":", "")
         duration_s = max(1, int(p["duration_s"]) - start_offset_s + end_offset_s)
         freq = float(rule["frequency_hz"])
-        label = f"{rule.get('name', p['name'])} {max_el:.1f}deg"
+        label = f"{rule.get('name', p['name'])} {float(p['max_el']):.1f}deg"
         slug = safe_name(rule.get("name") or p["name"])
         if rule.get("profile") == "meteor_lrpt_hackrf":
             jobs.append((
@@ -160,6 +157,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     freq=freq,
                     lna=lna,
                     vga=vga,
+                    amp=amp,
                     label=f"{label} LRPT",
                 ),
             ))
@@ -172,7 +170,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     duration_s=duration_s,
                     lna=lna,
                     vga=vga,
-                    amp=1,
+                    amp=amp,
                     outfile=f"{CAPDIR}/{slug}_{aos_local}.iq",
                     label=f"{label} IQ",
                 ),
