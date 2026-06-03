@@ -206,10 +206,84 @@ enum Command {
     Report {
         capture_id: String,
     },
+    /// Show log paths and tail recent entries
+    Logs {
+        #[arg(long, default_value_t = 20, help = "Lines to show per log")]
+        tail: usize,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
 enum RuleAction { Enable, Disable }
+
+// ── log helpers ───────────────────────────────────────────────────────────────
+
+fn tail_lines(path: &str, n: usize) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(path) else { return vec![]; };
+    content.lines().rev().take(n).map(String::from).collect::<Vec<_>>()
+        .into_iter().rev().collect()
+}
+
+struct SignalSample {
+    snr: f64,
+    peak_snr: f64,
+    viterbi: String,
+    ber: f64,
+    deframer: String,
+}
+
+fn parse_latest_signal(log_path: &str) -> Option<SignalSample> {
+    let content = std::fs::read_to_string(log_path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    // Walk backwards looking for paired SNR + BER lines
+    let mut i = lines.len();
+    while i >= 2 {
+        i -= 1;
+        let snr_line = lines[i];
+        if !snr_line.contains("SNR :") { continue; }
+        // Look for the BER line nearby (usually next line, sometimes same)
+        let ber_line = if i + 1 < lines.len() && lines[i+1].contains("Viterbi") {
+            lines[i+1]
+        } else if snr_line.contains("Viterbi") {
+            snr_line
+        } else {
+            continue;
+        };
+
+        let snr = snr_line.split("SNR :").nth(1)
+            .and_then(|s| s.trim().split("dB").next())
+            .and_then(|s| s.trim().parse::<f64>().ok())?;
+        let peak_snr = snr_line.split("Peak SNR:").nth(1)
+            .and_then(|s| s.trim().split("dB").next())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(snr);
+        let viterbi = if ber_line.contains("SYNCED") { "SYNCED".to_string() }
+                      else if ber_line.contains("NOSYNC") { "NOSYNC".to_string() }
+                      else { "—".to_string() };
+        let ber = ber_line.split("BER :").nth(1)
+            .and_then(|s| s.trim().split(',').next())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let deframer = if ber_line.contains("Deframer : SYNCED") { "SYNCED".to_string() }
+                       else if ber_line.contains("Deframer : NOSYNC") { "NOSYNC".to_string() }
+                       else { "—".to_string() };
+
+        return Some(SignalSample { snr, peak_snr, viterbi, ber, deframer });
+    }
+    None
+}
+
+fn print_signal(s: &SignalSample) {
+    let snr_str = {
+        let v = format!("{:.1} dB", s.snr);
+        if s.snr >= 15.0 { green(&v) } else if s.snr >= 8.0 { yellow(&v) } else { red(&v) }
+    };
+    let ber_str = format!("{:.4}", s.ber);
+    let deframer_str = if s.deframer == "SYNCED" { green("SYNCED") } else { red(&s.deframer) };
+    let viterbi_str = if s.viterbi == "SYNCED" { green("SYNCED") } else { yellow(&s.viterbi) };
+    println!("  Signal     SNR {} (peak {:.1} dB)  Viterbi {}  BER {}  Deframer {}",
+        snr_str, s.peak_snr, viterbi_str, dim(&ber_str), deframer_str);
+}
 
 // ── command handlers ──────────────────────────────────────────────────────────
 
@@ -233,8 +307,20 @@ fn cmd_status(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> 
             let freq = job.get("frequency_hz").and_then(|v| v.as_f64());
             let freq_str = freq.map(|f| format!("  {:.3} MHz", f / 1e6)).unwrap_or_default();
             let out = job.get("output").and_then(|v| v.as_str()).unwrap_or("");
+            let lna = job.get("lna_gain").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
+            let vga = job.get("vga_gain").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
+            let amp = job.get("amp").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
             println!("  Job        {}{}", bold(label), freq_str);
-            if !out.is_empty() { println!("  Output     {}", dim(out)); }
+            println!("  Gains      LNA={}  VGA={}  amp={}", lna, vga, amp);
+            if !out.is_empty() {
+                let log_path = format!("{}.log", out);
+                println!("  Log        {}", dim(&log_path));
+                if let Some(sig) = parse_latest_signal(&log_path) {
+                    print_signal(&sig);
+                } else {
+                    println!("  Signal     {}", dim("no samples yet — capture may be starting"));
+                }
+            }
         } else {
             let fire = job.get("fire_time").and_then(|v| v.as_str()).unwrap_or("");
             let local = if fire.is_empty() { "—".to_string() } else { fmt_local(fire) };
@@ -243,6 +329,81 @@ fn cmd_status(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> 
         }
         if !msg.is_empty() { println!("  Status     {}", dim(msg)); }
     }
+    println!();
+    Ok(())
+}
+
+fn cmd_logs(client: &reqwest::blocking::Client, base: &str, tail: usize) -> anyhow::Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let sched_log = format!("{}/sdr_scheduler.log", home);
+
+    let data = get(client, &format!("{}/scheduler/status", base))?;
+    let live = data["live"].as_bool().unwrap_or(false);
+    let satdump_log = data["current_job"].as_object()
+        .and_then(|j| j.get("output"))
+        .and_then(|v| v.as_str())
+        .map(|out| format!("{}.log", out));
+
+    println!("\n  {}", bold("Log files"));
+    println!("  Scheduler  {}", cyan(&sched_log));
+    if let Some(ref p) = satdump_log {
+        println!("  SatDump    {}", cyan(p));
+    }
+    println!("\n  {} tail -f {}", dim("follow:"), sched_log);
+    if let Some(ref p) = satdump_log {
+        println!("  {}         tail -f {}", dim("       "), p);
+    }
+
+    println!("\n{}", bold(&format!("  ── scheduler log (last {}) ──────────────────────────", tail)));
+    let sched_lines = tail_lines(&sched_log, tail);
+    if sched_lines.is_empty() {
+        println!("{}", dim("  (empty or not found)"));
+    } else {
+        for line in &sched_lines {
+            println!("  {}", dim(line));
+        }
+    }
+
+    if live {
+        if let Some(ref log_path) = satdump_log {
+            println!("\n{}", bold(&format!("  ── satdump signal (last {}) ──────────────────────────", tail)));
+            // Show only signal-relevant lines
+            let content = std::fs::read_to_string(log_path).unwrap_or_default();
+            let signal_lines: Vec<&str> = content.lines()
+                .filter(|l| l.contains("SNR") || l.contains("Viterbi") || l.contains("Deframer")
+                         || l.contains("SYNCED") || l.contains("NOSYNC") || l.contains("Timeout"))
+                .collect();
+            let show = &signal_lines[signal_lines.len().saturating_sub(tail)..];
+            if show.is_empty() {
+                println!("{}", dim("  (no signal lines yet)"));
+            } else {
+                for line in show {
+                    // strip ANSI escape codes from satdump's coloured output
+                    let clean: String = {
+                        let mut out = String::new();
+                        let mut in_esc = false;
+                        for c in line.chars() {
+                            if c == '\x1b' { in_esc = true; }
+                            else if in_esc { if c == 'm' { in_esc = false; } }
+                            else { out.push(c); }
+                        }
+                        out
+                    };
+                    // colour the line based on content
+                    let formatted = if clean.contains("Deframer : SYNCED") { green(&clean) }
+                                    else if clean.contains("NOSYNC") { yellow(&clean) }
+                                    else { dim(&clean) };
+                    println!("  {}", formatted);
+                }
+            }
+
+            if let Some(sig) = parse_latest_signal(log_path) {
+                println!();
+                print_signal(&sig);
+            }
+        }
+    }
+
     println!();
     Ok(())
 }
@@ -426,6 +587,7 @@ fn main() {
         Command::Captures { norad, limit } => cmd_captures(&client, &cli.url, *norad, *limit, cli.json),
         Command::Scan { norad, duration } => cmd_scan(&client, &cli.url, *norad, *duration),
         Command::Report { capture_id } => cmd_report(&client, &cli.url, capture_id),
+        Command::Logs { tail } => cmd_logs(&client, &cli.url, *tail),
     };
 
     if let Err(e) = result {
