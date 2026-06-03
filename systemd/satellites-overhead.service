@@ -1,0 +1,13 @@
+[Unit]
+Description=Satellites Overhead web app and scheduler API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cstahly/src/satellites-overhead
+ExecStart=/usr/bin/python3 /home/cstahly/src/satellites-overhead/serve.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

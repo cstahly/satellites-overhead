@@ -27,6 +27,24 @@ To reach it from a phone on the same LAN, it already binds
 `0.0.0.0` — browse to `http://<host-ip>:8723` (note: mobile browsers may block
 geolocation over a plain LAN IP without HTTPS).
 
+## Services
+
+The web app/API and SDR scheduler can run as systemd user services:
+
+```bash
+systemctl --user status satellites-overhead.service
+systemctl --user status sdr-scheduler.service
+```
+
+Unit files are tracked under `systemd/` and installed to
+`~/.config/systemd/user/`. User lingering must be enabled for them to start
+after reboot:
+
+```bash
+loginctl enable-linger cstahly
+systemctl --user enable --now satellites-overhead.service sdr-scheduler.service
+```
+
 ## Headless pass JSON
 
 For scheduler integrations, use the Python predictor instead of the browser:
