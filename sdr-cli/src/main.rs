@@ -578,8 +578,26 @@ fn cmd_scan(client: &reqwest::blocking::Client, base: &str, norad: u32, duration
     Ok(())
 }
 
+fn resolve_capture_id(client: &reqwest::blocking::Client, base: &str, id_or_prefix: &str) -> anyhow::Result<String> {
+    if id_or_prefix.len() == 36 {
+        return Ok(id_or_prefix.to_string());
+    }
+    let data = get(client, &format!("{}/captures", base))?;
+    let captures = data.as_array().ok_or_else(|| anyhow::anyhow!("unexpected response"))?;
+    let matched: Vec<&str> = captures.iter()
+        .filter_map(|c| c["id"].as_str())
+        .filter(|id| id.starts_with(id_or_prefix))
+        .collect();
+    match matched.len() {
+        0 => anyhow::bail!("no capture found with id starting '{}'", id_or_prefix),
+        1 => Ok(matched[0].to_string()),
+        n => anyhow::bail!("{} captures match prefix '{}' — be more specific", n, id_or_prefix),
+    }
+}
+
 fn cmd_report(client: &reqwest::blocking::Client, base: &str, capture_id: &str) -> anyhow::Result<()> {
-    let text = get_text(client, &format!("{}/captures/{}/report", base, capture_id))?;
+    let full_id = resolve_capture_id(client, base, capture_id)?;
+    let text = get_text(client, &format!("{}/captures/{}/report", base, &full_id))?;
     println!("{}", text);
     Ok(())
 }
