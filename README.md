@@ -80,6 +80,19 @@ runs; dry-running a rule; starting an immediate confirmed capture; and reading
 scheduler status. The MCP server uses the same `~/sdr_scheduler_rules.json`,
 TLE cache, SatNOGS cache, and Python predictor as the web/server side.
 
+The registered command uses a repo-local virtualenv:
+
+```bash
+python3 -m venv .venv-mcp
+.venv-mcp/bin/python -m pip install mcp ephem
+```
+
+```toml
+[mcp_servers.sdr-scheduler]
+command = "/home/cstahly/src/satellites-overhead/.venv-mcp/bin/python"
+args = ["-u", "/home/cstahly/src/satellites-overhead/scheduler_mcp.py"]
+```
+
 ## How it works
 
 1. Browser gets geolocation, then `fetch('/tle?group=active')`.

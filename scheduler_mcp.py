@@ -16,6 +16,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from mcp.server.fastmcp import FastMCP
+
 from predict import load_tles, look_at, make_observer, parse_start, predict_passes, select_tles
 
 try:
@@ -400,154 +402,145 @@ def suggest_capture_settings(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def tool_result(payload: Any) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
+mcp = FastMCP("sdr-scheduler")
 
 
-def schema(props: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
-    return {"type": "object", "properties": props, "required": required or []}
+@mcp.tool()
+def list_scheduler_rules() -> list[dict[str, Any]]:
+    """List all SDR scheduler rules."""
+    return read_rules()
 
 
-TOOLS = [
-    {"name": "list_scheduler_rules", "description": "List all SDR scheduler rules.", "inputSchema": schema({})},
-    {"name": "get_scheduler_rule", "description": "Get one scheduler rule by id.", "inputSchema": schema({"rule_id": {"type": "string"}}, ["rule_id"])},
-    {"name": "add_satellite_rule", "description": "Create or replace a recurring satellite scheduler rule.", "inputSchema": schema({
-        "norad": {"type": "integer"}, "name": {"type": "string"}, "frequency_hz": {"type": "number"},
-        "profile": {"type": "string", "enum": sorted(CAPTURE_PROFILES)}, "group": {"type": "string"},
-        "min_peak_el": {"type": "number"}, "start_offset_s": {"type": "integer"}, "end_offset_s": {"type": "integer"},
-        "enabled": {"type": "boolean"}, "id": {"type": "string"},
-    }, ["norad", "frequency_hz"])},
-    {"name": "update_scheduler_rule", "description": "Patch a scheduler rule by id.", "inputSchema": schema({"rule_id": {"type": "string"}, "updates": {"type": "object"}}, ["rule_id", "updates"])},
-    {"name": "delete_scheduler_rule", "description": "Delete a scheduler rule by id.", "inputSchema": schema({"rule_id": {"type": "string"}}, ["rule_id"])},
-    {"name": "enable_scheduler_rule", "description": "Enable a scheduler rule by id.", "inputSchema": schema({"rule_id": {"type": "string"}}, ["rule_id"])},
-    {"name": "disable_scheduler_rule", "description": "Disable a scheduler rule by id.", "inputSchema": schema({"rule_id": {"type": "string"}}, ["rule_id"])},
-    {"name": "predict_satellite_passes", "description": "Predict satellite passes using cached TLEs.", "inputSchema": schema({
-        "group": {"type": "string"}, "norads": {"type": "array", "items": {"type": "integer"}}, "names": {"type": "array", "items": {"type": "string"}},
-        "lat": {"type": "number"}, "lon": {"type": "number"}, "alt_m": {"type": "number"}, "start": {"type": "string"},
-        "hours": {"type": "number"}, "min_el": {"type": "number"}, "track_step_s": {"type": "integer"}, "limit": {"type": "integer"},
-    })},
-    {"name": "list_overhead_now", "description": "List satellites currently above the selected elevation.", "inputSchema": schema({
-        "group": {"type": "string"}, "lat": {"type": "number"}, "lon": {"type": "number"}, "alt_m": {"type": "number"},
-        "min_el": {"type": "number"}, "limit": {"type": "integer"}, "at": {"type": "string"},
-    })},
-    {"name": "list_radio_targets", "description": "List cached radio target satellites.", "inputSchema": schema({"query": {"type": "string"}, "group": {"type": "string"}, "limit": {"type": "integer"}})},
-    {"name": "get_satellite_details", "description": "Get SatNOGS satellite metadata by NORAD id.", "inputSchema": schema({"norad": {"type": "integer"}}, ["norad"])},
-    {"name": "list_satellite_transmitters", "description": "Get SatNOGS transmitter records by NORAD id.", "inputSchema": schema({"norad": {"type": "integer"}}, ["norad"])},
-    {"name": "suggest_capture_settings", "description": "Suggest frequency/profile from transmitter records and antenna band.", "inputSchema": schema({"norad": {"type": "integer"}, "band": {"type": "string"}}, ["norad"])},
-    {"name": "list_upcoming_scheduler_runs", "description": "List upcoming jobs generated from enabled rules.", "inputSchema": schema({"hours": {"type": "number"}, "limit_per_rule": {"type": "integer"}})},
-    {"name": "dry_run_scheduler_rule", "description": "Show jobs a scheduler rule would create.", "inputSchema": schema({"rule_id": {"type": "string"}, "hours": {"type": "number"}, "limit": {"type": "integer"}}, ["rule_id"])},
-    {"name": "run_scheduler_rule_now", "description": "Start an immediate capture for a rule. Requires confirm=true.", "inputSchema": schema({"rule_id": {"type": "string"}, "confirm": {"type": "boolean"}, "hours": {"type": "number"}, "duration_s": {"type": "integer"}}, ["rule_id", "confirm"])},
-    {"name": "get_scheduler_status", "description": "Return scheduler paths, rule counts, cache paths, and log tail.", "inputSchema": schema({})},
-]
+@mcp.tool()
+def get_scheduler_rule(rule_id: str) -> dict[str, Any]:
+    """Get one scheduler rule by id."""
+    return find_rule(rule_id)
 
 
-def call_tool(name: str, args: dict[str, Any]) -> Any:
-    if name == "list_scheduler_rules":
-        return read_rules()
-    if name == "get_scheduler_rule":
-        return find_rule(str(args["rule_id"]))
-    if name == "add_satellite_rule":
-        return upsert_rule(make_rule_from_args(args))
-    if name == "update_scheduler_rule":
-        return update_rule_fields(str(args["rule_id"]), dict(args["updates"]))
-    if name == "delete_scheduler_rule":
-        return delete_rule(str(args["rule_id"]))
-    if name == "enable_scheduler_rule":
-        return update_rule_fields(str(args["rule_id"]), {"enabled": True})
-    if name == "disable_scheduler_rule":
-        return update_rule_fields(str(args["rule_id"]), {"enabled": False})
-    if name == "predict_satellite_passes":
-        return predict_for_args(args)
-    if name == "list_overhead_now":
-        return list_overhead_now(args)
-    if name == "list_radio_targets":
-        return list_radio_targets(args)
-    if name == "get_satellite_details":
-        data, source = fetch_satellite(int(args["norad"]))
-        return {"source": source, "satellite": data}
-    if name == "list_satellite_transmitters":
-        data, source = fetch_transmitters(int(args["norad"]))
-        return {"source": source, "transmitters": data}
-    if name == "suggest_capture_settings":
-        return suggest_capture_settings(args)
-    if name == "list_upcoming_scheduler_runs":
-        return all_upcoming_jobs(float(args.get("hours", 24)), int(args.get("limit_per_rule", 4)))
-    if name == "dry_run_scheduler_rule":
-        return rule_jobs(find_rule(str(args["rule_id"])), float(args.get("hours", 24)), int(args.get("limit", 4)))
-    if name == "run_scheduler_rule_now":
-        return run_now(args)
-    if name == "get_scheduler_status":
-        return get_status()
-    raise ValueError(f"unknown tool: {name}")
+@mcp.tool()
+def add_satellite_rule(
+    norad: int,
+    frequency_hz: float,
+    name: str = "",
+    profile: str = "raw_iq_hackrf",
+    group: str = "radio",
+    min_peak_el: float = 10,
+    start_offset_s: int = -30,
+    end_offset_s: int = 60,
+    enabled: bool = True,
+    id: str = "",
+) -> dict[str, Any]:
+    """Create or replace a recurring satellite scheduler rule."""
+    return upsert_rule(make_rule_from_args(locals()))
 
 
-def read_message() -> dict[str, Any] | None:
-    header = b""
-    while b"\r\n\r\n" not in header and b"\n\n" not in header:
-        ch = sys.stdin.buffer.read(1)
-        if not ch:
-            debug("stdin closed")
-            return None
-        header += ch
-    if b"\r\n\r\n" in header:
-        header_bytes, rest = header.split(b"\r\n\r\n", 1)
-    else:
-        header_bytes, rest = header.split(b"\n\n", 1)
-    length = None
-    for line in header_bytes.decode("ascii", errors="replace").splitlines():
-        if line.lower().startswith("content-length:"):
-            length = int(line.split(":", 1)[1].strip())
-            break
-    if length is None:
-        debug(f"missing Content-Length in header: {header_bytes!r}")
-        raise RuntimeError("missing Content-Length")
-    body = rest + sys.stdin.buffer.read(length - len(rest))
-    message = json.loads(body[:length].decode("utf-8"))
-    debug(f"recv method={message.get('method')} id={message.get('id')}")
-    return message
+@mcp.tool()
+def update_scheduler_rule(rule_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    """Patch a scheduler rule by id."""
+    return update_rule_fields(rule_id, updates)
 
 
-def write_message(message: dict[str, Any]) -> None:
-    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
-    sys.stdout.buffer.flush()
-    debug(f"sent id={message.get('id')} keys={list(message.keys())}")
+@mcp.tool()
+def delete_scheduler_rule(rule_id: str) -> dict[str, Any]:
+    """Delete a scheduler rule by id."""
+    return delete_rule(rule_id)
 
 
-def handle(message: dict[str, Any]) -> dict[str, Any] | None:
-    if "id" not in message:
-        return None
-    msg_id = message["id"]
-    method = message.get("method")
-    params = message.get("params") or {}
-    try:
-        if method == "initialize":
-            result = {
-                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "sdr-scheduler", "version": "0.1.0"},
-            }
-        elif method == "tools/list":
-            result = {"tools": TOOLS}
-        elif method == "tools/call":
-            result = tool_result(call_tool(params["name"], params.get("arguments") or {}))
-        else:
-            return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"method not found: {method}"}}
-        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
-    except Exception as exc:
-        return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32000, "message": str(exc)}}
+@mcp.tool()
+def enable_scheduler_rule(rule_id: str) -> dict[str, Any]:
+    """Enable a scheduler rule by id."""
+    return update_rule_fields(rule_id, {"enabled": True})
 
 
-def main() -> int:
-    debug(f"start argv={sys.argv!r} cwd={os.getcwd()!r}")
-    while True:
-        message = read_message()
-        if message is None:
-            return 0
-        response = handle(message)
-        if response is not None:
-            write_message(response)
+@mcp.tool()
+def disable_scheduler_rule(rule_id: str) -> dict[str, Any]:
+    """Disable a scheduler rule by id."""
+    return update_rule_fields(rule_id, {"enabled": False})
+
+
+@mcp.tool()
+def predict_satellite_passes(
+    group: str = "radio",
+    norads: list[int] | None = None,
+    names: list[str] | None = None,
+    lat: float = DEFAULT_LAT,
+    lon: float = DEFAULT_LON,
+    alt_m: float = DEFAULT_ALT_M,
+    start: str | None = None,
+    hours: float = 24,
+    min_el: float = 10,
+    min_duration_s: int = 0,
+    track_step_s: int = 60,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Predict satellite passes using cached TLEs."""
+    return predict_for_args(locals())
+
+
+@mcp.tool(name="list_overhead_now")
+def list_overhead_now_tool(
+    group: str = "radio",
+    lat: float = DEFAULT_LAT,
+    lon: float = DEFAULT_LON,
+    alt_m: float = DEFAULT_ALT_M,
+    min_el: float = 0,
+    limit: int = 100,
+    at: str | None = None,
+) -> list[dict[str, Any]]:
+    """List satellites currently above the selected elevation."""
+    return list_overhead_now(locals())
+
+
+@mcp.tool(name="list_radio_targets")
+def list_radio_targets_tool(query: str = "", group: str = "radio", limit: int = 200) -> list[dict[str, Any]]:
+    """List cached radio target satellites."""
+    return list_radio_targets(locals())
+
+
+@mcp.tool()
+def get_satellite_details(norad: int) -> dict[str, Any]:
+    """Get SatNOGS satellite metadata by NORAD id."""
+    data, source = fetch_satellite(norad)
+    return {"source": source, "satellite": data}
+
+
+@mcp.tool()
+def list_satellite_transmitters(norad: int) -> dict[str, Any]:
+    """Get SatNOGS transmitter records by NORAD id."""
+    data, source = fetch_transmitters(norad)
+    return {"source": source, "transmitters": data}
+
+
+@mcp.tool(name="suggest_capture_settings")
+def suggest_capture_settings_tool(norad: int, band: str = "") -> dict[str, Any]:
+    """Suggest frequency/profile from transmitter records and antenna band."""
+    return suggest_capture_settings(locals())
+
+
+@mcp.tool()
+def list_upcoming_scheduler_runs(hours: float = 24, limit_per_rule: int = 4) -> list[dict[str, Any]]:
+    """List upcoming jobs generated from enabled rules."""
+    return all_upcoming_jobs(hours, limit_per_rule)
+
+
+@mcp.tool()
+def dry_run_scheduler_rule(rule_id: str, hours: float = 24, limit: int = 4) -> list[dict[str, Any]]:
+    """Show jobs a scheduler rule would create."""
+    return rule_jobs(find_rule(rule_id), hours, limit)
+
+
+@mcp.tool()
+def run_scheduler_rule_now(rule_id: str, confirm: bool, hours: float = 24, duration_s: int | None = None) -> dict[str, Any]:
+    """Start an immediate capture for a rule. Requires confirm=true."""
+    return run_now(locals())
+
+
+@mcp.tool()
+def get_scheduler_status() -> dict[str, Any]:
+    """Return scheduler paths, rule counts, cache paths, and log tail."""
+    return get_status()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    debug(f"start FastMCP argv={sys.argv!r} cwd={os.getcwd()!r}")
+    mcp.run(transport="stdio")
