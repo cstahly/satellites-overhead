@@ -30,6 +30,7 @@ RULES_PATH = os.path.join(HOME, "sdr_scheduler_rules.json")
 SCHEDULER_PATH = os.path.join(HOME, "sdr_scheduler.py")
 SCHEDULER_BACKUP = os.path.join(ROOT, "scheduler", "sdr_scheduler.py")
 LOG_PATH = os.path.join(HOME, "sdr_scheduler.log")
+MCP_DEBUG_LOG = os.path.join(HOME, "sdr_scheduler_mcp.log")
 TX_CACHE_DIR = os.path.join(ROOT, ".txcache")
 SAT_CACHE_DIR = os.path.join(ROOT, ".satcache")
 TLE_CACHE_DIR = os.path.join(ROOT, ".tlecache")
@@ -50,6 +51,16 @@ BAND_RANGES = {
     "lband": {"label": "L-band / patch", "ranges": [(1525e6, 1710e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_545_000_000},
     "adsb": {"label": "1090 / ADS-B antenna", "ranges": [(1087e6, 1093e6)], "profile": "raw_iq_hackrf", "frequency_hz": 1_090_000_000},
 }
+
+
+def debug(message: str) -> None:
+    if os.environ.get("SDR_SCHEDULER_MCP_DEBUG", "1") in {"0", "false", "False"}:
+        return
+    try:
+        with open(MCP_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+    except Exception:
+        pass
 
 
 def now_iso() -> str:
@@ -475,6 +486,7 @@ def read_message() -> dict[str, Any] | None:
     while b"\r\n\r\n" not in header and b"\n\n" not in header:
         ch = sys.stdin.buffer.read(1)
         if not ch:
+            debug("stdin closed")
             return None
         header += ch
     if b"\r\n\r\n" in header:
@@ -487,15 +499,19 @@ def read_message() -> dict[str, Any] | None:
             length = int(line.split(":", 1)[1].strip())
             break
     if length is None:
+        debug(f"missing Content-Length in header: {header_bytes!r}")
         raise RuntimeError("missing Content-Length")
     body = rest + sys.stdin.buffer.read(length - len(rest))
-    return json.loads(body[:length].decode("utf-8"))
+    message = json.loads(body[:length].decode("utf-8"))
+    debug(f"recv method={message.get('method')} id={message.get('id')}")
+    return message
 
 
 def write_message(message: dict[str, Any]) -> None:
     body = json.dumps(message, separators=(",", ":")).encode("utf-8")
     sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
     sys.stdout.buffer.flush()
+    debug(f"sent id={message.get('id')} keys={list(message.keys())}")
 
 
 def handle(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -523,6 +539,7 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> int:
+    debug(f"start argv={sys.argv!r} cwd={os.getcwd()!r}")
     while True:
         message = read_message()
         if message is None:
