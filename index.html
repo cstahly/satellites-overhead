@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Satellites Overhead</title>
+<style>
+  :root {
+    --bg: #0a0e1a; --panel: #131a2e; --panel-2: #1b2540; --line: #2a3658;
+    --text: #e6ecff; --muted: #8a97b8; --accent: #5ad1ff; --good: #57e389; --warn: #ffd166;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(1200px 800px at 70% -10%, #16204a 0%, var(--bg) 55%);
+    color: var(--text); min-height: 100vh;
+  }
+  header { padding: 20px 24px 8px; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: 0.3px; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .wrap {
+    display: grid; grid-template-columns: minmax(320px, 460px) 1fr;
+    gap: 20px; padding: 12px 24px 40px; align-items: start;
+  }
+  .col { display: flex; flex-direction: column; gap: 20px; }
+  @media (max-width: 860px) { .wrap { grid-template-columns: 1fr; } }
+  .card {
+    background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+    border: 1px solid var(--line); border-radius: 14px; padding: 16px;
+  }
+  .card h2 { margin: 0 0 10px; font-size: 15px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+  button, select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); color: #042231; border-color: var(--accent); font-weight: 600; }
+  label.minel { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  #status { font-size: 13px; color: var(--muted); min-height: 18px; }
+  #status.err { color: #ff6b6b; }
+  canvas { width: 100%; height: auto; display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; cursor: pointer; user-select: none; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  .scroll { max-height: 420px; overflow: auto; }
+  tbody tr:hover { background: rgba(90,209,255,0.06); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; }
+  .pill.high { background: rgba(87,227,137,0.15); color: var(--good); }
+  .pill.mid { background: rgba(255,209,102,0.15); color: var(--warn); }
+  .pill.low { background: rgba(138,151,184,0.15); color: var(--muted); }
+  .count { color: var(--accent); font-weight: 600; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .progress { height: 6px; background: var(--panel-2); border:1px solid var(--line); border-radius: 999px; overflow: hidden; margin: 8px 0; display:none; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.1s; }
+  .soon { color: var(--good); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰️ Satellites Overhead</h1>
+  <div class="sub">Live positions and upcoming passes, computed in your browser from CelesTrak orbital data.</div>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <div class="controls">
+      <button id="locBtn" class="primary">Use my location</button>
+      <select id="group" title="Satellite catalog">
+        <option value="active" selected>All active (max, ~11k)</option>
+        <option value="visual">Brightest (visual)</option>
+        <option value="stations">Space stations</option>
+        <option value="starlink">Starlink</option>
+        <option value="gps-ops">GPS</option>
+        <option value="science">Science</option>
+      </select>
+      <label class="minel">min elev
+        <select id="minEl">
+          <option value="0">0°</option>
+          <option value="10" selected>10°</option>
+          <option value="20">20°</option>
+          <option value="30">30°</option>
+        </select>
+      </label>
+    </div>
+    <div id="status">Click “Use my location” to begin.</div>
+    <canvas id="sky" width="800" height="800"></canvas>
+    <div class="legend">Center = straight up (zenith), edge = horizon, N is up. Dot brightness ∝ elevation.</div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
+        <h2 style="margin:0"><span class="count" id="overheadCount">—</span> overhead now</h2>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <button id="overheadCsv" title="Download current list as CSV">⬇ CSV</button>
+          <div style="color:var(--muted);font-size:12px" id="updated"></div>
+        </div>
+      </div>
+      <div class="scroll">
+        <table id="tbl">
+          <thead><tr>
+            <th data-sort="name">Satellite</th>
+            <th data-sort="el" class="num">Elev</th>
+            <th data-sort="az" class="num">Azim</th>
+            <th data-sort="dir">Dir</th>
+            <th data-sort="range" class="num">Range km</th>
+            <th data-sort="alt" class="num">Alt km</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Upcoming passes</h2>
+      <div class="controls">
+        <button id="predictBtn">Predict passes</button>
+        <label class="minel">next
+          <select id="window">
+            <option value="2">2 hours</option>
+            <option value="6" selected>6 hours</option>
+            <option value="12">12 hours</option>
+            <option value="24">24 hours</option>
+          </select>
+        </label>
+        <label class="minel">min peak
+          <select id="peakEl">
+            <option value="10">10°</option>
+            <option value="20" selected>20°</option>
+            <option value="40">40°</option>
+          </select>
+        </label>
+        <button id="passCsv" title="Download upcoming passes as CSV">⬇ CSV</button>
+      </div>
+      <div class="progress" id="prog"><div></div></div>
+      <div id="passStatus" style="font-size:13px;color:var(--muted);margin-bottom:6px;">Load satellites, then predict upcoming passes.</div>
+      <div class="scroll">
+        <table id="passTbl">
+          <thead><tr>
+            <th>Satellite</th><th>Starts</th><th>In</th>
+            <th class="num">Max el</th><th>Appears</th><th class="num">Dur</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js"></script>
+<script>
+const state = {
+  observer: null, group: 'active', minEl: 10, count: 0,
+  sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
+};
+const $ = (s) => document.querySelector(s);
+const statusEl = $('#status');
+function setStatus(m, err=false){ statusEl.textContent = m; statusEl.className = err ? 'err' : ''; }
+const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+const compass = (az) => dirs[Math.round(az/22.5) % 16];
+const escapeHtml = (s) => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- Web Worker (orbital math off the main thread) ----------
+const workerSrc = `
+importScripts('https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js');
+let sats = [];      // {name, satrec}
+let obsGd = null;   // geodetic radians
+
+function lookAt(satrec, date, gmst){
+  const pv = satellite.propagate(satrec, date);
+  if(!pv || !pv.position || isNaN(pv.position.x)) return null;
+  const ecf = satellite.eciToEcf(pv.position, gmst);
+  const la = satellite.ecfToLookAngles(obsGd, ecf);
+  let az = satellite.radiansToDegrees(la.azimuth); if(az < 0) az += 360;
+  return { el: satellite.radiansToDegrees(la.elevation), az, range: la.rangeSat, eci: pv.position };
+}
+function elAt(satrec, ms){
+  const d = new Date(ms);
+  const r = lookAt(satrec, d, satellite.gstime(d));
+  return r ? r.el : -90;
+}
+
+self.onmessage = (e) => {
+  const m = e.data;
+  if(m.type === 'load'){
+    const lines = m.tle.split(/\\r?\\n/).filter(l => l.length);
+    sats = [];
+    for(let i=0; i+2 < lines.length+1; i+=3){
+      const name=(lines[i]||'').trim(), l1=lines[i+1], l2=lines[i+2];
+      if(!l1||!l2||l1[0]!=='1'||l2[0]!=='2') continue;
+      try { const sr = satellite.twoline2satrec(l1,l2); if(!sr.error) sats.push({name, satrec: sr}); } catch(_){}
+    }
+    self.postMessage({type:'loaded', count: sats.length});
+  }
+  else if(m.type === 'observer'){
+    obsGd = { longitude: satellite.degreesToRadians(m.lon), latitude: satellite.degreesToRadians(m.lat), height: m.altKm };
+  }
+  else if(m.type === 'live'){
+    const now = new Date(m.now), gmst = satellite.gstime(now), out = [];
+    for(const s of sats){
+      const r = lookAt(s.satrec, now, gmst);
+      if(!r || r.el < m.minEl) continue;
+      const geo = satellite.eciToGeodetic(r.eci, gmst);
+      out.push({ name: s.name, el: r.el, az: r.az, range: r.range, alt: geo.height, dir: ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'][Math.round(r.az/22.5)%16] });
+    }
+    self.postMessage({type:'live', list: out});
+  }
+  else if(m.type === 'predict'){
+    const step = m.stepSec*1000, end = m.startMs + m.windowHrs*3600*1000;
+    const stateArr = sats.map(() => ({ inPass:false }));
+    const passes = [];
+    let lastPct = -1;
+    const total = Math.ceil((end - m.startMs)/step);
+    let k = 0;
+    for(let t = m.startMs; t <= end; t += step, k++){
+      const d = new Date(t), gmst = satellite.gstime(d);
+      for(let i=0; i<sats.length; i++){
+        const r = lookAt(sats[i].satrec, d, gmst);
+        const el = r ? r.el : -90;
+        const st = stateArr[i];
+        if(el >= 0){
+          if(!st.inPass){ st.inPass=true; st.startBelow=t-step; st.start=t; st.maxEl=el; st.maxT=t; st.maxAz=r.az; }
+          else if(el > st.maxEl){ st.maxEl=el; st.maxT=t; st.maxAz=r.az; }
+          st.lastAbove = t;
+        } else if(st.inPass){
+          finish(passes, sats[i], st, t, m.peakEl);
+          st.inPass = false;
+        }
+      }
+      const pct = Math.floor(100*k/total);
+      if(pct !== lastPct){ lastPct = pct; self.postMessage({type:'predictProgress', pct}); }
+    }
+    for(let i=0;i<sats.length;i++){ const st=stateArr[i]; if(st.inPass) finish(passes, sats[i], st, end+step, m.peakEl); }
+    passes.sort((a,b)=>a.start-b.start);
+    self.postMessage({type:'predict', passes});
+  }
+};
+
+// Refine rise/peak/set with bisection + ternary search, then keep if peak passes threshold.
+function finish(passes, sat, st, belowT, peakEl){
+  const sr = sat.satrec;
+  const rise = bisect(sr, st.startBelow, st.start);
+  const set  = bisect(sr, st.lastAbove, belowT);
+  let lo = rise, hi = set;
+  for(let j=0;j<24 && hi-lo>1000;j++){
+    const m1 = lo+(hi-lo)/3, m2 = hi-(hi-lo)/3;
+    if(elAt(sr,m1) < elAt(sr,m2)) lo=m1; else hi=m2;
+  }
+  const peakT = (lo+hi)/2;
+  const d = new Date(peakT), g = satellite.gstime(d);
+  const pk = lookAt(sr, d, g);
+  if(!pk || pk.el < peakEl) return;
+  const rd = new Date(rise), ri = lookAt(sr, rd, satellite.gstime(rd));
+  passes.push({ name: sat.name, start: rise, end: set, maxEl: pk.el, maxAz: pk.az, startAz: ri?ri.az:pk.az });
+}
+function bisect(sr, below, above){ // time where el crosses 0
+  for(let j=0;j<20 && above-below>500;j++){ const mid=(below+above)/2; if(elAt(sr,mid) < 0) below=mid; else above=mid; }
+  return (below+above)/2;
+}
+`;
+let worker = null;
+function startWorker(){
+  if(worker) worker.terminate();
+  worker = new Worker(URL.createObjectURL(new Blob([workerSrc], {type:'application/javascript'})));
+  worker.onmessage = onWorkerMessage;
+}
+
+function onWorkerMessage(e){
+  const m = e.data;
+  if(m.type === 'loaded'){
+    state.count = m.count;
+    setStatus(`Loaded ${m.count} satellites from “${state.group}”. Tracking live…`);
+    if(state.observer) worker.postMessage({type:'observer', ...state.observer});
+    requestLive();
+    if(state.timer) clearInterval(state.timer);
+    state.timer = setInterval(requestLive, 3000);
+    $('#predictBtn').disabled = false;
+    $('#passStatus').textContent = `${m.count} satellites loaded — ready to predict passes.`;
+  }
+  else if(m.type === 'live'){
+    state.overhead = m.list;
+    renderList(m.list);
+    drawSky(m.list);
+    $('#overheadCount').textContent = m.list.length;
+    $('#updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  }
+  else if(m.type === 'predictProgress'){
+    $('#prog').firstElementChild.style.width = m.pct + '%';
+  }
+  else if(m.type === 'predict'){
+    $('#prog').style.display = 'none';
+    $('#predictBtn').disabled = false;
+    state.passes = m.passes;
+    renderPasses();
+    if(state.countdownTimer) clearInterval(state.countdownTimer);
+    state.countdownTimer = setInterval(updateCountdowns, 1000);
+  }
+}
+
+function requestLive(){
+  if(!state.observer) return;
+  worker.postMessage({type:'live', now: Date.now(), minEl: state.minEl});
+}
+
+// ---------- fetch TLEs ----------
+const TLE_TTL = 2*3600*1000; // CelesTrak asks clients not to refetch a group within ~2h
+const readCache = (k) => { try { const v=localStorage.getItem(k); return v?JSON.parse(v):null; } catch(_){ return null; } };
+const writeCache = (k,text) => { try { localStorage.setItem(k, JSON.stringify({t:Date.now(), text})); } catch(_){} };
+const ageStr = (t) => { const m=Math.round((Date.now()-t)/60000); return m<60?`${m}m`:`${(m/60).toFixed(1)}h`; };
+
+async function fetchTLEs(group){
+  const key = 'tle:'+group, cached = readCache(key);
+  if(cached && Date.now()-cached.t < TLE_TTL){
+    setStatus(`Using cached “${group}” data (${ageStr(cached.t)} old) — avoids re-hitting CelesTrak.`);
+    return cached.text;
+  }
+  setStatus(`Fetching “${group}” orbital data…`);
+  // Prefer the local caching proxy (serve.py); fall back to CelesTrak directly
+  // if the app is opened as a static file without the proxy running.
+  const viaProxy = location.protocol.startsWith('http');
+  const url = viaProxy
+    ? `/tle?group=${encodeURIComponent(group)}`
+    : `https://celestrak.org/NORAD/elements/gp.php?GROUP=${encodeURIComponent(group)}&FORMAT=tle`;
+  try {
+    const res = await fetch(url);
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    if(!/^1 /m.test(text)) throw new Error('unexpected response (not TLE data)');
+    const src = res.headers.get('X-TLE-Source');
+    if(src) setStatus(`Loaded “${group}” via local proxy — source: ${src}.`);
+    writeCache(key, text);
+    return text;
+  } catch(e){
+    if(cached){
+      setStatus(`Fetch error (${e.message}); falling back to cached data ${ageStr(cached.t)} old.`);
+      return cached.text;
+    }
+    throw new Error(`${e.message}. If you're not running serve.py, CelesTrak rate-limits repeated downloads (403) — run "python3 serve.py" and reload.`);
+  }
+}
+async function load(){
+  try {
+    $('#predictBtn').disabled = true;
+    const tle = await fetchTLEs(state.group);
+    worker.postMessage({type:'load', tle});
+  } catch(e){ setStatus(`Error: ${e.message}`, true); }
+}
+
+// ---------- rendering: overhead list ----------
+function renderList(list){
+  const k = state.sortKey, d = state.sortDir;
+  list.sort((a,b) => typeof a[k]==='string' ? d*a[k].localeCompare(b[k]) : d*(a[k]-b[k]));
+  $('#tbl tbody').innerHTML = list.map(s => {
+    const cls = s.el>=45?'high':s.el>=20?'mid':'low';
+    return `<tr><td>${escapeHtml(s.name)}</td>
+      <td class="num"><span class="pill ${cls}">${s.el.toFixed(1)}°</span></td>
+      <td class="num">${s.az.toFixed(0)}°</td><td>${s.dir}</td>
+      <td class="num">${s.range.toFixed(0)}</td><td class="num">${s.alt.toFixed(0)}</td></tr>`;
+  }).join('') || `<tr><td colspan="6" style="color:var(--muted)">Nothing above ${state.minEl}° right now.</td></tr>`;
+}
+
+// ---------- rendering: sky plot ----------
+function drawSky(list){
+  const cv = $('#sky'), ctx = cv.getContext('2d');
+  const W=cv.width,H=cv.height,cx=W/2,cy=H/2,R=Math.min(W,H)/2-30;
+  ctx.clearRect(0,0,W,H);
+  ctx.strokeStyle='#2a3658'; ctx.fillStyle='#8a97b8'; ctx.lineWidth=1.5;
+  ctx.font='20px sans-serif'; ctx.textAlign='center';
+  for(const el of [0,30,60]){ const r=R*(1-el/90); ctx.beginPath(); ctx.arc(cx,cy,r,0,2*Math.PI); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy); ctx.stroke();
+  ctx.fillText('N',cx,cy-R-8); ctx.fillText('S',cx,cy+R+22); ctx.fillText('E',cx+R+14,cy+7); ctx.fillText('W',cx-R-14,cy+7);
+  const showLabels = list.length <= 60;
+  for(const s of list){
+    const r=R*(1-s.el/90), a=(s.az-90)*Math.PI/180;
+    const x=cx+r*Math.cos(a), y=cy+r*Math.sin(a), bright=0.35+0.65*(s.el/90);
+    ctx.beginPath(); ctx.arc(x,y,5,0,2*Math.PI); ctx.fillStyle=`rgba(90,209,255,${bright})`; ctx.fill();
+    if(showLabels){ ctx.fillStyle=`rgba(230,236,255,${0.5+0.5*(s.el/90)})`; ctx.font='15px sans-serif'; ctx.textAlign='left'; ctx.fillText(s.name.slice(0,16), x+8, y+5); }
+  }
+}
+
+// ---------- rendering: passes ----------
+function fmtDur(ms){ const s=Math.round(ms/1000); const m=Math.floor(s/60); return `${m}m${String(s%60).padStart(2,'0')}s`; }
+function fmtIn(ms){
+  if(ms<=0) return 'now';
+  const s=Math.floor(ms/1000), h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60;
+  if(h>0) return `${h}h ${m}m`;
+  if(m>0) return `${m}m ${String(ss).padStart(2,'0')}s`;
+  return `${ss}s`;
+}
+function renderPasses(){
+  const tb = $('#passTbl tbody');
+  if(!state.passes.length){ tb.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">No passes above the chosen peak elevation in this window.</td></tr>`; $('#passStatus').textContent='Done.'; return; }
+  $('#passStatus').textContent = `${state.passes.length} passes upcoming.`;
+  tb.innerHTML = state.passes.map((p,i) => {
+    const cls = p.maxEl>=45?'high':p.maxEl>=20?'mid':'low';
+    return `<tr data-i="${i}"><td>${escapeHtml(p.name)}</td>
+      <td>${new Date(p.start).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
+      <td class="in"></td>
+      <td class="num"><span class="pill ${cls}">${p.maxEl.toFixed(0)}°</span></td>
+      <td>${compass(p.startAz)}→${compass(p.maxAz)}</td>
+      <td class="num">${fmtDur(p.end-p.start)}</td></tr>`;
+  }).join('');
+  updateCountdowns();
+}
+function updateCountdowns(){
+  const now = Date.now();
+  $('#passTbl tbody').querySelectorAll('tr[data-i]').forEach(tr => {
+    const p = state.passes[+tr.dataset.i]; if(!p) return;
+    const cell = tr.querySelector('.in'); const delta = p.start - now;
+    cell.textContent = fmtIn(delta);
+    cell.className = 'in' + ((delta>0 && delta<600000) ? ' soon' : '');
+  });
+}
+
+// ---------- events ----------
+$('#locBtn').addEventListener('click', () => {
+  if(!navigator.geolocation){ setStatus('Geolocation not supported.', true); return; }
+  setStatus('Requesting your location…');
+  navigator.geolocation.getCurrentPosition(pos => {
+    state.observer = { lat: pos.coords.latitude, lon: pos.coords.longitude, altKm: (pos.coords.altitude||0)/1000 };
+    setStatus(`Location: ${state.observer.lat.toFixed(3)}, ${state.observer.lon.toFixed(3)}. Loading satellites…`);
+    if(!worker) startWorker();
+    load();
+  }, err => setStatus(`Could not get location: ${err.message}`, true), { enableHighAccuracy:false, timeout:10000 });
+});
+$('#group').addEventListener('change', e => { state.group = e.target.value; if(state.observer) load(); });
+$('#minEl').addEventListener('change', e => { state.minEl = +e.target.value; requestLive(); });
+document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', () => {
+  const k = th.dataset.sort;
+  if(state.sortKey===k) state.sortDir*=-1; else { state.sortKey=k; state.sortDir=(k==='name')?1:-1; }
+  requestLive();
+}));
+$('#predictBtn').addEventListener('click', () => {
+  if(!state.observer || !state.count){ $('#passStatus').textContent='Load satellites first.'; return; }
+  const windowHrs = +$('#window').value, peakEl = +$('#peakEl').value;
+  const stepSec = state.count > 4000 ? 30 : 20;
+  $('#predictBtn').disabled = true;
+  $('#prog').style.display = 'block'; $('#prog').firstElementChild.style.width = '0%';
+  $('#passStatus').textContent = `Scanning ${state.count} satellites over the next ${windowHrs}h…`;
+  worker.postMessage({ type:'predict', startMs: Date.now(), windowHrs, stepSec, peakEl });
+});
+
+// ---------- CSV export ----------
+function toCsv(rows){
+  return rows.map(r => r.map(c => {
+    const s = String(c ?? '');
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+  }).join(',')).join('\r\n');
+}
+function downloadCsv(name, rows){
+  const blob = new Blob(['﻿' + toCsv(rows)], {type:'text/csv;charset=utf-8'}); // BOM for Excel
+  const url = URL.createObjectURL(blob);
+  const a = Object.assign(document.createElement('a'), {href:url, download:name});
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+const tsStr = () => new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+
+$('#overheadCsv').addEventListener('click', () => {
+  const list = state.overhead || [];
+  if(!list.length){ setStatus('Nothing overhead to export yet.'); return; }
+  const obs = state.observer || {lat:'',lon:''};
+  const rows = [
+    [`# Satellites overhead — generated ${new Date().toISOString()}`],
+    [`# observer_lat=${obs.lat} observer_lon=${obs.lon} catalog=${state.group} min_elev_deg=${state.minEl}`],
+    ['name','elevation_deg','azimuth_deg','direction','range_km','altitude_km'],
+    ...list.map(s => [s.name, s.el.toFixed(2), s.az.toFixed(1), s.dir, s.range.toFixed(1), s.alt.toFixed(1)]),
+  ];
+  downloadCsv(`satellites-overhead-${tsStr()}.csv`, rows);
+});
+
+$('#passCsv').addEventListener('click', () => {
+  const list = state.passes || [];
+  if(!list.length){ $('#passStatus').textContent = 'No passes to export — run Predict passes first.'; return; }
+  const obs = state.observer || {lat:'',lon:''};
+  const rows = [
+    [`# Satellite passes — generated ${new Date().toISOString()}`],
+    [`# observer_lat=${obs.lat} observer_lon=${obs.lon} catalog=${state.group}`],
+    ['name','start_local','start_iso','end_iso','duration_s','max_elevation_deg','rise_direction','peak_direction'],
+    ...list.map(p => [
+      p.name,
+      new Date(p.start).toLocaleString(),
+      new Date(p.start).toISOString(),
+      new Date(p.end).toISOString(),
+      Math.round((p.end - p.start)/1000),
+      p.maxEl.toFixed(1),
+      compass(p.startAz),
+      compass(p.maxAz),
+    ]),
+  ];
+  downloadCsv(`satellite-passes-${tsStr()}.csv`, rows);
+});
+</script>
+</body>
+</html>
