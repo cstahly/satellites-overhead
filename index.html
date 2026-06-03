@@ -693,6 +693,45 @@ function defaultFrequencyMhz(pass){
   if(txs[0]) return txFrequency(txs[0]) / 1e6;
   return +$('#schedFreq').value || 137.100;
 }
+function captureBandForPass(pass){
+  if(bandProfiles[state.bandFilter]) return state.bandFilter;
+  const bands = passBands(pass).filter(b => bandProfiles[b]);
+  return bands[0] || 'vdipole';
+}
+async function suggestCaptureSettings(pass){
+  const band = captureBandForPass(pass);
+  const qs = new URLSearchParams({norad: pass.norad, band});
+  try {
+    const res = await fetch(`/capture-settings?${qs}`);
+    if(!res.ok) throw new Error(`HTTP ${res.status}`);
+    const suggested = await res.json();
+    const adjusted = {
+      ...suggested,
+      vga_gain: Math.max(0, Number(suggested.vga_gain || 36) - (pass.maxEl >= 60 ? 12 : 0)),
+    };
+    $('#schedProfile').value = adjusted.profile || $('#schedProfile').value;
+    $('#schedFreq').value = (Number(adjusted.frequency_hz || 137100000) / 1e6).toFixed(3);
+    $('#schedLna').value = Number(adjusted.lna_gain ?? 16);
+    $('#schedVga').value = Number(adjusted.vga_gain ?? 36);
+    $('#schedAmp').checked = Number(adjusted.amp ?? 1) === 1;
+    return adjusted;
+  } catch(_){
+    const cfg = bandProfiles[band] || bandProfiles.vdipole;
+    const adjusted = {
+      profile: cfg.profile,
+      frequency_hz: defaultFrequencyMhz(pass) * 1e6,
+      lna_gain: cfg.lna,
+      vga_gain: Math.max(0, cfg.vga - (pass.maxEl >= 60 ? 12 : 0)),
+      amp: cfg.amp,
+    };
+    $('#schedProfile').value = adjusted.profile;
+    $('#schedFreq').value = (adjusted.frequency_hz / 1e6).toFixed(3);
+    $('#schedLna').value = adjusted.lna_gain;
+    $('#schedVga').value = adjusted.vga_gain;
+    $('#schedAmp').checked = !!adjusted.amp;
+    return adjusted;
+  }
+}
 function ruleIdFor(pass, profile){
   return `sat-${pass.norad}-${profile}`.replace(/[^a-zA-Z0-9_-]/g, '-');
 }
@@ -772,6 +811,8 @@ async function schedulePass(index){
     $('#passStatus').textContent = `Tracking removed for ${pass.name}.`;
     return;
   }
+  $('#passStatus').textContent = `Looking up capture settings for ${pass.name}…`;
+  await suggestCaptureSettings(pass);
   const profile = $('#schedProfile').value;
   const freqMhz = +$('#schedFreq').value || defaultFrequencyMhz(pass);
   $('#schedFreq').value = freqMhz.toFixed(3);

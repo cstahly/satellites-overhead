@@ -37,6 +37,44 @@ RADIO_NAME_TERMS = (
     "AO-", "SO-", "FO-", "IO-", "RS-", "CAS-", "XW-", "TEVEL", "LILACSAT",
     "SKYTERRA", "INMARSAT", "IRIDIUM", "GLOBALSTAR", "ORBCOMM",
 )
+BAND_RANGES = {
+    "vdipole": {
+        "label": "V-dipole VHF",
+        "ranges": ((136e6, 138e6),),
+        "profile": "meteor_lrpt_hackrf",
+        "frequency_hz": 137_100_000,
+        "lna_gain": 16,
+        "vga_gain": 36,
+        "amp": 1,
+    },
+    "amateur": {
+        "label": "Amateur VHF/UHF",
+        "ranges": ((144e6, 148e6), (430e6, 450e6)),
+        "profile": "raw_iq_hackrf",
+        "frequency_hz": 145_825_000,
+        "lna_gain": 32,
+        "vga_gain": 48,
+        "amp": 1,
+    },
+    "lband": {
+        "label": "L-band / patch",
+        "ranges": ((1525e6, 1710e6),),
+        "profile": "raw_iq_hackrf",
+        "frequency_hz": 1_545_000_000,
+        "lna_gain": 32,
+        "vga_gain": 48,
+        "amp": 1,
+    },
+    "adsb": {
+        "label": "1090 / ADS-B antenna",
+        "ranges": ((1087e6, 1093e6),),
+        "profile": "raw_iq_hackrf",
+        "frequency_hz": 1_090_000_000,
+        "lna_gain": 32,
+        "vga_gain": 48,
+        "amp": 1,
+    },
+}
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(TX_CACHE_DIR, exist_ok=True)
@@ -170,6 +208,50 @@ def fetch_transmitters(norad):
             with open(path, encoding="utf-8") as f:
                 return json.load(f), "stale cache"
         raise
+
+
+def tx_frequency(tx):
+    return float(tx.get("downlink_low") or tx.get("downlink_high") or 0)
+
+
+def tx_is_usable(tx):
+    return bool(tx) and tx.get("alive") is not False and tx.get("status") != "inactive" and tx_frequency(tx) > 0
+
+
+def transmitter_bands(txs):
+    bands = set()
+    for tx in filter(tx_is_usable, txs):
+        freq = tx_frequency(tx)
+        for band, cfg in BAND_RANGES.items():
+            if any(lo <= freq <= hi for lo, hi in cfg["ranges"]):
+                bands.add(band)
+    return sorted(bands)
+
+
+def suggest_capture_settings(norad, band=None):
+    txs, source = fetch_transmitters(norad)
+    bands = transmitter_bands(txs)
+    selected_band = band if band in BAND_RANGES else (bands[0] if bands else "vdipole")
+    cfg = BAND_RANGES[selected_band]
+    usable = sorted([tx for tx in txs if tx_is_usable(tx)], key=tx_frequency)
+    selected = None
+    for tx in usable:
+        freq = tx_frequency(tx)
+        if any(lo <= freq <= hi for lo, hi in cfg["ranges"]):
+            selected = tx
+            break
+    return {
+        "norad": int(norad),
+        "source": source,
+        "bands": bands or ["unknown"],
+        "selected_band": selected_band,
+        "profile": cfg["profile"],
+        "frequency_hz": tx_frequency(selected) if selected else cfg["frequency_hz"],
+        "lna_gain": cfg["lna_gain"],
+        "vga_gain": cfg["vga_gain"],
+        "amp": cfg["amp"],
+        "transmitter": selected,
+    }
 
 
 def fetch_satellite(norad):
@@ -319,6 +401,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             write_json(self, 200, data)
             sys.stderr.write(f"[transmitters] {norad}: {source}, {len(data)} records\n")
+            return
+        if parsed.path == "/capture-settings":
+            qs = parse_qs(parsed.query)
+            try:
+                norad = int(first_value(qs, "norad"))
+                band = first_value(qs, "band")
+                data = suggest_capture_settings(norad, band)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(502, f"could not suggest capture settings: {e}")
+                return
+            write_json(self, 200, data)
+            sys.stderr.write(
+                f"[capture-settings] {norad}: {data['source']}, {data['selected_band']}\n"
+            )
             return
         if parsed.path == "/satellite":
             qs = parse_qs(parsed.query)

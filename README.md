@@ -81,7 +81,10 @@ not depend on the web server staying online after the rule is saved. In saved
 JSON, the capture mode is still stored as `profile` for scheduler compatibility.
 Satellite rules include `frequency_hz`, `lna_gain`, `vga_gain`, and `amp`; the
 scheduler reads those rule fields directly and reloads rule changes while
-running.
+running. New Track rules call `/capture-settings` first, which mirrors the MCP
+`suggest_capture_settings` tool, then applies one pass-specific tweak: if the
+pass peaks at 60 degrees or higher, VGA is reduced by 12 dB while LNA and amp
+are left unchanged.
 
 The Scheduler rules table shows all current rules and lets you edit enabled
 state, capture mode, frequency, LNA gain, VGA gain, amp, and minimum elevation
