@@ -667,14 +667,18 @@ function renderCapturesSection(captures){
     const started = c.started_at ? new Date(c.started_at).toLocaleString() : '—';
     const dur = (c.started_at && c.ended_at) ? fmtDur(new Date(c.ended_at)-new Date(c.started_at)) : '—';
     const size = fmtBytes(c.size_bytes);
-    const cadu = c.cadu_bytes != null ? ` · ${fmtBytes(c.cadu_bytes)} CADU` : '';
+    const cadu = c.cadu_bytes != null ? ` \xb7 ${fmtBytes(c.cadu_bytes)} CADU` : '';
     const profile = c.profile || c.label || '—';
+    const flags = [c.iq_swap ? 'iq_swap' : '', c.samplerate || ''].filter(Boolean).join(' ');
+    const reportBtn = c.report_path
+      ? `<a href="/captures/${encodeURIComponent(c.id)}/report" target="_blank"><button class="mini">Report</button></a> `
+      : '';
     return `<tr>
       <td style="font-size:12px;">${escapeHtml(started)}</td>
-      <td style="font-size:12px;">${escapeHtml(profile)}</td>
+      <td style="font-size:12px;">${escapeHtml(profile)}${flags ? `<br><span style="color:var(--muted);font-size:11px;">${escapeHtml(flags)}</span>` : ''}</td>
       <td class="num" style="font-size:12px;">${escapeHtml(dur)}</td>
       <td class="num" style="font-size:12px;">${escapeHtml(size)}${escapeHtml(cadu)}</td>
-      <td><a href="/captures/${encodeURIComponent(c.id)}/download" download><button class="mini">↓</button></a></td>
+      <td style="white-space:nowrap">${reportBtn}<a href="/captures/${encodeURIComponent(c.id)}/download" download><button class="mini">↓</button></a></td>
     </tr>`;
   }).join('');
   return label + `<div class="tx-list"><table><thead><tr><th>Time</th><th>Profile</th><th>Duration</th><th>Size</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;

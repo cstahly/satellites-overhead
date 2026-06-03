@@ -194,6 +194,13 @@ def read_captures(norad=None):
         return []
     if norad is not None:
         data = [r for r in data if r.get("norad") == norad]
+    # Freshen report_path: check if the report file exists on disk now even if
+    # it didn't when the history record was written (monitor runs after).
+    for r in data:
+        output = r.get("output")
+        if output and os.path.isdir(output):
+            rp = os.path.join(output, "diagnostic_report.md")
+            r["report_path"] = rp if os.path.exists(rp) else None
     return sorted(data, key=lambda r: r.get("started_at", ""), reverse=True)
 
 
@@ -582,6 +589,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(500, f"could not read capture history: {e}")
                 return
             write_json(self, 200, data)
+            return
+        if parsed.path.startswith("/captures/") and parsed.path.endswith("/report"):
+            capture_id = parsed.path[len("/captures/"):-len("/report")]
+            try:
+                record = next((r for r in read_captures() if r.get("id") == capture_id), None)
+                if record is None:
+                    self.send_error(404, "capture not found")
+                    return
+                rp = record.get("report_path")
+                if not rp or not os.path.exists(rp):
+                    self.send_error(404, "no diagnostic report for this capture")
+                    return
+                safe = safe_output_path(rp)
+                if not safe:
+                    self.send_error(403, "report path outside home directory")
+                    return
+                with open(safe, "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_error(500, f"could not read report: {e}")
             return
         if parsed.path.startswith("/captures/") and parsed.path.endswith("/download"):
             capture_id = parsed.path[len("/captures/"):-len("/download")]

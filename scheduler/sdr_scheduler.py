@@ -68,20 +68,27 @@ def hackrf_capture(freq_hz, outfile, duration_s, lna=32, vga=40, amp=1, label=""
         log(f"FAIL  {label} — {e}")
         return None
 
-def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, label=""):
+def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, label="",
+                    samplerate="1e6", iq_swap=True, pipeline="meteor_m2-x_lrpt"):
     logfile = capdir + ".log"
-    log(f"START {label} — satdump LRPT {freq/1e6:.1f} MHz → {capdir} (tail -f {logfile})")
-    cmd = ["satdump", "live", "meteor_m2-x_lrpt", capdir,
-           "--source", "hackrf", "--samplerate", "2e6",
+    pidfile = capdir + ".pid"
+    flags = ("--iq_swap " if iq_swap else "") + f"sr={samplerate}"
+    log(f"START {label} — satdump {pipeline} {freq/1e6:.1f} MHz [{flags}] → {capdir} (tail -f {logfile})")
+    cmd = ["satdump", "live", pipeline, capdir,
+           "--source", "hackrf", "--samplerate", str(samplerate),
            "--frequency", str(freq),
            "--lna_gain", str(lna), "--vga_gain", str(vga),
            "--amp", str(amp),
            "--timeout", str(duration_s)]
+    if iq_swap:
+        cmd.append("--iq_swap")
     os.makedirs(capdir, exist_ok=True)
     try:
         with open(logfile, "w") as lf:
             proc = subprocess.Popen(cmd, stdout=lf, stderr=lf)
-            proc.wait()
+        with open(pidfile, "w") as pf:
+            pf.write(str(proc.pid))
+        proc.wait()
         cadu = os.path.join(capdir, "meteor_m2-x_lrpt.cadu")
         size = os.path.getsize(cadu) if os.path.exists(cadu) else 0
         if size > 0:
@@ -92,6 +99,11 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
     except Exception as e:
         log(f"FAIL  {label} — {e}")
         return 0
+    finally:
+        try:
+            os.unlink(pidfile)
+        except FileNotFoundError:
+            pass
 
 def analyze_150mhz(iqfile, label):
     try:
@@ -221,6 +233,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
             _name=rule.get("name") or p["name"],
             _profile=rule.get("profile", "raw_iq_hackrf"),
             _source="rule",
+            _max_el=float(p.get("max_el", 0)),
         )
         if rule.get("profile") == "meteor_lrpt_hackrf":
             jobs.append((
@@ -234,6 +247,9 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     vga=vga,
                     amp=amp,
                     label=f"{label} LRPT",
+                    samplerate=str(rule.get("samplerate", "1e6")),
+                    iq_swap=bool(rule.get("iq_swap", True)),
+                    pipeline=str(rule.get("pipeline", "meteor_m2-x_lrpt")),
                     **meta,
                 ),
             ))
@@ -360,7 +376,7 @@ def jobs_signature(jobs):
 
 def run_job(ptype, kwargs):
     run_kwargs = dict(kwargs)
-    for key in ("_command_id", "_queued_at", "_norad", "_name", "_profile", "_source"):
+    for key in ("_command_id", "_queued_at", "_norad", "_name", "_profile", "_source", "_max_el"):
         run_kwargs.pop(key, None)
     if ptype == "iq":
         outfile = hackrf_capture(**run_kwargs)
@@ -439,6 +455,7 @@ def scheduler_loop():
                         )
                     else:
                         size_bytes = os.path.getsize(output)
+                report_path = os.path.join(output, "diagnostic_report.md") if output else None
                 record = {
                     "id": str(uuid.uuid4()),
                     "norad": kwargs.get("_norad"),
@@ -449,6 +466,10 @@ def scheduler_loop():
                     "lna_gain": kwargs.get("lna"),
                     "vga_gain": kwargs.get("vga"),
                     "amp": kwargs.get("amp"),
+                    "samplerate": kwargs.get("samplerate"),
+                    "iq_swap": kwargs.get("iq_swap"),
+                    "pipeline": kwargs.get("pipeline"),
+                    "max_el": kwargs.get("_max_el"),
                     "label": kwargs.get("label", ""),
                     "command_id": kwargs.get("_command_id"),
                     "started_at": started_at,
@@ -457,6 +478,7 @@ def scheduler_loop():
                     "output_type": "directory" if (output and os.path.isdir(output)) else "file",
                     "size_bytes": size_bytes,
                     "cadu_bytes": cadu_bytes,
+                    "report_path": report_path if (report_path and os.path.exists(report_path)) else None,
                 }
                 try:
                     append_capture_record(record)
