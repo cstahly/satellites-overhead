@@ -14,6 +14,8 @@ RULES_PATH = os.path.join(HOME, "sdr_scheduler_rules.json")
 LAT = 40.42
 LON = -86.88
 ALT_M = 180
+RELOAD_INTERVAL_S = 60
+POLL_INTERVAL_S = 10
 
 def log(msg):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -63,13 +65,14 @@ def hackrf_capture(freq_hz, outfile, duration_s, lna=32, vga=40, amp=1, label=""
         log(f"FAIL  {label} — {e}")
         return None
 
-def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, label=""):
+def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, label=""):
     logfile = capdir + ".log"
     log(f"START {label} — satdump LRPT {freq/1e6:.1f} MHz → {capdir} (tail -f {logfile})")
     cmd = ["satdump", "live", "meteor_m2-x_lrpt", capdir,
            "--source", "hackrf", "--samplerate", "2e6",
            "--frequency", str(freq),
            "--lna_gain", str(lna), "--vga_gain", str(vga),
+           "--amp", str(amp),
            "--timeout", str(duration_s)]
     os.makedirs(capdir, exist_ok=True)
     try:
@@ -176,7 +179,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
             ))
     return jobs
 
-def optional_rule_jobs():
+def optional_rule_jobs(log_loaded=True):
     jobs = []
     for rule in load_scheduler_rules():
         if not rule.get("enabled", True):
@@ -186,10 +189,94 @@ def optional_rule_jobs():
         try:
             rule_jobs = build_rule_jobs(rule)
             jobs.extend(rule_jobs)
-            log(f"Loaded {len(rule_jobs)} jobs from rule {rule.get('id')}")
+            if log_loaded:
+                log(f"Loaded {len(rule_jobs)} jobs from rule {rule.get('id')}")
         except Exception as e:
             log(f"RULE PREDICT FAIL {rule.get('id', '?')} — no jobs added: {e}")
     return jobs
+
+def job_fire_dt(fire_time):
+    if isinstance(fire_time, datetime.datetime):
+        return fire_time.astimezone()
+    now = datetime.datetime.now().astimezone()
+    h, m = map(int, str(fire_time).split(":"))
+    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if target <= now:
+        target += datetime.timedelta(days=1)
+    return target
+
+def job_time_label(fire_time):
+    return job_fire_dt(fire_time).strftime("%H:%M")
+
+def job_key(job):
+    fire_time, ptype, kwargs = job
+    return (job_fire_dt(fire_time).isoformat(timespec="minutes"), ptype, kwargs.get("label", ""))
+
+def collect_jobs(log_loaded=False):
+    jobs = MANUAL_JOBS + optional_rule_jobs(log_loaded=log_loaded)
+    jobs.sort(key=lambda job: job_fire_dt(job[0]))
+    return jobs
+
+def jobs_signature(jobs):
+    return tuple((job_fire_dt(j[0]).isoformat(timespec="minutes"), j[1], j[2].get("label", "")) for j in jobs)
+
+def run_job(ptype, kwargs):
+    if ptype == "iq":
+        outfile = hackrf_capture(**kwargs)
+        if outfile:
+            analyze_150mhz(outfile, kwargs["label"])
+    elif ptype == "satdump":
+        satdump_capture(**kwargs)
+    else:
+        log(f"UNKNOWN JOB TYPE {ptype} — {kwargs}")
+
+def scheduler_loop():
+    completed = set()
+    jobs = []
+    last_sig = None
+    last_next = None
+    next_reload = 0.0
+    log("SDR scheduler running — dynamic rule reload enabled")
+
+    while True:
+        now_ts = time.time()
+        now = datetime.datetime.now().astimezone()
+        if now_ts >= next_reload:
+            jobs = collect_jobs(log_loaded=False)
+            sig = jobs_signature(jobs)
+            if sig != last_sig:
+                rule_jobs = max(0, len(jobs) - len(MANUAL_JOBS))
+                log(f"Schedule loaded — {len(MANUAL_JOBS)} manual jobs, {rule_jobs} rule jobs")
+                last_sig = sig
+                last_next = None
+            next_reload = now_ts + RELOAD_INTERVAL_S
+
+        due = [job for job in jobs if job_key(job) not in completed and job_fire_dt(job[0]) <= now]
+        if due:
+            job = sorted(due, key=lambda item: job_fire_dt(item[0]))[0]
+            completed.add(job_key(job))
+            fire_time, ptype, kwargs = job
+            log(f"Running: {kwargs['label']} scheduled for {job_time_label(fire_time)}")
+            run_job(ptype, kwargs)
+            next_reload = 0.0
+            continue
+
+        future = [job for job in jobs if job_key(job) not in completed and job_fire_dt(job[0]) > now]
+        if future:
+            job = sorted(future, key=lambda item: job_fire_dt(item[0]))[0]
+            fire_dt = job_fire_dt(job[0])
+            wait = max(0, (fire_dt - now).total_seconds())
+            next_id = job_key(job)
+            if next_id != last_next:
+                log(f"Next: {job[2]['label']} at {fire_dt.strftime('%H:%M')} (in {wait:.0f}s)")
+                last_next = next_id
+            sleep_s = min(POLL_INTERVAL_S, wait, max(1, next_reload - now_ts))
+        else:
+            if last_next is not None:
+                log("No scheduled jobs pending.")
+                last_next = None
+            sleep_s = min(POLL_INTERVAL_S, max(1, next_reload - now_ts))
+        time.sleep(max(1, sleep_s))
 
 # ── SCHEDULE ─────────────────────────────────────────────────────────────────
 if __name__ != '__main__':
@@ -200,20 +287,4 @@ MANUAL_JOBS = [
     # satellites and do not depend on TLEs, CelesTrak, the map, or serve.py.
 ]
 
-JOBS = MANUAL_JOBS + optional_rule_jobs()
-JOBS.sort(key=lambda job: job[0])
-log(f"SDR scheduler running — {len(MANUAL_JOBS)} manual jobs, {len(JOBS) - len(MANUAL_JOBS)} rule jobs")
-
-for fire_time, ptype, kwargs in JOBS:
-    wait = seconds_until(fire_time)
-    log(f"Next: {kwargs['label']} at {fire_time} (in {wait:.0f}s)")
-    time.sleep(wait)
-
-    if ptype == "iq":
-        outfile = hackrf_capture(**kwargs)
-        if outfile:
-            analyze_150mhz(outfile, kwargs["label"])
-    elif ptype == "satdump":
-        satdump_capture(**kwargs)
-
-log("All passes complete.")
+scheduler_loop()
