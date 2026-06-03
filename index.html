@@ -58,7 +58,10 @@
   .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.1s; }
   .soon { color: var(--good); font-weight: 600; }
   .mini { padding: 5px 8px; font-size: 12px; }
+  .mini.engaged { background: rgba(87,227,137,0.18); color: var(--good); border-color: rgba(87,227,137,0.55); }
   .rule-status { font-size:13px;color:var(--muted);margin-bottom:8px;min-height:18px; }
+  .filterbar { margin: 6px 0 8px; }
+  .filterbar input { width: 100%; padding: 6px 10px; }
 </style>
 </head>
 <body>
@@ -99,11 +102,11 @@
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
         <h2 style="margin:0"><span class="count" id="overheadCount">—</span> overhead now</h2>
         <div style="display:flex;align-items:center;gap:10px;">
-          <input id="overheadFilter" type="search" placeholder="Filter" title="Filter overhead list">
           <button id="overheadCsv" title="Download current list as CSV">⬇ CSV</button>
           <div style="color:var(--muted);font-size:12px" id="updated"></div>
         </div>
       </div>
+      <div class="filterbar"><input id="overheadFilter" type="search" placeholder="Filter overhead satellites" title="Filter overhead list"></div>
       <div class="scroll">
         <table id="tbl">
           <thead><tr>
@@ -144,14 +147,24 @@
             <option value="raw_iq_hackrf">Raw IQ</option>
           </select>
         </label>
+        <label class="minel">band
+          <select id="bandFilter">
+            <option value="all" selected>All bands</option>
+            <option value="vdipole">V-dipole VHF</option>
+            <option value="amateur">Amateur VHF/UHF</option>
+            <option value="lband">L-band / patch</option>
+            <option value="adsb">1090 / ADS-B antenna</option>
+            <option value="unknown">Unknown/other</option>
+          </select>
+        </label>
         <label class="minel">MHz
           <input id="schedFreq" type="number" step="0.001" value="137.100">
         </label>
-        <input id="passFilter" type="search" placeholder="Filter passes" title="Filter upcoming passes">
         <button id="passCsv" title="Download upcoming passes as CSV">⬇ CSV</button>
       </div>
       <div class="progress" id="prog"><div></div></div>
       <div id="passStatus" style="font-size:13px;color:var(--muted);margin-bottom:6px;">Load satellites, then predict upcoming passes.</div>
+      <div class="filterbar"><input id="passFilter" type="search" placeholder="Filter upcoming passes, e.g. skyterra" title="Filter upcoming passes"></div>
       <div class="scroll">
         <table id="passTbl">
           <thead><tr>
@@ -167,11 +180,11 @@
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;">
         <h2 style="margin:0">Scheduler rules</h2>
         <div style="display:flex;align-items:center;gap:10px;">
-          <input id="rulesFilter" type="search" placeholder="Filter" title="Filter scheduler rules">
           <button id="rulesRefresh" class="mini">Refresh</button>
         </div>
       </div>
       <div id="ruleStatus" class="rule-status">Rules are saved on the local server for the SDR scheduler to read.</div>
+      <div class="filterbar"><input id="rulesFilter" type="search" placeholder="Filter scheduler rules" title="Filter scheduler rules"></div>
       <div class="scroll" style="max-height:240px">
         <table id="rulesTbl">
           <thead><tr>
@@ -189,7 +202,7 @@
 const state = {
   observer: null, group: 'radio', minEl: 10, count: 0,
   sortKey: 'el', sortDir: -1, timer: null, passes: [], countdownTimer: null,
-  overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '',
+  overhead: [], rules: [], overheadFilter: '', passFilter: '', rulesFilter: '', bandFilter: 'all',
 };
 const $ = (s) => document.querySelector(s);
 const statusEl = $('#status');
@@ -197,8 +210,30 @@ function setStatus(m, err=false){ statusEl.textContent = m; statusEl.className =
 const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
 const compass = (az) => dirs[Math.round(az/22.5) % 16];
 const escapeHtml = (s) => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const radioTerms = ['ISS','METEOR','NOAA','FENGYUN','METOP','AQUA','TERRA','SUOMI','LANDSAT','OKEAN','SICH','RESURS','ELEKTRO','GOES','HAMSAT','AO-','SO-','FO-','IO-','RS-','CAS-','XW-','TEVEL','LILACSAT'];
+const radioTerms = ['ISS','METEOR','NOAA','FENGYUN','METOP','AQUA','TERRA','SUOMI','LANDSAT','OKEAN','SICH','RESURS','ELEKTRO','GOES','HAMSAT','AO-','SO-','FO-','IO-','RS-','CAS-','XW-','TEVEL','LILACSAT','SKYTERRA','INMARSAT','IRIDIUM','GLOBALSTAR','ORBCOMM'];
 const textMatch = (value, filter) => !filter || String(value || '').toLowerCase().includes(filter.toLowerCase());
+const bandProfiles = {
+  vdipole: { terms:['METEOR','NOAA','OKEAN','SICH','RESURS','ISS'], freq:137.100, profile:'meteor_lrpt_hackrf' },
+  amateur: { terms:['ISS','AO-','SO-','FO-','IO-','RS-','CAS-','XW-','TEVEL','LILACSAT','HAMSAT'], freq:145.825, profile:'raw_iq_hackrf' },
+  lband: { terms:['SKYTERRA','INMARSAT','IRIDIUM','GLOBALSTAR','ORBCOMM','GOES','FENGYUN','METOP','AQUA','TERRA','SUOMI','LANDSAT'], freq:1545.000, profile:'raw_iq_hackrf' },
+  adsb: { terms:['ADS-B','ADSB'], freq:1090.000, profile:'raw_iq_hackrf' },
+};
+function passBand(pass){
+  const name = String(pass.name || '').toUpperCase();
+  for(const [band, cfg] of Object.entries(bandProfiles)){
+    if(cfg.terms.some(term => name.includes(term))) return band;
+  }
+  return 'unknown';
+}
+function bandMatches(pass){
+  return state.bandFilter === 'all' || passBand(pass) === state.bandFilter;
+}
+function applyBandDefaults(){
+  const cfg = bandProfiles[state.bandFilter];
+  if(!cfg) return;
+  $('#schedProfile').value = cfg.profile;
+  $('#schedFreq').value = cfg.freq.toFixed(3);
+}
 function filterTleText(text, group){
   if(group !== 'radio') return text;
   const lines = text.split(/\r?\n/).filter(l => l.length);
@@ -445,19 +480,25 @@ function fmtIn(ms){
 }
 function renderPasses(){
   const tb = $('#passTbl tbody');
-  const filtered = state.passes.map((p,i) => ({p,i})).filter(({p}) => textMatch(`${p.name} ${p.norad || ''}`, state.passFilter));
+  const filtered = state.passes.map((p,i) => ({p,i}))
+    .filter(({p}) => textMatch(`${p.name} ${p.norad || ''}`, state.passFilter))
+    .filter(({p}) => bandMatches(p));
   if(!state.passes.length){ tb.innerHTML = `<tr><td colspan="7" style="color:var(--muted)">No passes above the chosen peak elevation in this window.</td></tr>`; $('#passStatus').textContent='Done.'; return; }
-  if(!filtered.length){ tb.innerHTML = `<tr><td colspan="7" style="color:var(--muted)">No upcoming passes match this filter.</td></tr>`; $('#passStatus').textContent = `${state.passes.length} passes upcoming.`; return; }
-  $('#passStatus').textContent = state.passFilter ? `${filtered.length}/${state.passes.length} passes shown.` : `${state.passes.length} passes upcoming.`;
+  if(!filtered.length){ tb.innerHTML = `<tr><td colspan="7" style="color:var(--muted)">No upcoming passes match these filters.</td></tr>`; $('#passStatus').textContent = `${state.passes.length} passes upcoming.`; return; }
+  $('#passStatus').textContent = (state.passFilter || state.bandFilter !== 'all') ? `${filtered.length}/${state.passes.length} passes shown.` : `${state.passes.length} passes upcoming.`;
   tb.innerHTML = filtered.map(({p,i}) => {
     const cls = p.maxEl>=45?'high':p.maxEl>=20?'mid':'low';
+    const rule = trackedRuleFor(p);
+    const band = passBand(p);
+    const buttonClass = rule ? 'mini schedulePass engaged' : 'mini schedulePass';
+    const buttonText = rule ? 'Engaged' : 'Track';
     return `<tr data-i="${i}"><td>${escapeHtml(p.name)}</td>
       <td>${new Date(p.start).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
       <td class="in"></td>
       <td class="num"><span class="pill ${cls}">${p.maxEl.toFixed(0)}°</span></td>
-      <td>${compass(p.startAz)}→${compass(p.maxAz)}</td>
+      <td>${compass(p.startAz)}→${compass(p.maxAz)} <span style="color:var(--muted)">· ${band}</span></td>
       <td class="num">${fmtDur(p.end-p.start)}</td>
-      <td><button class="mini schedulePass" data-i="${i}">Track</button></td></tr>`;
+      <td><button class="${buttonClass}" data-i="${i}">${buttonText}</button></td></tr>`;
   }).join('');
   updateCountdowns();
 }
@@ -472,11 +513,16 @@ function updateCountdowns(){
 }
 
 function defaultFrequencyMhz(pass){
+  const band = passBand(pass);
+  if(bandProfiles[band]) return bandProfiles[band].freq;
   if(/METEOR-M2\s*4/i.test(pass.name)) return 137.100;
   return +$('#schedFreq').value || 137.100;
 }
 function ruleIdFor(pass, profile){
   return `sat-${pass.norad}-${profile}`.replace(/[^a-zA-Z0-9_-]/g, '-');
+}
+function trackedRuleFor(pass){
+  return (state.rules || []).find(rule => rule.enabled !== false && Number(rule.norad) === Number(pass.norad));
 }
 async function loadRules(){
   try {
@@ -504,10 +550,17 @@ function renderRules(rules){
       <td><button class="mini deleteRule" data-id="${escapeHtml(rule.id)}">Delete</button></td>
     </tr>`;
   }).join('') || `<tr><td colspan="6" style="color:var(--muted)">No saved scheduler rules match this filter.</td></tr>`;
+  if(state.passes.length) renderPasses();
 }
 async function schedulePass(index){
   const pass = state.passes[index];
   if(!pass || !pass.norad){ $('#passStatus').textContent = 'Pass has no NORAD ID; reload TLEs and predict again.'; return; }
+  const existing = trackedRuleFor(pass);
+  if(existing){
+    await deleteRule(existing.id);
+    $('#passStatus').textContent = `Tracking removed for ${pass.name}.`;
+    return;
+  }
   const profile = $('#schedProfile').value;
   const freqMhz = +$('#schedFreq').value || defaultFrequencyMhz(pass);
   $('#schedFreq').value = freqMhz.toFixed(3);
@@ -562,6 +615,7 @@ $('#group').addEventListener('change', e => { state.group = e.target.value; if(s
 $('#minEl').addEventListener('change', e => { state.minEl = +e.target.value; requestLive(); });
 $('#overheadFilter').addEventListener('input', e => { state.overheadFilter = e.target.value.trim(); renderList(state.overhead || []); });
 $('#passFilter').addEventListener('input', e => { state.passFilter = e.target.value.trim(); renderPasses(); });
+$('#bandFilter').addEventListener('change', e => { state.bandFilter = e.target.value; applyBandDefaults(); renderPasses(); });
 $('#rulesFilter').addEventListener('input', e => { state.rulesFilter = e.target.value.trim(); renderRules(state.rules || []); });
 document.querySelectorAll('#tbl th').forEach(th => th.addEventListener('click', () => {
   const k = th.dataset.sort;

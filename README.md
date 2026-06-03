@@ -47,11 +47,15 @@ The response includes `norad`, `aos`, `los`, `max_el`, `aos_az`, `los_az`,
 The default catalog in the web UI is `radio`, a curated subset of active TLEs
 for common radio/weather/station/amateur targets. The full `active` catalog is
 still available, but it is much slower for predictions. Overhead, pass, and
-scheduler-rule tables all have text filters for large lists.
+scheduler-rule tables all have full-width text filters for large lists.
+Upcoming passes also have an equipment/band filter for common VHF, amateur,
+L-band, and 1090 MHz antenna setups. These band matches are name-based
+heuristics because TLEs do not include transmitter frequencies.
 
 The web UI can also save persistent SDR scheduler rules through the local
 server. Run `python3 serve.py`, predict passes, choose a profile/frequency, and
-click `Track` on a pass. Rules are stored at `~/sdr_scheduler_rules.json`; the
+click `Track` on a pass. A tracked satellite shows `Engaged`; click it again to
+remove the saved rule. Rules are stored at `~/sdr_scheduler_rules.json`; the
 scheduler reads that file directly, so it does not depend on the web server
 staying online after the rule is saved.
 
