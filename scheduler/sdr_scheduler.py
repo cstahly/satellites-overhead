@@ -103,7 +103,7 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
         with open(pidfile, "w") as pf:
             pf.write(str(proc.pid))
         proc.wait()
-        cadu = os.path.join(capdir, "meteor_m2-x_lrpt.cadu")
+        cadu = os.path.join(capdir, f"{pipeline}.cadu")
         size = os.path.getsize(cadu) if os.path.exists(cadu) else 0
         if size > 0:
             log(f"DONE  {label} — {size} bytes CADU — IMAGES LIKELY")
@@ -368,9 +368,10 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     vga=vga,
                     amp=amp,
                     label=f"{label} {suffix}",
-                    samplerate=str(rule.get("samplerate", "1e6")),
-                    iq_swap=bool(rule.get("iq_swap", False)),
+                    samplerate=str(rule.get("samplerate", LRPT_RETRY_VARIANTS[0]["samplerate"])),
+                    iq_swap=bool(rule.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"])),
                     pipeline=str(rule.get("pipeline", default_pipeline)),
+                    _retry_idx=0,
                     **meta,
                 ),
             ))
