@@ -10,6 +10,7 @@ caches orbital data so you never hit CelesTrak's rate limiter.
 |--------------|-------------------------------------------------------------------|
 | `index.html` | The entire frontend: UI, sky plot, and a Web Worker that does all the orbital math (SGP4 via `satellite.js`, loaded from a CDN). |
 | `serve.py`   | Static file server **+** caching TLE proxy. The browser fetches `/tle?group=NAME` from here; this process fetches CelesTrak at most once per group per 2 h and caches to `./.tlecache/`. |
+| `scheduler_mcp.py` | Stdio MCP server exposing scheduler-rule, pass-prediction, satellite detail, transmitter, and dry-run tools to Codex/agents. |
 | `.tlecache/` | Auto-created TLE cache. Safe to delete; regenerates on demand. Not needed when moving the project. |
 
 ## Run
@@ -67,6 +68,17 @@ upcoming pass or overhead-now row opens satellite details from SatNOGS DB,
 including image when available, status, launch/country/operator metadata, pass
 summary, and active transmitter records. Satellite metadata is cached under
 `.satcache/`.
+
+## MCP server
+
+`scheduler_mcp.py` is a stdio MCP facade for agents. It has been registered in
+`~/.codex/config.toml` as `sdr-scheduler` and exposes tools for listing,
+adding, updating, enabling/disabling, and deleting scheduler rules; predicting
+passes; checking overhead satellites; reading SatNOGS satellite/transmitter
+metadata; suggesting capture settings; listing upcoming generated scheduler
+runs; dry-running a rule; starting an immediate confirmed capture; and reading
+scheduler status. The MCP server uses the same `~/sdr_scheduler_rules.json`,
+TLE cache, SatNOGS cache, and Python predictor as the web/server side.
 
 ## How it works
 
