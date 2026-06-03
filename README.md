@@ -1,155 +1,376 @@
 # Satellites Overhead
 
-A single-file web app that shows which satellites are above your horizon right
-now and predicts upcoming passes, plus a tiny Python server that proxies and
-caches orbital data so you never hit CelesTrak's rate limiter.
+Real-time satellite tracker, pass predictor, SDR capture scheduler, and MCP
+server for AI agents. Built for a single HackRF One + V-dipole setup receiving
+METEOR LRPT weather imagery, but the web UI and scheduler are hardware-agnostic.
 
-## Files
+---
 
-| File         | What it is                                                        |
-|--------------|-------------------------------------------------------------------|
-| `index.html` | The entire frontend: UI, sky plot, and a Web Worker that does all the orbital math (SGP4 via `satellite.js`, loaded from a CDN). |
-| `serve.py`   | Static file server **+** caching TLE proxy. The browser fetches `/tle?group=NAME` from here; this process fetches CelesTrak at most once per group per 2 h and caches to `./.tlecache/`. |
-| `scheduler_mcp.py` | Stdio MCP server exposing scheduler-rule, pass-prediction, satellite detail, transmitter, and dry-run tools to Codex/agents. |
-| `.tlecache/` | Auto-created TLE cache. Safe to delete; regenerates on demand. Not needed when moving the project. |
+## What's in here
 
-## Run
+| File | Purpose |
+|------|---------|
+| `index.html` | Full frontend: sky plot, overhead list, pass prediction, scheduler rules UI |
+| `serve.py` | Web server + TLE proxy + scheduler API on port 8723 |
+| `predict.py` | Headless pass predictor (PyEphem, used by scheduler and `/passes` endpoint) |
+| `scheduler_mcp.py` | Stdio MCP server exposing all scheduler/prediction tools to AI agents |
+| `scheduler/sdr_scheduler.py` | SDR pass scheduler (symlinked from `~/sdr_scheduler.py`) |
+| `monitor_capture.py` | Capture monitor: parses satdump logs, kills bad runs, writes diagnostic reports |
+| `CLAUDE.md` | Full context file for AI agents working in this repo |
+| `systemd/` | Systemd user service unit files |
+| `.tlecache/` | TLE disk cache (auto-created, safe to delete) |
+| `.txcache/` | SatNOGS transmitter cache (auto-created) |
+| `.satcache/` | SatNOGS satellite metadata cache (auto-created) |
+
+---
+
+## Requirements
+
+- Python 3.9+
+- `ephem` (PyEphem) — `pip install ephem` or your distro package
+- `satdump` — for LRPT image decoding (optional, scheduler only)
+- `hackrf_transfer` — HackRF IQ capture (optional, scheduler only)
+- Internet access — CelesTrak TLEs, SatNOGS DB
+
+---
+
+## Installation
+
+### 1. Clone and set up
 
 ```bash
-python3 serve.py            # defaults to port 8723
-# open http://localhost:8723
+git clone <repo> /home/<user>/src/satellites-overhead
+cd /home/<user>/src/satellites-overhead
 ```
 
-No build step, no npm install. Needs Python 3 and internet (for the CDN script
-and CelesTrak). The headless pass predictor also needs PyEphem
-(`python3 -m pip install ephem` if your distro does not already package it).
-To reach it from a phone on the same LAN, it already binds
-`0.0.0.0` — browse to `http://<host-ip>:8723` (note: mobile browsers may block
-geolocation over a plain LAN IP without HTTPS).
+### 2. Python dependencies
 
-## Services
+The web server and predictor use only stdlib + ephem:
 
-The web app/API and SDR scheduler can run as systemd user services:
+```bash
+pip install ephem
+# or: sudo apt install python3-ephem
+```
+
+The MCP server needs its own venv (to isolate the `mcp` package):
+
+```bash
+python3 -m venv .venv-mcp
+.venv-mcp/bin/pip install mcp ephem
+```
+
+### 3. Symlink the live scheduler
+
+The scheduler runs from `~/sdr_scheduler.py` so systemd can find it. Symlink
+it to the source-controlled copy so edits and git history stay in one place:
+
+```bash
+ln -sf /home/<user>/src/satellites-overhead/scheduler/sdr_scheduler.py \
+       ~/sdr_scheduler.py
+```
+
+### 4. Configure your location
+
+Edit `scheduler/sdr_scheduler.py` and update:
+
+```python
+LAT = 40.42    # degrees north
+LON = -86.88   # degrees east (negative = west)
+ALT_M = 180    # meters above sea level
+```
+
+These are also used by the MCP server via `predict.py`.
+
+### 5. Systemd user services
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/satellites-overhead.service ~/.config/systemd/user/
+cp systemd/sdr-scheduler.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now satellites-overhead.service sdr-scheduler.service
+```
+
+Enable lingering so services start on boot without a login session:
+
+```bash
+loginctl enable-linger <user>
+```
+
+Check status:
 
 ```bash
 systemctl --user status satellites-overhead.service
 systemctl --user status sdr-scheduler.service
 ```
 
-Unit files are tracked under `systemd/` and installed to
-`~/.config/systemd/user/`. User lingering must be enabled for them to start
-after reboot:
+### 6. MCP server registration (Codex / Claude Code)
 
-```bash
-loginctl enable-linger cstahly
-systemctl --user enable --now satellites-overhead.service sdr-scheduler.service
-```
-
-## Headless pass JSON
-
-For scheduler integrations, use the Python predictor instead of the browser:
-
-```bash
-python3 predict.py --lat 40.42 --lon -86.88 --alt-m 180 \
-  --hours 8 --min-el 5 --norad 59051 --track-step-s 10
-```
-
-Or run the server and query `/passes`:
-
-```bash
-curl 'http://localhost:8723/passes?group=active&lat=40.42&lon=-86.88&alt_m=180&hours=8&min_el=5&norad=59051&track_step_s=10'
-```
-
-The response includes `norad`, `aos`, `los`, `max_el`, `aos_az`, `los_az`,
-`duration_s`, and a sampled `track` of `{t, az, el, range, range_rate}` points.
-
-The default catalog in the web UI is `radio`, a curated subset of active TLEs
-for common radio/weather/station/amateur targets. The full `active` catalog is
-still available, but it is much slower for predictions. Overhead, pass, and
-scheduler-rule tables all have full-width text filters for large lists.
-Upcoming passes also have an equipment/band filter for common VHF, amateur,
-L-band, and 1090 MHz antenna setups. That filter only controls which rows are
-shown. Capture settings for new rules live in the separate capture controls; the
-`Auto` capture band asks `/capture-settings` to choose from SatNOGS transmitter
-records, cached under `.txcache/`. Satellites without transmitter data stay
-unknown instead of being guessed from their names.
-
-The web UI can also save persistent SDR scheduler rules through the local
-server. Run `python3 serve.py`, predict passes, choose a capture mode/frequency,
-HackRF gain settings, and click `Track` on a pass. A tracked satellite shows
-`Engaged`; click it again to remove the saved rule. Rules are stored at
-`~/sdr_scheduler_rules.json`; the scheduler reads that file directly, so it does
-not depend on the web server staying online after the rule is saved. In saved
-JSON, the capture mode is still stored as `profile` for scheduler compatibility.
-Satellite rules include `frequency_hz`, `lna_gain`, `vga_gain`, and `amp`; the
-scheduler reads those rule fields directly and reloads rule changes while
-running. New Track rules call `/capture-settings` first, which mirrors the MCP
-`suggest_capture_settings` tool, then applies one pass-specific tweak: if the
-pass peaks at 60 degrees or higher, VGA is reduced by 12 dB while LNA and amp
-are left unchanged.
-
-Overhead-now rows also have `Scan now`. This does not start hardware from the
-web server. The server writes a `scan_now` command to
-`~/sdr_scheduler_commands.json`; the scheduler polls that queue, removes the
-command when it starts, and runs captures synchronously so only one SDR session
-can be active at a time. Live/idle state is written by the scheduler to
-`~/sdr_scheduler_status.json` and shown in the UI. This is the single-device
-model; add device ids/locks to those command and status records when multiple
-receivers are added.
-
-The Scheduler rules table shows all current rules and lets you edit enabled
-state, capture mode, frequency, LNA gain, VGA gain, amp, and minimum elevation
-inline. Clicking an upcoming pass or overhead-now row opens satellite details
-from SatNOGS DB, including image when available, status, launch/country/operator
-metadata, pass summary, and active transmitter records. Satellite metadata is
-cached under `.satcache/`.
-
-## MCP server
-
-`scheduler_mcp.py` is a stdio MCP facade for agents. It has been registered in
-`~/.codex/config.toml` as `sdr-scheduler` and exposes tools for listing,
-adding, updating, enabling/disabling, and deleting scheduler rules; predicting
-passes; checking overhead satellites; reading SatNOGS satellite/transmitter
-metadata; suggesting capture settings; listing upcoming generated scheduler
-runs; dry-running a rule; starting an immediate confirmed capture; and reading
-scheduler status. Confirmed immediate captures are queued through
-`~/sdr_scheduler_commands.json`; the MCP server does not launch HackRF/SatDump
-directly. The MCP server uses the same `~/sdr_scheduler_rules.json`, TLE cache,
-SatNOGS cache, and Python predictor as the web/server side.
-
-The registered command uses a repo-local virtualenv:
-
-```bash
-python3 -m venv .venv-mcp
-.venv-mcp/bin/python -m pip install mcp ephem
-```
+Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.sdr-scheduler]
-command = "/home/cstahly/src/satellites-overhead/.venv-mcp/bin/python"
-args = ["-u", "/home/cstahly/src/satellites-overhead/scheduler_mcp.py"]
+command = "/home/<user>/src/satellites-overhead/.venv-mcp/bin/python"
+args = ["-u", "/home/<user>/src/satellites-overhead/scheduler_mcp.py"]
 ```
 
-## How it works
+---
 
-1. Browser gets geolocation, then `fetch('/tle?group=active')`.
-2. `serve.py` returns cached or freshly-downloaded TLEs (CelesTrak GP data).
-3. The Web Worker parses TLEs into `satrec`s and, every 3 s, computes
-   topocentric look angles (azimuth/elevation/range) for the observer — the
-   "overhead now" list and sky plot.
-4. "Predict passes" scans forward N hours at a coarse step, detects horizon
-   crossings, then refines rise/peak/set with bisection + ternary search.
-5. CSV export buttons dump either table client-side.
+## Running without systemd
 
-## Data sources & gotchas
+```bash
+# Web server
+python3 serve.py             # port 8723
+python3 serve.py 8080        # custom port
 
-- **Orbital data**: CelesTrak GP/TLE, e.g.
-  `https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle`.
-- CelesTrak **rate-limits** repeated downloads with HTTP 403. The proxy's 2 h
-  disk cache is the fix — keep using it rather than fetching from the browser.
-- `satcat.csv` is **metadata only** (no epoch/state vectors) and cannot be used
-  to compute positions. You need GP/TLE data.
-- `active` (~15k objects) is the largest no-auth public set. The full catalog
-  (incl. debris) requires a Space-Track login.
+# Scheduler (foreground)
+python3 ~/sdr_scheduler.py
 
-See `AGENTS.md` for architecture detail and the radio-scheduler integration plan.
+# MCP server (stdio, normally launched by the agent host)
+.venv-mcp/bin/python scheduler_mcp.py
+```
+
+---
+
+## Web UI
+
+Open `http://localhost:8723`. On the same LAN, browse to `http://<host-ip>:8723`
+from a phone — geolocation requires HTTPS on mobile, so grant it manually or use
+the coordinate inputs.
+
+**Overhead now** — satellites above your horizon at this moment, updated every 3
+seconds. Click a row to open satellite details (SatNOGS image, metadata,
+transmitters, pass info, and capture history). Overhead rows with a scheduled
+rule show a **Scan now** button.
+
+**Predict passes** — scans the next N hours for upcoming passes above a minimum
+elevation. Filter by name/NORAD or equipment band (V-dipole VHF, amateur,
+L-band, ADS-B). Click a row to open details. Click **Track** to create a
+recurring scheduler rule for that satellite.
+
+**Scheduler rules** — live view of all rules. Edit gains, frequency, minimum
+elevation, and enabled state inline. Click **Engaged** to remove a rule.
+
+**Captures** — the satellite details popup includes a history of all past
+captures for that satellite: timestamp, profile, duration, size, CADU bytes, and
+links to download the output or view the diagnostic report.
+
+---
+
+## SDR Scheduler
+
+The scheduler (`scheduler/sdr_scheduler.py`) is a single Python process that:
+
+1. Loads recurring satellite rules from `~/sdr_scheduler_rules.json`
+2. Predicts upcoming passes using `predict.py` (re-runs every 60 s)
+3. Fires captures at the right time (30 s before AOS by default)
+4. Polls `~/sdr_scheduler_commands.json` for immediate scan-now commands
+5. Runs one capture at a time (single-device model)
+6. Writes status to `~/sdr_scheduler_status.json` every 30 s
+7. Appends a record to `~/sdr_capture_history.json` after every job
+8. Spawns a monitoring thread 90 s into every satdump capture
+
+### Runtime files
+
+| File | Written by | Read by |
+|------|-----------|---------|
+| `~/sdr_scheduler_rules.json` | Web UI / MCP | Scheduler |
+| `~/sdr_scheduler_commands.json` | Web UI / MCP | Scheduler |
+| `~/sdr_scheduler_status.json` | Scheduler | Web UI / MCP |
+| `~/sdr_capture_history.json` | Scheduler | Web UI |
+| `~/sdr_scheduler.log` | Scheduler | You / monitor |
+
+### Rule fields
+
+```json
+{
+  "id": "sat-59051-meteor_lrpt_hackrf",
+  "enabled": true,
+  "type": "satellite_recurring",
+  "name": "METEOR-M2 4",
+  "norad": 59051,
+  "group": "radio",
+  "frequency_hz": 137100000,
+  "profile": "meteor_lrpt_hackrf",
+  "lna_gain": 16,
+  "vga_gain": 36,
+  "amp": 1,
+  "min_peak_el": 20,
+  "start_offset_s": -30,
+  "end_offset_s": 60,
+  "samplerate": "1e6",
+  "iq_swap": true,
+  "pipeline": "meteor_m2-x_lrpt"
+}
+```
+
+`start_offset_s` is applied before AOS (negative = start early). `end_offset_s`
+is added after predicted LOS. For passes ≥ 60° elevation the scheduler
+automatically reduces VGA by 12 dB to avoid ADC saturation.
+
+### Scan-now command queue
+
+The web server and MCP write commands to `~/sdr_scheduler_commands.json`. The
+scheduler removes a command when it starts executing it. Neither the web server
+nor the MCP ever runs HackRF or satdump directly.
+
+### Capture monitoring and auto-retry
+
+Every satdump capture spawns a background monitoring thread that wakes at T+90 s
+and runs `monitor_capture.py`. The monitor reads the satdump log and classifies
+signal state:
+
+| Status | Action |
+|--------|--------|
+| Deframer SYNCED | Healthy — let it run |
+| NOSYNC with good SNR | Kill, queue retry with next variant |
+| ADC saturation | Kill, queue retry with reduced gains |
+| All retry variants exhausted | Spawn `claude --print -p ...` for diagnosis |
+| Novel/unknown failure | Spawn Claude immediately |
+
+The retry sequence for LRPT NOSYNC (tries in order):
+
+1. `--iq_swap --samplerate 1e6` pipeline `meteor_m2-x_lrpt` (default)
+2. no `--iq_swap`, `--samplerate 1e6`
+3. `--iq_swap --samplerate 2e6`
+4. `--samplerate 1e6` pipeline `meteor_m2_lrpt` (older decoder)
+
+Each capture produces a `<capdir>/diagnostic_report.md` viewable from the web UI.
+
+---
+
+## API endpoints
+
+All endpoints served by `serve.py` on port 8723.
+
+### Scheduler
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/scheduler/status` | Scheduler heartbeat, current job, queue count |
+| `GET` | `/scheduler/rules` | List all rules |
+| `POST` | `/scheduler/rules` | Create or update a rule |
+| `DELETE` | `/scheduler/rules/<id>` | Delete a rule |
+| `POST` | `/scheduler/scan-now` | Queue an immediate capture |
+
+### Captures
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/captures?norad=NNN` | Capture history for a satellite (all if no norad) |
+| `GET` | `/captures/<id>/report` | Diagnostic report markdown |
+| `GET` | `/captures/<id>/download` | Output directory as `.tar.gz` or raw IQ file |
+
+### Satellites / TLEs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/tle?group=NAME` | Cached TLE data from CelesTrak |
+| `GET` | `/passes?lat=&lon=&...` | Pass predictions (see below) |
+| `GET` | `/capture-settings?norad=NNN` | Suggested frequency/gain from SatNOGS |
+| `GET` | `/transmitters?norad=NNN` | SatNOGS transmitter records |
+| `GET` | `/satellite?norad=NNN` | SatNOGS satellite metadata |
+
+`/passes` parameters: `group`, `lat` (required), `lon` (required), `alt_m`,
+`hours`, `min_el`, `min_duration_s`, `track_step_s`, `limit`, `start`, `norad`
+(repeatable), `name` (repeatable).
+
+---
+
+## MCP server
+
+`scheduler_mcp.py` exposes all scheduler and prediction functionality to AI
+agents via the Model Context Protocol (stdio transport).
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_scheduler_status` | Scheduler heartbeat, paths, log tail |
+| `list_scheduler_rules` | All SDR scheduler rules |
+| `get_scheduler_rule` | Single rule by id |
+| `add_satellite_rule` | Create a recurring satellite rule |
+| `update_scheduler_rule` | Update rule fields |
+| `enable_scheduler_rule` | Enable a rule |
+| `disable_scheduler_rule` | Disable a rule |
+| `delete_scheduler_rule` | Delete a rule |
+| `list_upcoming_scheduler_runs` | Jobs the scheduler will fire in the next N hours |
+| `dry_run_scheduler_rule` | Preview jobs a rule would generate without saving |
+| `run_scheduler_rule_now` | Queue an immediate capture (`confirm=true` required) |
+| `predict_satellite_passes` | Predict passes for any NORAD ID(s) |
+| `list_overhead_now` | Satellites above the horizon right now |
+| `list_radio_targets` | Common radio/weather targets from the TLE catalog |
+| `suggest_capture_settings` | Recommended frequency/gains from SatNOGS transmitters |
+| `get_satellite_details` | SatNOGS satellite metadata |
+| `list_satellite_transmitters` | SatNOGS transmitter records |
+
+### Important: hardware safety
+
+`run_scheduler_rule_now` queues a command through
+`~/sdr_scheduler_commands.json`. The MCP server never runs HackRF or satdump
+directly. The scheduler enforces one active capture at a time.
+
+---
+
+## Headless pass prediction
+
+```bash
+python3 predict.py \
+  --lat 40.42 --lon -86.88 --alt-m 180 \
+  --hours 24 --min-el 10 \
+  --norad 59051 \
+  --track-step-s 60 \
+  --limit 4
+```
+
+Output is a JSON array of pass objects with `norad`, `name`, `aos`, `los`,
+`max_t`, `max_el`, `max_az`, `aos_az`, `los_az`, `duration_s`, and a `track`
+array of `{t, az, el, range, range_rate}` samples.
+
+---
+
+## Monitor script
+
+```bash
+python3 monitor_capture.py ~/noaa_captures/<capdir>
+# --check-only  : analyse and report without killing anything
+```
+
+Reads `<capdir>.log`, classifies signal state, optionally kills satdump, and
+writes `<capdir>/diagnostic_report.md`. Exits 0 if healthy, 1 if it intervened
+or found a problem, 2 if the log isn't there yet. JSON summary printed to stdout
+for programmatic use.
+
+---
+
+## Data sources
+
+- **TLEs**: CelesTrak GP data, cached 2 h per group. Do not fetch directly from
+  the browser — the proxy exists to avoid CelesTrak's HTTP 403 rate limit.
+- **Satellite metadata / transmitters**: SatNOGS DB API, cached 7 days.
+- **LRPT status** (Meteor satellites): check before each session —
+  `https://ub8qbd.satdump.org/wx_report_new.html`
+
+---
+
+## After code changes
+
+```bash
+# Syntax check everything
+python3 -m py_compile serve.py scheduler_mcp.py scheduler/sdr_scheduler.py monitor_capture.py
+
+# Check inline JS
+node - <<'NODE'
+const fs = require('fs');
+const html = fs.readFileSync('index.html', 'utf8');
+for (const src of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(src[1]);
+console.log('ok');
+NODE
+
+# Restart services
+systemctl --user restart satellites-overhead.service sdr-scheduler.service
+
+# Verify
+curl -fsS http://localhost:8723/scheduler/status
+curl -fsS 'http://localhost:8723/captures?norad=59051'
+```
