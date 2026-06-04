@@ -21,6 +21,19 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
 from predict import parse_start, parse_tles, predict_passes, select_tles
+from sdr_runtime import (
+    authenticate_api_token,
+    create_api_token,
+    delete_device,
+    emit_event,
+    list_api_tokens,
+    list_devices,
+    principal_has_scope,
+    read_events,
+    read_notifications,
+    register_device,
+    revoke_api_token,
+)
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8723
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -111,17 +124,59 @@ def int_param(qs, name, default=None):
     return None if value is None else int(value)
 
 
-def write_json(handler, status, payload):
+def write_json(handler, status, payload, headers=None):
     body = json.dumps(payload, indent=2).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Access-Control-Allow-Origin", "*")
+    for name, value in (headers or {}).items():
+        handler.send_header(name, value)
     handler.end_headers()
     try:
         handler.wfile.write(body)
     except (BrokenPipeError, ConnectionResetError):
         pass
+
+
+def is_versioned_api_path(path):
+    return path == "/api/v1" or path.startswith("/api/v1/")
+
+
+def api_required_scope(method, path):
+    if path == "/api/v1/tokens" or path.startswith("/api/v1/tokens/"):
+        return "tokens:manage"
+    if path == "/api/v1/devices" or path.startswith("/api/v1/devices/"):
+        return "devices:manage"
+    if method.upper() == "GET":
+        return "read"
+    return "control"
+
+
+def authorize_versioned_request(handler, method, path):
+    if not is_versioned_api_path(path):
+        return True
+    auth = handler.headers.get("Authorization") or ""
+    scheme, _, token = auth.partition(" ")
+    principal = authenticate_api_token(token.strip()) if scheme.lower() == "bearer" and token.strip() else None
+    if principal is None:
+        write_json(
+            handler,
+            401,
+            {"error": "valid bearer token required"},
+            {"WWW-Authenticate": 'Bearer realm="sdr-api"'},
+        )
+        return False
+    required_scope = api_required_scope(method, path)
+    if not principal_has_scope(principal, required_scope):
+        write_json(
+            handler,
+            403,
+            {"error": "insufficient scope", "required_scope": required_scope},
+        )
+        return False
+    handler.api_principal = principal
+    return True
 
 
 def api_path(path):
@@ -144,8 +199,19 @@ def api_path(path):
 
 
 def audit_actor(handler):
+    principal = getattr(handler, "api_principal", None)
+    if principal:
+        user = principal.get("name") or principal.get("id") or "api-token"
+        auth_type = "bearer"
+        token_id = principal.get("id")
+    else:
+        user = handler.headers.get("X-Remote-User") or "local-or-unknown"
+        auth_type = "basic-or-local"
+        token_id = None
     return {
-        "user": handler.headers.get("X-Remote-User") or "local-or-unknown",
+        "user": user,
+        "auth_type": auth_type,
+        "token_id": token_id,
         "source_ip": handler.headers.get("X-Real-IP") or handler.client_address[0],
         "forwarded_for": handler.headers.get("X-Forwarded-For") or "",
         "user_agent": handler.headers.get("User-Agent") or "",
@@ -166,6 +232,14 @@ def append_audit(handler, action, target, details=None):
     except Exception as e:
         sys.stderr.write(f"[audit] could not append {action}: {e}\n")
     return record
+
+
+def append_event(event_type, source, data=None, notification=None):
+    try:
+        return emit_event(event_type, source, data, notification)
+    except Exception as e:
+        sys.stderr.write(f"[events] could not append {event_type}: {e}\n")
+        return None
 
 
 def read_audit(limit=100):
@@ -585,6 +659,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if not authorize_versioned_request(self, "GET", parsed.path):
+            return
         path = api_path(parsed.path)
         if path == "/api/v1":
             write_json(self, 200, {
@@ -599,7 +675,45 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "transmitters": "/api/v1/transmitters",
                 "satellite": "/api/v1/satellite",
                 "audit": "/api/v1/audit",
+                "events": "/api/v1/events",
+                "notifications": "/api/v1/notifications",
+                "devices": "/api/v1/devices",
+                "tokens": "/api/v1/tokens",
             })
+            return
+        if path == "/api/v1/events":
+            try:
+                qs = parse_qs(parsed.query)
+                limit = int(first_value(qs, "limit", "100"))
+                after = first_value(qs, "after")
+                write_json(self, 200, read_events(after=after, limit=limit))
+            except ValueError as e:
+                self.send_error(400, str(e))
+            except Exception as e:
+                self.send_error(500, f"could not read event stream: {e}")
+            return
+        if path == "/api/v1/notifications":
+            try:
+                qs = parse_qs(parsed.query)
+                limit = int(first_value(qs, "limit", "100"))
+                status = first_value(qs, "status")
+                write_json(self, 200, read_notifications(limit=limit, status=status))
+            except ValueError as e:
+                self.send_error(400, str(e))
+            except Exception as e:
+                self.send_error(500, f"could not read notification outbox: {e}")
+            return
+        if path == "/api/v1/devices":
+            try:
+                write_json(self, 200, list_devices())
+            except Exception as e:
+                self.send_error(500, f"could not read mobile devices: {e}")
+            return
+        if path == "/api/v1/tokens":
+            try:
+                write_json(self, 200, list_api_tokens())
+            except Exception as e:
+                self.send_error(500, f"could not read API tokens: {e}")
             return
         if path == "/api/v1/audit":
             try:
@@ -837,7 +951,42 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if not authorize_versioned_request(self, "POST", parsed.path):
+            return
         path = api_path(parsed.path)
+        if path == "/api/v1/tokens":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("request body must be an object")
+                created = create_api_token(payload.get("name"), payload.get("scopes"))
+                metadata = {key: value for key, value in created.items() if key != "token"}
+            except (ValueError, json.JSONDecodeError) as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"could not create API token: {e}")
+                return
+            append_audit(self, "token.create", metadata["id"], {"token": metadata})
+            append_event("api_token.created", "serve.py", {"token": metadata, "actor": audit_actor(self)})
+            write_json(self, 201, created)
+            return
+        if path == "/api/v1/devices":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                device = register_device(payload, getattr(self, "api_principal", {}).get("id"))
+            except (ValueError, json.JSONDecodeError) as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(500, f"could not register mobile device: {e}")
+                return
+            append_audit(self, "device.register", device["id"], {"device": device})
+            append_event("device.registered", "serve.py", {"device": device, "actor": audit_actor(self)})
+            write_json(self, 200, device)
+            return
         if path == "/scheduler/rules":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -870,6 +1019,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 incoming["id"],
                 {"replaced": replaced, "rule": incoming},
             )
+            append_event(
+                "rule.updated" if replaced else "rule.created",
+                "serve.py",
+                {"rule": incoming, "actor": audit_actor(self)},
+            )
             write_json(self, 200, incoming)
             sys.stderr.write(f"[scheduler] saved rule {incoming['id']}\n")
             return
@@ -886,6 +1040,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(500, f"could not queue scan: {e}")
                 return
             append_audit(self, "scan.queued", command["id"], {"command": command})
+            append_event(
+                "scan.queued",
+                "serve.py",
+                {"command": command, "actor": audit_actor(self)},
+                {
+                    "title": "SDR scan queued",
+                    "body": command.get("name", ""),
+                    "data": {"command_id": command["id"], "norad": command.get("norad")},
+                },
+            )
             write_json(self, 200, {"queued": True, "command": command, "status": scheduler_status()})
             sys.stderr.write(f"[scheduler] queued scan {command['id']}\n")
             return
@@ -893,7 +1057,37 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
+        if not authorize_versioned_request(self, "DELETE", parsed.path):
+            return
         path = api_path(parsed.path)
+        if path.startswith("/api/v1/tokens/"):
+            token_id = path.rsplit("/", 1)[-1]
+            try:
+                revoked = revoke_api_token(token_id)
+            except Exception as e:
+                self.send_error(500, f"could not revoke API token: {e}")
+                return
+            if revoked is None:
+                self.send_error(404, "API token not found")
+                return
+            append_audit(self, "token.revoke", token_id, {"token": revoked})
+            append_event("api_token.revoked", "serve.py", {"token": revoked, "actor": audit_actor(self)})
+            write_json(self, 200, revoked)
+            return
+        if path.startswith("/api/v1/devices/"):
+            device_id = path.rsplit("/", 1)[-1]
+            try:
+                removed = delete_device(device_id)
+            except Exception as e:
+                self.send_error(500, f"could not delete mobile device: {e}")
+                return
+            if removed is None:
+                self.send_error(404, "mobile device not found")
+                return
+            append_audit(self, "device.delete", device_id, {"device": removed})
+            append_event("device.deleted", "serve.py", {"device": removed, "actor": audit_actor(self)})
+            write_json(self, 200, removed)
+            return
         if path.startswith("/scheduler/rules/"):
             rule_id = path.rsplit("/", 1)[-1]
             try:
@@ -905,6 +1099,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(500, f"could not delete scheduler rule: {e}")
                 return
             append_audit(self, "rule.delete", rule_id, {"removed_rules": removed_rules})
+            append_event(
+                "rule.deleted",
+                "serve.py",
+                {"rule_id": rule_id, "removed_rules": removed_rules, "actor": audit_actor(self)},
+            )
             write_json(self, 200, {"deleted": rule_id, "count": len(next_rules)})
             sys.stderr.write(f"[scheduler] deleted rule {rule_id}\n")
             return

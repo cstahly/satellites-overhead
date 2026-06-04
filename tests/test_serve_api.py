@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import sys
 import tempfile
@@ -24,6 +25,24 @@ class FakeHandler:
     client_address = ("127.0.0.1", 12345)
 
 
+class FakeAuthHandler:
+    def __init__(self, authorization=None):
+        self.headers = FakeHeaders({"Authorization": authorization} if authorization else {})
+        self.client_address = ("127.0.0.1", 12345)
+        self.wfile = io.BytesIO()
+        self.status = None
+        self.response_headers = {}
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, name, value):
+        self.response_headers[name] = value
+
+    def end_headers(self):
+        pass
+
+
 class ApiPathTests(unittest.TestCase):
     def test_versioned_aliases(self):
         self.assertEqual(serve.api_path("/api/v1/status"), "/scheduler/status")
@@ -36,6 +55,42 @@ class ApiPathTests(unittest.TestCase):
     def test_legacy_paths_are_unchanged(self):
         self.assertEqual(serve.api_path("/scheduler/status"), "/scheduler/status")
         self.assertEqual(serve.api_path("/passes"), "/passes")
+
+    def test_versioned_api_scope_mapping(self):
+        self.assertEqual(serve.api_required_scope("GET", "/api/v1/status"), "read")
+        self.assertEqual(serve.api_required_scope("POST", "/api/v1/rules"), "control")
+        self.assertEqual(serve.api_required_scope("POST", "/api/v1/devices"), "devices:manage")
+        self.assertEqual(serve.api_required_scope("DELETE", "/api/v1/tokens/tok_1"), "tokens:manage")
+
+    @mock.patch("serve.authenticate_api_token", return_value=None)
+    def test_versioned_api_rejects_missing_token(self, authenticate):
+        handler = FakeAuthHandler()
+
+        allowed = serve.authorize_versioned_request(handler, "GET", "/api/v1/status")
+
+        self.assertFalse(allowed)
+        self.assertEqual(handler.status, 401)
+        self.assertIn("WWW-Authenticate", handler.response_headers)
+        authenticate.assert_not_called()
+
+    @mock.patch("serve.authenticate_api_token")
+    def test_versioned_api_checks_scope(self, authenticate):
+        authenticate.return_value = {"id": "tok_1", "name": "phone", "scopes": ["read"]}
+        handler = FakeAuthHandler("Bearer secret")
+
+        allowed = serve.authorize_versioned_request(handler, "POST", "/api/v1/scans")
+
+        self.assertFalse(allowed)
+        self.assertEqual(handler.status, 403)
+
+    @mock.patch("serve.authenticate_api_token")
+    def test_legacy_api_does_not_require_bearer(self, authenticate):
+        handler = FakeAuthHandler()
+
+        allowed = serve.authorize_versioned_request(handler, "POST", "/scheduler/scan-now")
+
+        self.assertTrue(allowed)
+        authenticate.assert_not_called()
 
 
 class AuditTests(unittest.TestCase):
