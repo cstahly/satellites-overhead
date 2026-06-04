@@ -11,6 +11,7 @@ final class AppState: ObservableObject {
     @Published var passes: [Pass] = []
     @Published var captures: [Capture] = []
     @Published var rules: [Rule] = []
+    @Published var overhead: [OverheadSat] = []
     @Published var events: [SdrEvent] = []
     @Published var statusError: String?
     @Published var passesError: String?
@@ -51,16 +52,27 @@ final class AppState: ObservableObject {
         let lat = UserDefaults.standard.double(forKey: "latitude").nonZero ?? defaultLat
         let lon = UserDefaults.standard.double(forKey: "longitude").nonZero ?? defaultLon
         let alt = UserDefaults.standard.double(forKey: "altitude_m").nonZero ?? defaultAlt
-        let ruleNorads = rules.isEmpty ? [59051] : Array(Set(rules.map { $0.norad }))
-        var all: [Pass] = []
-        for norad in ruleNorads {
-            if let result = try? await api.getPasses(norad: Int32(norad), hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt) {
-                all += result as? [Pass] ?? []
-            }
+        do {
+            // no norad filter = all active satellites
+            let result = try await api.getPasses(norad: -1, hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt)
+            passes = result as? [Pass] ?? []
+            passesError = nil
+        } catch {
+            passesError = error.localizedDescription
         }
-        passes = all.sorted { $0.aos < $1.aos }
-        passesError = all.isEmpty ? "No passes in the next \(hours)h." : nil
         isLoadingPasses = false
+    }
+
+    func refreshOverhead() async {
+        let lat = UserDefaults.standard.double(forKey: "latitude").nonZero ?? defaultLat
+        let lon = UserDefaults.standard.double(forKey: "longitude").nonZero ?? defaultLon
+        let alt = UserDefaults.standard.double(forKey: "altitude_m").nonZero ?? defaultAlt
+        do {
+            let result = try await api.getOverhead(lat: lat, lon: lon, altM: alt, minEl: 0.0)
+            overhead = result as? [OverheadSat] ?? []
+        } catch {
+            overhead = []
+        }
     }
 
     func refreshCaptures(norad: Int32 = -1) async {
@@ -113,6 +125,7 @@ final class AppState: ObservableObject {
             group.addTask { await self.refreshPasses() }
             group.addTask { await self.refreshCaptures() }
             group.addTask { await self.refreshEvents() }
+            group.addTask { await self.refreshOverhead() }
         }
     }
 }

@@ -23,9 +23,7 @@ struct PassesView: View {
                             }
                         }
                     }
-                    .navigationDestination(item: $selectedPass) { pass in
-                        PassDetailView(pass: pass)
-                    }
+                    .navigationDestination(item: $selectedPass) { PassDetailView(pass: $0) }
                 }
             }
             .navigationTitle("Upcoming Passes")
@@ -48,31 +46,31 @@ private struct PassRow: View {
     let onToggleTracking: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            // Main content — tapping navigates to detail
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(pass.name).font(.headline)
-                    Spacer()
-                    Text(String(format: "%.0f°", pass.maxElevation))
-                        .font(.headline.bold())
-                        .foregroundStyle(elevationColor)
-                }
-                Text("AOS \(pass.aos.shortTime)  •  \(pass.durationSeconds / 60)m \(pass.durationSeconds % 60)s")
+        HStack(alignment: .center, spacing: 10) {
+            // Elevation pill — left
+            elevationPill
+
+            // Pass info — fills remaining space, taps to navigate
+            VStack(alignment: .leading, spacing: 3) {
+                Text(pass.name)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text("AOS \(pass.aos.shortTime)  ·  \(pass.durationSeconds / 60)m \(pass.durationSeconds % 60)s")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("Az \(Int(pass.aosAzimuth))° → \(Int(pass.maxAzimuth))° → \(Int(pass.losAzimuth))°")
+                Text("Az \(Int(pass.aosAzimuth))°→\(Int(pass.maxAzimuth))°→\(Int(pass.losAzimuth))°")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture { onTap() }
 
-            // Tracking toggle — separate tap target
-            Button {
-                onToggleTracking()
-            } label: {
-                Image(systemName: isTracked ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
-                    .foregroundStyle(isTracked ? .green : Color(white: 0.4))
-                    .font(.system(size: 18))
+            // Tracking toggle — right
+            Button { onToggleTracking() } label: {
+                Image(systemName: isTracked
+                      ? "antenna.radiowaves.left.and.right"
+                      : "antenna.radiowaves.left.and.right.slash")
+                    .foregroundStyle(isTracked ? .green : Color(white: 0.35))
+                    .font(.system(size: 17))
                     .frame(width: 36, height: 44)
                     .contentShape(Rectangle())
             }
@@ -81,11 +79,21 @@ private struct PassRow: View {
         .padding(.vertical, 2)
     }
 
-    private var elevationColor: Color {
+    private var elevationPill: some View {
+        Text(String(format: "%.0f°", pass.maxElevation))
+            .font(.caption.bold())
+            .foregroundStyle(.black)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(pillColor.cornerRadius(6))
+            .frame(width: 46)
+    }
+
+    private var pillColor: Color {
         switch pass.maxElevation {
-        case 60...: return .green
-        case 30...: return Color(red: 0.6, green: 0.9, blue: 0.3)
-        default: return .secondary
+        case 45...: return Color(red: 0.2, green: 0.85, blue: 0.4)   // green
+        case 20...: return Color(red: 0.85, green: 0.75, blue: 0.1)  // yellow
+        default:    return Color(red: 0.55, green: 0.55, blue: 0.6)  // gray
         }
     }
 }

@@ -6,52 +6,24 @@ struct StatusView: View {
     @Binding var selectedTab: Int
     @State private var showScanSheet = false
     @State private var now = Date()
-    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var nextPass: Pass? { app.passes.first }
-
-    // Passes that are currently in progress
-    var overhead: [(pass: Pass, el: Double, az: Double)] {
-        app.passes.compactMap { pass in
-            guard let aos = iso(pass.aos), let los = iso(pass.los),
-                  now >= aos, now <= los else { return nil }
-            let elapsed = now.timeIntervalSince(aos)
-            let track = pass.track as? [TrackPoint] ?? []
-            let idx = min(max(0, Int(elapsed / Double(pass.trackStepSeconds))), track.count - 1)
-            let tp = track.isEmpty ? nil : track[idx]
-            return (pass, tp?.el ?? 0, tp?.az ?? 0)
-        }
-    }
 
     var body: some View {
         NavigationStack {
             Group {
                 if let status = app.status {
                     List {
-                        // Overhead satellites
-                        Section("Overhead now") {
-                            if overhead.isEmpty {
-                                Text("No satellites overhead")
-                                    .foregroundStyle(.secondary)
-                                    .italic()
-                            } else {
-                                ForEach(overhead, id: \.pass.aos) { item in
-                                    HStack {
-                                        Text(item.pass.name).bold()
-                                        Spacer()
-                                        Text(String(format: "%.0f°", item.el))
-                                            .foregroundStyle(item.el >= 30 ? .green : .yellow)
-                                            .bold()
-                                        Text(cardinal(item.az))
-                                            .foregroundStyle(.secondary)
-                                            .font(.caption)
-                                            .frame(width: 28, alignment: .leading)
-                                    }
-                                }
-                            }
+                        // Sky plot
+                        Section {
+                            OverheadSkyPlot(sats: app.overhead)
+                                .aspectRatio(1, contentMode: .fit)
+                                .listRowInsets(EdgeInsets())
+                                .listRowBackground(Color.clear)
                         }
 
-                        // Scheduler state
+                        // Scheduler state + next pass
                         Section {
                             HStack(spacing: 10) {
                                 Circle()
@@ -68,12 +40,11 @@ struct StatusView: View {
                                 } label: {
                                     HStack {
                                         Text(countdownText(to: p.aos))
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
+                                            .font(.caption).foregroundStyle(.secondary)
                                         Spacer()
                                         Text(p.name).foregroundStyle(.primary)
                                         Image(systemName: "chevron.right")
-                                            .font(.caption).foregroundStyle(.secondary)
+                                            .font(.caption).foregroundStyle(Color(white: 0.4))
                                     }
                                 }
                                 .buttonStyle(.plain)
@@ -94,24 +65,6 @@ struct StatusView: View {
                                     LabeledContent("Gains", value: "LNA=\(lna.int32Value) VGA=\(job.vgaGain?.int32Value ?? 0) AMP=\(job.amp?.int32Value ?? 0)")
                                 }
                             }
-                        }
-
-                        // Queue
-                        Section {
-                            Button {
-                                selectedTab = 2
-                            } label: {
-                                HStack {
-                                    Text("Pending queue").foregroundStyle(.primary)
-                                    Spacer()
-                                    Text("\(status.queueCount)")
-                                        .foregroundStyle(status.queueCount > 0 ? .orange : Color(white: 0.45))
-                                        .bold()
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption).foregroundStyle(Color(white: 0.45))
-                                }
-                            }
-                            .buttonStyle(.plain)
                         }
 
                         Section {
@@ -137,20 +90,20 @@ struct StatusView: View {
                     }
                 }
             }
-            .refreshable { await app.refreshAll() }
-            .onReceive(timer) { now = $0 }
+            .refreshable {
+                async let a: () = app.refreshAll()
+                async let b: () = app.refreshOverhead()
+                _ = await (a, b)
+            }
+            .onReceive(timer) { _ in Task { await app.refreshOverhead() } }
             .sheet(isPresented: $showScanSheet) {
                 ScanNowSheet().presentationDetents([.medium])
             }
         }
     }
 
-    private func iso(_ s: String) -> Date? {
-        ISO8601DateFormatter().date(from: s)
-    }
-
     private func countdownText(to aosISO: String) -> String {
-        guard let d = iso(aosISO) else { return "" }
+        guard let d = ISO8601DateFormatter().date(from: aosISO) else { return "" }
         let diff = d.timeIntervalSince(now)
         if diff < 0 { return "In progress" }
         let h = Int(diff) / 3600; let m = (Int(diff) % 3600) / 60; let s = Int(diff) % 60
@@ -158,10 +111,66 @@ struct StatusView: View {
         if m > 0 { return "in \(m)m \(s)s" }
         return "in \(s)s"
     }
+}
 
-    private func cardinal(_ az: Double) -> String {
-        let dirs = ["N","NE","E","SE","S","SW","W","NW","N"]
-        return dirs[Int((az + 22.5) / 45) % 8]
+// MARK: - Sky Plot
+
+private struct OverheadSkyPlot: View {
+    let sats: [OverheadSat]
+
+    var body: some View {
+        Canvas { ctx, size in
+            let cx = size.width / 2, cy = size.height / 2
+            let r = min(cx, cy) - 24
+
+            // Background
+            ctx.fill(Path(ellipseIn: CGRect(x: cx-r-16, y: cy-r-16, width: (r+16)*2, height: (r+16)*2)),
+                     with: .color(Color(white: 0.06)))
+
+            // Elevation rings
+            for el in stride(from: 0.0, through: 60.0, by: 30.0) {
+                let rr = r * (1 - el / 90)
+                let rect = CGRect(x: cx-rr, y: cy-rr, width: rr*2, height: rr*2)
+                ctx.stroke(Path(ellipseIn: rect),
+                           with: .color(Color(red: 0.16, green: 0.21, blue: 0.35)),
+                           lineWidth: el == 0 ? 1.5 : 1)
+            }
+
+            // Cross hairs
+            ctx.stroke(Path { p in
+                p.move(to: CGPoint(x: cx, y: cy-r)); p.addLine(to: CGPoint(x: cx, y: cy+r))
+                p.move(to: CGPoint(x: cx-r, y: cy)); p.addLine(to: CGPoint(x: cx+r, y: cy))
+            }, with: .color(Color(red: 0.16, green: 0.21, blue: 0.35)), lineWidth: 0.5)
+
+            // Compass labels
+            let compass: [(String, Double)] = [("N",0),("E",90),("S",180),("W",270)]
+            for (label, az) in compass {
+                let rad = (az - 90) * .pi / 180
+                let px = cx + (r + 14) * cos(rad)
+                let py = cy + (r + 14) * sin(rad)
+                ctx.draw(Text(label).font(.caption2.bold()).foregroundStyle(Color(white: 0.5)),
+                         at: CGPoint(x: px, y: py))
+            }
+
+            // Satellite dots
+            for sat in sats {
+                let dist = r * (1 - sat.el / 90)
+                let rad = (sat.az - 90) * .pi / 180
+                let x = cx + dist * cos(rad)
+                let y = cy + dist * sin(rad)
+                let brightness = 0.35 + 0.65 * (sat.el / 90)
+                let dotColor = Color(red: 0.35, green: 0.82, blue: 1.0, opacity: brightness)
+                let dotR: CGFloat = sat.el > 60 ? 5 : 4
+                ctx.fill(Path(ellipseIn: CGRect(x: x-dotR, y: y-dotR, width: dotR*2, height: dotR*2)),
+                         with: .color(dotColor))
+            }
+
+            // Count label
+            let countText = Text("\(sats.count) overhead")
+                .font(.caption2).foregroundStyle(Color(white: 0.45))
+            ctx.draw(countText, at: CGPoint(x: cx, y: cy + r + 22))
+        }
+        .padding(8)
     }
 }
 
@@ -184,9 +193,7 @@ private struct ScanNowSheet: View {
                 if !activeRules.isEmpty {
                     Section("Active rules") {
                         Picker("Target", selection: $selectedRuleId) {
-                            ForEach(activeRules, id: \.id) { r in
-                                Text(r.name).tag(r.id)
-                            }
+                            ForEach(activeRules, id: \.id) { r in Text(r.name).tag(r.id) }
                         }
                         .pickerStyle(.inline).labelsHidden()
                     }

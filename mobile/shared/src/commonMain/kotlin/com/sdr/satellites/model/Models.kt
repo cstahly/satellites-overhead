@@ -107,6 +107,15 @@ data class SdrEvent(
 )
 
 @Serializable
+data class OverheadSat(
+    val name: String,
+    val norad: Int,
+    val az: Double,
+    val el: Double,
+    @SerialName("range_km") val rangeKm: Double,
+)
+
+@Serializable
 data class ScanNowRequest(
     val norad: Int,
     val name: String? = null,

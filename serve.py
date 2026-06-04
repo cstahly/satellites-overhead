@@ -20,7 +20,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
-from predict import parse_start, parse_tles, predict_passes, select_tles
+from predict import overhead_now, parse_start, parse_tles, predict_passes, select_tles
 from sdr_runtime import (
     authenticate_api_token,
     create_api_token,
@@ -723,6 +723,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(400, str(e))
             except Exception as e:
                 self.send_error(500, f"could not read audit log: {e}")
+            return
+        if path == "/api/v1/overhead":
+            qs = parse_qs(parsed.query)
+            try:
+                lat = float_param(qs, "lat", required=True)
+                lon = float_param(qs, "lon", required=True)
+                alt_m = float_param(qs, "alt_m", 0.0)
+                min_el = float_param(qs, "min_el", 0.0)
+                group = first_value(qs, "group", "active").lower()
+                if group not in ALLOWED:
+                    self.send_error(400, "unknown group")
+                    return
+                text, _ = fetch_tle(group)
+                sats = overhead_now(parse_tles(text), lat=lat, lon=lon, alt_m=alt_m, min_el=min_el)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
+            except Exception as e:
+                self.send_error(502, f"overhead computation failed: {e}")
+                return
+            write_json(self, 200, sats)
             return
         if path == "/tle":
             group = (parse_qs(parsed.query).get("group", ["active"])[0]).lower()

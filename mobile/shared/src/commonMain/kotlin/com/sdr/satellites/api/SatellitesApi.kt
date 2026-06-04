@@ -57,7 +57,7 @@ class SatellitesApi(private val baseUrl: String, token: String) {
 
     @Throws(Exception::class)
     suspend fun getPasses(
-        norad: Int,
+        norad: Int = -1,
         hours: Int = 24,
         minEl: Double = 10.0,
         lat: Double,
@@ -66,13 +66,28 @@ class SatellitesApi(private val baseUrl: String, token: String) {
     ): List<Pass> =
         client.get("$baseUrl/api/v1/passes") {
             header("Authorization", authHeader)
-            parameter("norad", norad)
+            if (norad > 0) parameter("norad", norad)
             parameter("hours", hours)
             parameter("min_el", minEl)
             parameter("lat", lat)
             parameter("lon", lon)
             parameter("alt_m", altM)
             parameter("track_step_s", 30)
+        }.body()
+
+    @Throws(Exception::class)
+    suspend fun getOverhead(
+        lat: Double,
+        lon: Double,
+        altM: Double = 180.0,
+        minEl: Double = 0.0,
+    ): List<OverheadSat> =
+        client.get("$baseUrl/api/v1/overhead") {
+            header("Authorization", authHeader)
+            parameter("lat", lat)
+            parameter("lon", lon)
+            parameter("alt_m", altM)
+            parameter("min_el", minEl)
         }.body()
 
     @Throws(Exception::class)

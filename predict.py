@@ -118,6 +118,38 @@ def sample_track(
     return out
 
 
+def overhead_now(
+    tles: Iterable[TleSat],
+    lat: float,
+    lon: float,
+    alt_m: float,
+    min_el: float = 0.0,
+    at: datetime | None = None,
+) -> list[dict]:
+    if at is None:
+        at = datetime.now(timezone.utc)
+    obs = make_observer(lat, lon, alt_m, at)
+    obs.date = ephem.Date(at)
+    result = []
+    for tle in tles:
+        try:
+            sat = ephem.readtle(tle.name, tle.line1, tle.line2)
+            sat.compute(obs)
+            el = degrees(float(sat.alt))
+            if el >= min_el:
+                result.append({
+                    "name": tle.name,
+                    "norad": tle.norad,
+                    "az": degrees(float(sat.az)) % 360.0,
+                    "el": el,
+                    "range_km": float(sat.range) / 1000.0,
+                })
+        except Exception:
+            continue
+    result.sort(key=lambda x: -x["el"])
+    return result
+
+
 def select_tles(tles: Iterable[TleSat], names: set[str], norads: set[int]) -> list[TleSat]:
     if not names and not norads:
         return list(tles)
