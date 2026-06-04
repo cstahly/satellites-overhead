@@ -1,0 +1,21 @@
+[Unit]
+Description=Private reverse SSH tunnel for the SDR web app
+After=network-online.target satellites-overhead.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -NT \
+  -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes \
+  -R 127.0.0.1:18723:127.0.0.1:8723 \
+  sadbabyrabbit.com
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+
