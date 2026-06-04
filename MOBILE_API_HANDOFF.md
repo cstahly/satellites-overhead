@@ -9,52 +9,46 @@ worker and mobile client will consume.
 
 ## Agent pickup status
 
-As of the last edit on June 4, 2026:
+As of the last edit on June 4, 2026, the backend foundation is live:
 
 - Functional code is committed:
   - `d6e58d4 Add bearer-authenticated mobile API runtime`
   - `b5f3bf4 Emit scheduler lifecycle events`
+  - `f872f1b Document mobile API deployment and rollback`
 - The functional code has passed `python3 -m unittest discover -v` (13 tests)
   and Python compilation.
-- The live web and scheduler services have **not yet been restarted**, so the
-  new auth/events behavior is not active yet.
-- The public nginx `/api/v1` bearer-auth split has **not yet been installed**.
-- No initial mobile bearer token has been created yet.
-- Documentation/nginx changes after those commits may still be uncommitted;
-  inspect `git status --short` first.
+- The live web and scheduler services have been restarted and verified.
+- The public nginx `/api/v1` bearer-auth split is installed and verified.
+- Initial full-scope token `tok_7c9873925e18470c` is active. Its one-time raw
+  secret is temporarily stored at `~/sdr_mobile_bootstrap_token.json`, mode
+  `0600`. Give it only to the owner/app, then delete that temporary file.
+- A deployment read-only token was created, scope-tested, and revoked.
+- Device registration/redaction/removal was tested; the live device list is
+  empty after cleanup.
 - `.tlecache/active.tle` is runtime churn and must not be committed or reverted.
 
-Safe continuation order:
+Next implementation work:
 
-1. Run tests and compile checks.
-2. Commit any remaining documentation/nginx changes.
-3. Re-check `sdr status`, `pgrep -x hackrf_transfer`, and `pgrep -x satdump`.
-4. Create an initial full-scope token with
-   `python3 manage_api_tokens.py create --name mobile-bootstrap`; preserve the
-   one-time secret for the owner and never commit it.
-5. Restart only `satellites-overhead.service`; verify local legacy routes still
-   work, local `/api/v1` without bearer returns 401, and bearer returns 200.
-6. Re-check the capture window, then restart `sdr-scheduler.service` only when
-   idle and safely away from a pass. Verify scheduler events appear.
-7. Back up `/etc/nginx/conf.d/sdr.conf` on EC2, install
-   `deploy/nginx-sdr.conf`, run `sudo nginx -t`, and reload nginx.
-8. Verify public `/` remains Basic-authenticated, public unauthenticated
-   `/api/v1` returns the application's JSON 401, bearer `/api/v1/status`
-   returns 200, and `https://sadbabyrabbit.com` still returns 200.
-9. Record the exact nginx backup path below and in `HOSTING_RUNBOOK.md`, commit,
-   and push.
-
-At the last runtime check, the scheduler was idle, no HackRF/SatDump process
-was active, and the next capture was ORBCOMM at 03:05 EDT. Do not rely on that
-stale check; repeat it immediately before restarting the scheduler.
+1. Scaffold the iOS/Android app against `/api/v1`; use the event stream for
+   foreground updates and device registration for push enrollment.
+2. Implement a push-delivery worker that consumes
+   `~/sdr_notification_outbox.jsonl`, respects device preferences, and records
+   delivery outcomes without blocking the scheduler.
+3. Add a narrowly scoped remote Claude-invocation API only after defining its
+   prompts, allowed context/actions, audit records, and concurrency behavior.
 
 Deployment record:
 
-- Initial token id: not created yet
-- EC2 nginx backup: not created yet
-- Live web restart: not done
-- Live scheduler restart: not done
-- Public nginx reload: not done
+- Initial token id: `tok_7c9873925e18470c`
+- Temporary raw-token handoff: `~/sdr_mobile_bootstrap_token.json` (`0600`)
+- EC2 nginx backup:
+  `/etc/nginx/conf.d/sdr.conf.before-mobile-api-20260604T044109Z`
+- Live web restart: complete
+- Live scheduler restart: complete
+- Public nginx reload: complete
+- Verified: public `/` and `/api/v1foo` use Basic Auth; `/api/v1` uses Bearer;
+  bearer status/events return `200`; revoked token returns `401`; insufficient
+  scope returns `403`; private tunnel and portfolio remain healthy.
 
 ## Boundaries
 
@@ -84,6 +78,10 @@ They are runtime state and must not be committed.
 
 Associated `*.lock` files serialize updates between the CLI, threaded web
 server, and scheduler.
+
+`~/sdr_mobile_bootstrap_token.json` is a temporary mode-`0600` handoff
+containing the initial raw secret. It is not used by the services and should be
+deleted after the app/owner stores the token.
 
 ## Token operations
 
@@ -168,8 +166,7 @@ state; no delivery process exists yet.
 
 `deploy/nginx-sdr.conf` keeps Basic Auth on `/` and disables Basic Auth only for
 the exact `/api/v1` path and `/api/v1/` subtree. `serve.py` then enforces bearer
-auth. The split must only be deployed after application auth is running and
-verified locally.
+auth. This split is live; the pre-deployment nginx backup is recorded above.
 
 ## Rollback
 
@@ -181,9 +178,17 @@ systemctl --user restart satellites-overhead.service
 # Restart sdr-scheduler.service only outside a pass window.
 ```
 
-Public-route rollback: restore the nginx backup recorded in
-`HOSTING_RUNBOOK.md`, run `sudo nginx -t`, then reload nginx. That returns
-`/api/v1` to Basic Auth without affecting the scheduler.
+Public-route rollback:
+
+```bash
+ssh sadbabyrabbit.com
+sudo cp -a /etc/nginx/conf.d/sdr.conf.before-mobile-api-20260604T044109Z \
+  /etc/nginx/conf.d/sdr.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+That returns `/api/v1` to Basic Auth without affecting the scheduler.
 
 Runtime files can be retained through rollback. To fully remove the mobile
 state, move the four runtime files and their `*.lock` files to a private backup

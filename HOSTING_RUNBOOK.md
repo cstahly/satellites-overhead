@@ -40,7 +40,7 @@ No Cloudflare Tunnel or Tailscale installation existed at audit time.
 
 ## Deployment status
 
-Installed and verified on June 3, 2026:
+Installed and verified on June 3/4, 2026:
 
 - Baseline git tag: `pre-public-web-20260603`
 - Kali user service: `sdr-web-tunnel.service`
@@ -70,6 +70,13 @@ Installed and verified on June 3, 2026:
 - Public URL: `https://sdr.sadbabyrabbit.com`
 - Versioned API index: `https://sdr.sadbabyrabbit.com/api/v1`
 - Mutation audit log on Kali: `~/sdr_web_audit.jsonl`
+- Application bearer auth is live for `/api/v1`
+- Basic Auth remains live for `/` and legacy browser routes
+- nginx backup before the `/api/v1` bearer split:
+  `/etc/nginx/conf.d/sdr.conf.before-mobile-api-20260604T044109Z`
+- Initial mobile API token id: `tok_7c9873925e18470c`
+- Temporary mode-`0600` raw-token handoff:
+  `~/sdr_mobile_bootstrap_token.json` on Kali; delete after app provisioning
 
 ## Selected transport
 
