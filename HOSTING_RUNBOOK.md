@@ -54,7 +54,16 @@ Installed and verified on June 3, 2026:
   `/etc/nginx/conf.d.backup-sdr-20260604030313`
 - Unauthenticated bootstrap requests return `401`
 - Authenticated bootstrap requests reach the SDR app
-- No public SDR DNS record or TLS certificate has been installed yet
+- Namecheap DNS: `sdr.sadbabyrabbit.com A 3.148.96.123`
+- Let's Encrypt certificate installed:
+  `/etc/nginx/ssl/sdr.sadbabyrabbit.com/`
+- Certificate renewal reloads nginx through acme.sh
+- HTTP redirects to HTTPS
+- HTTPS unauthenticated requests return `401`
+- HTTPS authenticated requests reach the SDR app
+- HTTP bootstrap nginx backup:
+  `/etc/nginx/conf.d/sdr.conf.bootstrap-20260604`
+- Public URL: `https://sdr.sadbabyrabbit.com`
 
 ## Selected transport
 
@@ -114,8 +123,13 @@ ssh sadbabyrabbit.com 'curl -fsS http://127.0.0.1:18723/scheduler/status'
 
 2. Issue a TLS certificate for the selected hostname.
 3. Create an htpasswd file on EC2.
-4. Render `deploy/nginx-sdr.conf.template` with the selected hostname and cert
-   paths.
+4. Install the checked-in final configuration:
+
+   ```text
+   deploy/nginx-sdr.conf
+   ```
+
+   The generic template remains at `deploy/nginx-sdr.conf.template`.
 5. Back up nginx configuration before installing:
 
    ```bash
