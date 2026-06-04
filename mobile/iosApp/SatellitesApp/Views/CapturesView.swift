@@ -38,7 +38,7 @@ private struct CaptureRow: View {
                     .font(.headline)
                 Spacer()
                 if let bytes = capture.sizeBytes {
-                    Text(formatBytes(bytes))
+                    Text(formatBytes(bytes.int64Value))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
