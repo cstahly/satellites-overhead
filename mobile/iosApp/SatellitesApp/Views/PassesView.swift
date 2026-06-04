@@ -90,6 +90,10 @@ private struct PassRow: View {
     }
 }
 
+extension Pass: Identifiable {
+    public var id: String { aos }
+}
+
 extension AppState {
     func isTracked(_ pass: Pass) -> Bool {
         rules.contains { $0.norad == pass.norad && $0.enabled }

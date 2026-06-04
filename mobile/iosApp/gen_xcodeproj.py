@@ -266,7 +266,7 @@ accent.mkdir(exist_ok=True)
 
 appicon = assets / "AppIcon.appiconset"
 appicon.mkdir(exist_ok=True)
-(appicon / "Contents.json").write_text('{"images":[{"idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}')
+(appicon / "Contents.json").write_text('{"images":[{"filename":"AppIcon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}')
 
 # Preview Assets
 preview = pathlib.Path("SatellitesApp/Preview Content/Preview Assets.xcassets")
