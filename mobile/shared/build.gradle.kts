@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.plugin.mpp.apple.XCFramework
+
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.android.library)
@@ -10,6 +12,8 @@ kotlin {
             kotlinOptions { jvmTarget = "17" }
         }
     }
+
+    val xcf = XCFramework("Shared")
     listOf(
         iosX64(),
         iosArm64(),
@@ -18,6 +22,7 @@ kotlin {
         target.binaries.framework {
             baseName = "Shared"
             isStatic = true
+            xcf.add(this)
         }
     }
 
