@@ -65,6 +65,8 @@ Installed and verified on June 3, 2026:
   `/etc/nginx/conf.d/sdr.conf.bootstrap-20260604`
 - nginx backup before authenticated-user forwarding:
   `/etc/nginx/conf.d/sdr.conf.before-api-20260604031457`
+- Password-file backup before repairing a missing username prefix:
+  `/etc/nginx/sdr.htpasswd.missing-user-20260604041550`
 - Public URL: `https://sdr.sadbabyrabbit.com`
 - Versioned API index: `https://sdr.sadbabyrabbit.com/api/v1`
 - Mutation audit log on Kali: `~/sdr_web_audit.jsonl`
@@ -166,6 +168,31 @@ nginx forwards the authenticated username to the app as `X-Remote-User`.
 Rule upserts/deletes and queued immediate scans are appended to
 `~/sdr_web_audit.jsonl`. Audit write failure is logged but does not prevent a
 scheduler command from being accepted.
+
+### Rotate the Basic Auth password
+
+Run this interactively on the EC2 host. The password file must contain both the
+username and hash in the form `cstahly:$6$...`; a hash without the username
+causes nginx to report that the user does not exist.
+
+```bash
+ssh sadbabyrabbit.com
+sudo cp -a /etc/nginx/sdr.htpasswd \
+  /etc/nginx/sdr.htpasswd.backup-$(date +%Y%m%d%H%M%S)
+read -rsp "New password: " PASS; echo
+HASH=$(printf '%s' "$PASS" | openssl passwd -6 -stdin)
+unset PASS
+printf '%s:%s\n' cstahly "$HASH" | sudo tee /etc/nginx/sdr.htpasswd >/dev/null
+unset HASH
+sudo chown root:nginx /etc/nginx/sdr.htpasswd
+sudo chmod 0640 /etc/nginx/sdr.htpasswd
+sudo restorecon /etc/nginx/sdr.htpasswd
+sudo awk -F: 'NF == 2 && $1 == "cstahly" && $2 ~ /^\$6\$/ {ok=1} END {exit !ok}' \
+  /etc/nginx/sdr.htpasswd
+```
+
+No nginx reload is required. Browsers may cache old Basic Auth credentials; use
+a private window if the browser does not prompt for the new password.
 
 ## Rollback
 
