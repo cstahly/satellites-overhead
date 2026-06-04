@@ -47,7 +47,14 @@ Installed and verified on June 3, 2026:
 - EC2 loopback listener: `127.0.0.1:18723`
 - EC2 can fetch `http://127.0.0.1:18723/scheduler/status`
 - Existing portfolio remains unchanged
-- No public SDR DNS record or nginx route has been installed yet
+- Authenticated HTTP bootstrap route installed on EC2:
+  `/etc/nginx/conf.d/sdr.conf`
+- HTTP Basic Auth hash installed on EC2: `/etc/nginx/sdr.htpasswd`
+- nginx backup before bootstrap route:
+  `/etc/nginx/conf.d.backup-sdr-20260604030313`
+- Unauthenticated bootstrap requests return `401`
+- Authenticated bootstrap requests reach the SDR app
+- No public SDR DNS record or TLS certificate has been installed yet
 
 ## Selected transport
 
@@ -68,19 +75,13 @@ deploy/sdr-web-tunnel.service
 
 ## Public placement decision required
 
-Before configuring nginx or DNS, the owner must select the public hostname.
+Confirmed by owner:
 
-Recommended:
+- Public hostname: `sdr.sadbabyrabbit.com`
+- HTTP Basic Auth username: `cstahly`
 
-```text
-sdr.sadbabyrabbit.com
-```
-
-This preserves the existing portfolio and avoids path-prefix problems in the
-single-file frontend. Do not assume the hostname without owner confirmation.
-
-The owner must also select the HTTP Basic Auth username. A password can be
-generated locally and stored only in nginx's htpasswd file.
+The generated password is not stored in this repository. Only its password hash
+is installed at `/etc/nginx/sdr.htpasswd` on EC2.
 
 ## Install and verify the private tunnel
 
@@ -102,9 +103,15 @@ ssh sadbabyrabbit.com 'curl -fsS http://127.0.0.1:18723/scheduler/status'
 
 ## Public nginx deployment
 
-Do this only after the owner confirms the hostname and auth username.
+1. Create this Namecheap DNS record:
 
-1. Create the selected Namecheap DNS record pointing to `3.148.96.123`.
+   ```text
+   Type: A Record
+   Host: sdr
+   Value: 3.148.96.123
+   TTL: Automatic
+   ```
+
 2. Issue a TLS certificate for the selected hostname.
 3. Create an htpasswd file on EC2.
 4. Render `deploy/nginx-sdr.conf.template` with the selected hostname and cert
