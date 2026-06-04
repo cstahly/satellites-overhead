@@ -1,7 +1,6 @@
 import Foundation
-import Shared  // KMP XCFramework — build with: ./gradlew :shared:assembleSharedXCFramework
+import Shared
 
-// Default location: Lafayette IN
 private let defaultLat = 40.42
 private let defaultLon = -86.88
 private let defaultAlt = 180.0
@@ -11,13 +10,16 @@ final class AppState: ObservableObject {
     @Published var status: SchedulerStatus?
     @Published var passes: [Pass] = []
     @Published var captures: [Capture] = []
+    @Published var rules: [Rule] = []
     @Published var events: [SdrEvent] = []
     @Published var statusError: String?
     @Published var passesError: String?
     @Published var capturesError: String?
+    @Published var rulesError: String?
     @Published var eventsError: String?
     @Published var isLoadingStatus = false
     @Published var isLoadingPasses = false
+    @Published var scanResult: String?
 
     private(set) var api: SatellitesApi
 
@@ -40,9 +42,7 @@ final class AppState: ObservableObject {
         do {
             status = try await api.getStatus()
             statusError = nil
-        } catch {
-            statusError = error.localizedDescription
-        }
+        } catch { statusError = error.localizedDescription }
         isLoadingStatus = false
     }
 
@@ -55,21 +55,40 @@ final class AppState: ObservableObject {
             let result = try await api.getPasses(norad: norad, hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt)
             passes = result as? [Pass] ?? []
             passesError = nil
-        } catch {
-            passesError = error.localizedDescription
-        }
+        } catch { passesError = error.localizedDescription }
         isLoadingPasses = false
     }
 
-    // norad: -1 means all satellites
     func refreshCaptures(norad: Int32 = -1) async {
         do {
             let result = try await api.getCaptures(norad: norad, limit: 50)
             captures = result as? [Capture] ?? []
             capturesError = nil
-        } catch {
-            capturesError = error.localizedDescription
-        }
+        } catch { capturesError = error.localizedDescription }
+    }
+
+    func refreshRules() async {
+        do {
+            let result = try await api.getRules()
+            rules = result as? [Rule] ?? []
+            rulesError = nil
+        } catch { rulesError = error.localizedDescription }
+    }
+
+    func setRuleEnabled(_ ruleId: String, enabled: Bool) async {
+        do {
+            try await api.setRuleEnabled(ruleId: ruleId, enabled: enabled)
+            await refreshRules()
+        } catch { rulesError = error.localizedDescription }
+    }
+
+    func triggerScan(norad: Int32, name: String, durationS: Int32 = 300) async {
+        do {
+            let req = ScanNowRequest(norad: norad, name: name, durationSeconds: durationS, maxElevation: nil)
+            try await api.triggerScanNow(request: req)
+            scanResult = "Queued \(name) (\(durationS)s)"
+            await refreshStatus()
+        } catch { scanResult = "Error: \(error.localizedDescription)" }
     }
 
     func refreshEvents() async {
@@ -79,9 +98,7 @@ final class AppState: ObservableObject {
             let merged = (incoming + events).uniqued(by: \.id).prefix(100)
             events = Array(merged)
             eventsError = nil
-        } catch {
-            eventsError = error.localizedDescription
-        }
+        } catch { eventsError = error.localizedDescription }
     }
 
     func refreshAll() async {
@@ -89,6 +106,7 @@ final class AppState: ObservableObject {
             group.addTask { await self.refreshStatus() }
             group.addTask { await self.refreshPasses() }
             group.addTask { await self.refreshCaptures() }
+            group.addTask { await self.refreshRules() }
             group.addTask { await self.refreshEvents() }
         }
     }

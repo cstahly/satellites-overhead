@@ -40,6 +40,7 @@ SOURCES = {
     "Views/PassesView.swift":       (g(), g()),
     "Views/CapturesView.swift":     (g(), g()),
     "Views/EventsView.swift":       (g(), g()),
+    "Views/RulesView.swift":        (g(), g()),
     "Views/SettingsView.swift":     (g(), g()),
 }
 
