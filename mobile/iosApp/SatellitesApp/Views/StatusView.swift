@@ -6,7 +6,9 @@ struct StatusView: View {
     @Binding var selectedTab: Int
     @State private var showScanSheet = false
     @State private var now = Date()
-    private let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+    @State private var selectedOverheadSat: OverheadSat?
+    private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    private let overheadTimer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var nextPass: Pass? { app.passes.first }
 
@@ -17,13 +19,13 @@ struct StatusView: View {
                     List {
                         // Sky plot
                         Section {
-                            OverheadSkyPlot(sats: app.overhead)
+                            OverheadSkyPlot(sats: app.overhead, selected: $selectedOverheadSat)
                                 .aspectRatio(1, contentMode: .fit)
                                 .listRowInsets(EdgeInsets())
                                 .listRowBackground(Color.clear)
                         }
 
-                        // Scheduler state + next pass
+                        // Capture running / next pass
                         Section {
                             HStack(spacing: 10) {
                                 Circle()
@@ -33,36 +35,55 @@ struct StatusView: View {
                                     .font(.headline)
                                     .foregroundStyle(status.live ? .green : .primary)
                             }
-                            Text(status.message).foregroundStyle(.secondary)
-                            if !status.live, let p = nextPass {
+
+                            if status.live, let job = status.currentJob {
+                                // Running capture summary
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(job.label)
+                                        .font(.subheadline.bold())
+                                    if let freq = job.frequencyHz {
+                                        Text(String(format: "%.3f MHz  ·  LNA=\(job.lnaGain?.int32Value ?? 0) VGA=\(job.vgaGain?.int32Value ?? 0)",
+                                                    freq.doubleValue / 1e6))
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    if let remaining = captureRemaining(job: job) {
+                                        HStack {
+                                            Image(systemName: "timer").foregroundStyle(.green)
+                                            Text(remaining + " remaining")
+                                                .font(.caption.bold())
+                                                .foregroundStyle(.green)
+                                        }
+                                    }
+                                }
                                 Button {
-                                    selectedTab = 1
+                                    selectedTab = 2   // Captures tab
                                 } label: {
                                     HStack {
-                                        Text(countdownText(to: p.aos))
-                                            .font(.caption).foregroundStyle(.secondary)
+                                        Text("View captures")
+                                            .foregroundStyle(.primary)
                                         Spacer()
-                                        Text(p.name).foregroundStyle(.primary)
                                         Image(systemName: "chevron.right")
                                             .font(.caption).foregroundStyle(Color(white: 0.4))
                                     }
                                 }
                                 .buttonStyle(.plain)
-                            }
-                        }
-
-                        // Running job
-                        if status.live, let job = status.currentJob {
-                            Section("Running") {
-                                LabeledContent("Label", value: job.label)
-                                if let freq = job.frequencyHz {
-                                    LabeledContent("Frequency", value: String(format: "%.3f MHz", freq.doubleValue / 1e6))
-                                }
-                                if let dur = job.durationSeconds {
-                                    LabeledContent("Duration", value: "\(dur.int32Value)s")
-                                }
-                                if let lna = job.lnaGain {
-                                    LabeledContent("Gains", value: "LNA=\(lna.int32Value) VGA=\(job.vgaGain?.int32Value ?? 0) AMP=\(job.amp?.int32Value ?? 0)")
+                            } else {
+                                // Idle — show next pass countdown
+                                Text(status.message).foregroundStyle(.secondary)
+                                if let p = nextPass {
+                                    Button {
+                                        selectedTab = 1
+                                    } label: {
+                                        HStack {
+                                            Text(countdownText(to: p.aos))
+                                                .font(.caption).foregroundStyle(.secondary)
+                                            Spacer()
+                                            Text(p.name).foregroundStyle(.primary)
+                                            Image(systemName: "chevron.right")
+                                                .font(.caption).foregroundStyle(Color(white: 0.4))
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                         }
@@ -73,6 +94,10 @@ struct StatusView: View {
                                     .foregroundStyle(.green)
                             }
                         }
+                    }
+                    .sheet(item: $selectedOverheadSat) { sat in
+                        OverheadSatSheet(sat: sat)
+                            .presentationDetents([.fraction(0.35)])
                     }
                 } else if app.isLoadingStatus {
                     ProgressView()
@@ -91,15 +116,28 @@ struct StatusView: View {
                 }
             }
             .refreshable {
-                async let a: () = app.refreshAll()
-                async let b: () = app.refreshOverhead()
-                _ = await (a, b)
+                await app.refreshAll()
+                await app.refreshOverhead()
             }
-            .onReceive(timer) { _ in Task { await app.refreshOverhead() } }
+            .onReceive(ticker) { now = $0 }
+            .onReceive(overheadTimer) { _ in Task { await app.refreshOverhead() } }
             .sheet(isPresented: $showScanSheet) {
                 ScanNowSheet().presentationDetents([.medium])
             }
         }
+    }
+
+    private func captureRemaining(job: CurrentJob) -> String? {
+        guard let fireISO = job.fireTime,
+              let dur = job.durationSeconds else { return nil }
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        guard let fireDate = fmt.date(from: fireISO) else { return nil }
+        let end = fireDate.addingTimeInterval(Double(dur.int32Value))
+        let diff = end.timeIntervalSince(now)
+        guard diff > 0 else { return nil }
+        let m = Int(diff) / 60; let s = Int(diff) % 60
+        return "\(m)m \(s)s"
     }
 
     private func countdownText(to aosISO: String) -> String {
@@ -113,65 +151,144 @@ struct StatusView: View {
     }
 }
 
+// MARK: - Overhead satellite detail sheet
+
+private struct OverheadSatSheet: View {
+    let sat: OverheadSat
+    var body: some View {
+        VStack(spacing: 16) {
+            Text(sat.name)
+                .font(.title2.bold())
+                .padding(.top, 20)
+            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
+                GridRow {
+                    Label("Elevation", systemImage: "arrow.up.right")
+                    Text(String(format: "%.1f°", sat.el))
+                        .foregroundStyle(sat.el > 45 ? .green : sat.el > 20 ? .yellow : .primary)
+                        .bold()
+                }
+                GridRow {
+                    Label("Azimuth", systemImage: "arrow.clockwise")
+                    Text(String(format: "%.0f°  %@", sat.az, cardinal(sat.az)))
+                }
+                GridRow {
+                    Label("Range", systemImage: "ruler")
+                    Text(String(format: "%.0f km", sat.rangeKm))
+                }
+            }
+            .font(.subheadline)
+            Text("NORAD \(sat.norad)")
+                .font(.caption).foregroundStyle(.secondary)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func cardinal(_ az: Double) -> String {
+        ["N","NE","E","SE","S","SW","W","NW","N"][Int((az + 22.5) / 45) % 8]
+    }
+}
+
 // MARK: - Sky Plot
 
-private struct OverheadSkyPlot: View {
+struct OverheadSkyPlot: View {
     let sats: [OverheadSat]
+    @Binding var selected: OverheadSat?
+    // Store computed positions for hit testing
+    @State private var plotSize: CGSize = .zero
+    @State private var positions: [(sat: OverheadSat, pt: CGPoint)] = []
 
     var body: some View {
         Canvas { ctx, size in
+            plotSize = size
             let cx = size.width / 2, cy = size.height / 2
             let r = min(cx, cy) - 24
 
-            // Background
+            // Background fill
             ctx.fill(Path(ellipseIn: CGRect(x: cx-r-16, y: cy-r-16, width: (r+16)*2, height: (r+16)*2)),
-                     with: .color(Color(white: 0.06)))
+                     with: .color(Color(red: 0.07, green: 0.09, blue: 0.15)))
 
-            // Elevation rings
+            // Rings
             for el in stride(from: 0.0, through: 60.0, by: 30.0) {
                 let rr = r * (1 - el / 90)
-                let rect = CGRect(x: cx-rr, y: cy-rr, width: rr*2, height: rr*2)
-                ctx.stroke(Path(ellipseIn: rect),
-                           with: .color(Color(red: 0.16, green: 0.21, blue: 0.35)),
-                           lineWidth: el == 0 ? 1.5 : 1)
+                ctx.stroke(Path(ellipseIn: CGRect(x: cx-rr, y: cy-rr, width: rr*2, height: rr*2)),
+                           with: .color(Color(red: 0.18, green: 0.23, blue: 0.38)),
+                           lineWidth: el == 0 ? 1.5 : 0.75)
             }
 
             // Cross hairs
             ctx.stroke(Path { p in
                 p.move(to: CGPoint(x: cx, y: cy-r)); p.addLine(to: CGPoint(x: cx, y: cy+r))
                 p.move(to: CGPoint(x: cx-r, y: cy)); p.addLine(to: CGPoint(x: cx+r, y: cy))
-            }, with: .color(Color(red: 0.16, green: 0.21, blue: 0.35)), lineWidth: 0.5)
+            }, with: .color(Color(red: 0.18, green: 0.23, blue: 0.38)), lineWidth: 0.5)
 
-            // Compass labels
-            let compass: [(String, Double)] = [("N",0),("E",90),("S",180),("W",270)]
-            for (label, az) in compass {
+            // Compass
+            let dirs: [(String, Double)] = [("N",0),("E",90),("S",180),("W",270)]
+            for (label, az) in dirs {
                 let rad = (az - 90) * .pi / 180
-                let px = cx + (r + 14) * cos(rad)
-                let py = cy + (r + 14) * sin(rad)
-                ctx.draw(Text(label).font(.caption2.bold()).foregroundStyle(Color(white: 0.5)),
-                         at: CGPoint(x: px, y: py))
+                ctx.draw(Text(label).font(.caption2.bold()).foregroundStyle(Color(white: 0.45)),
+                         at: CGPoint(x: cx + (r+14)*cos(rad), y: cy + (r+14)*sin(rad)))
             }
 
             // Satellite dots
+            var pts: [(sat: OverheadSat, pt: CGPoint)] = []
+            let showLabels = sats.count <= 60
             for sat in sats {
                 let dist = r * (1 - sat.el / 90)
                 let rad = (sat.az - 90) * .pi / 180
                 let x = cx + dist * cos(rad)
                 let y = cy + dist * sin(rad)
-                let brightness = 0.35 + 0.65 * (sat.el / 90)
-                let dotColor = Color(red: 0.35, green: 0.82, blue: 1.0, opacity: brightness)
-                let dotR: CGFloat = sat.el > 60 ? 5 : 4
-                ctx.fill(Path(ellipseIn: CGRect(x: x-dotR, y: y-dotR, width: dotR*2, height: dotR*2)),
-                         with: .color(dotColor))
-            }
+                let pt = CGPoint(x: x, y: y)
+                pts.append((sat, pt))
 
-            // Count label
-            let countText = Text("\(sats.count) overhead")
-                .font(.caption2).foregroundStyle(Color(white: 0.45))
-            ctx.draw(countText, at: CGPoint(x: cx, y: cy + r + 22))
+                let brightness = 0.35 + 0.65 * (sat.el / 90)
+                let isSelected = selected?.norad == sat.norad
+                let color = isSelected
+                    ? Color(red: 0.3, green: 1.0, blue: 0.5, opacity: 1)
+                    : Color(red: 0.35, green: 0.82, blue: 1.0, opacity: brightness)
+                let dotR: CGFloat = isSelected ? 6 : (sat.el > 60 ? 5 : 4)
+                ctx.fill(Path(ellipseIn: CGRect(x: x-dotR, y: y-dotR, width: dotR*2, height: dotR*2)),
+                         with: .color(color))
+
+                if showLabels || isSelected {
+                    let opacity = isSelected ? 1.0 : (0.4 + 0.6 * (sat.el / 90))
+                    ctx.draw(
+                        Text(sat.name.prefix(16))
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color(white: 0.85, opacity: opacity)),
+                        at: CGPoint(x: x + 8, y: y + 3)
+                    )
+                }
+            }
+            positions = pts
+
+            // Count
+            ctx.draw(Text("\(sats.count) overhead").font(.caption2).foregroundStyle(Color(white: 0.4)),
+                     at: CGPoint(x: cx, y: cy + r + 22))
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { location in
+            // Find nearest satellite within 24pt
+            guard !positions.isEmpty else { return }
+            let nearest = positions.min { a, b in
+                distance(a.pt, location) < distance(b.pt, location)
+            }
+            if let nearest, distance(nearest.pt, location) < 24 {
+                selected = nearest.sat
+            } else {
+                selected = nil
+            }
         }
         .padding(8)
     }
+
+    private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        sqrt(pow(a.x - b.x, 2) + pow(a.y - b.y, 2))
+    }
+}
+
+extension OverheadSat: Identifiable {
+    public var id: Int { norad }
 }
 
 // MARK: - Scan Now Sheet

@@ -52,14 +52,16 @@ final class AppState: ObservableObject {
         let lat = UserDefaults.standard.double(forKey: "latitude").nonZero ?? defaultLat
         let lon = UserDefaults.standard.double(forKey: "longitude").nonZero ?? defaultLon
         let alt = UserDefaults.standard.double(forKey: "altitude_m").nonZero ?? defaultAlt
-        do {
-            // no norad filter = all active satellites
-            let result = try await api.getPasses(norad: -1, hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt)
-            passes = result as? [Pass] ?? []
-            passesError = nil
-        } catch {
-            passesError = error.localizedDescription
+        // All-sats prediction is too slow; use rule norads
+        let ruleNorads = rules.isEmpty ? [59051] : Array(Set(rules.map { $0.norad }))
+        var all: [Pass] = []
+        for norad in ruleNorads {
+            if let result = try? await api.getPasses(norad: Int32(norad), hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt) {
+                all += result as? [Pass] ?? []
+            }
         }
+        passes = all.sorted { $0.aos < $1.aos }
+        passesError = all.isEmpty ? (rules.isEmpty ? "No rules configured." : nil) : nil
         isLoadingPasses = false
     }
 
