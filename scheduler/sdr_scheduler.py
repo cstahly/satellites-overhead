@@ -32,10 +32,15 @@ from sdr_runtime import emit_event
 # Retry variants tried in order when deframer NOSYNC with good signal.
 # First entry is the default; each subsequent entry is tried after a kill.
 LRPT_RETRY_VARIANTS = [
-    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt"},
-    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt"},
-    {"iq_swap": True,  "samplerate": "2e6",  "pipeline": "meteor_m2-x_lrpt"},
-    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2_lrpt"},
+    # dc_block=True variants first — LO leakage at 137.1 MHz causes false Viterbi lock without it
+    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": True},
+    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": True},
+    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-4_lrpt_nrzl",  "dc_block": True},
+    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-4_lrpt_nrzl",  "dc_block": True},
+    # Fallback: original variants without dc_block (kept for reference)
+    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": False},
+    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": False},
+    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-4_lrpt_nrzl_nors", "dc_block": True},
 ]
 
 def log(msg):
@@ -96,12 +101,13 @@ def hackrf_capture(freq_hz, outfile, duration_s, lna=32, vga=40, amp=1, label=""
         return None
 
 def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, label="",
-                    samplerate="1e6", iq_swap=True, pipeline="meteor_m2-x_lrpt"):
+                    samplerate="1e6", iq_swap=True, pipeline="meteor_m2-x_lrpt",
+                    dc_block=True):
     logfile = capdir + ".log"
     pidfile = capdir + ".pid"
     # Convert samplerate to integer — satdump rejects scientific notation strings
     sr_int = int(float(samplerate)) if samplerate else 1_000_000
-    flags = ("--iq_swap " if iq_swap else "") + f"sr={sr_int}"
+    flags = ("--iq_swap " if iq_swap else "") + f"sr={sr_int}" + (" dc_block" if dc_block else "")
     log(f"START {label} — satdump {pipeline} {freq/1e6:.1f} MHz [{flags}] → {capdir} (tail -f {logfile})")
     cmd = ["satdump", "live", pipeline, capdir,
            "--source", "hackrf", "--samplerate", str(sr_int),
@@ -111,6 +117,8 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
            "--timeout", str(duration_s)]
     if iq_swap:
         cmd.append("--iq_swap")
+    if dc_block:
+        cmd.append("--dc_block")
     os.makedirs(capdir, exist_ok=True)
     try:
         with open(logfile, "w") as lf:
@@ -262,6 +270,7 @@ def _queue_monitor_retry(orig_kwargs, variant, retry_idx):
         "samplerate": variant["samplerate"],
         "iq_swap": variant["iq_swap"],
         "pipeline": variant["pipeline"],
+        "dc_block": variant.get("dc_block", True),
         "_retry_idx": retry_idx,
         "source": "monitor_retry",
     }
@@ -270,7 +279,7 @@ def _queue_monitor_retry(orig_kwargs, variant, retry_idx):
     write_command_queue(cmds)
     log(f"MONITOR retry {retry_idx + 1}/{len(LRPT_RETRY_VARIANTS)}: "
         f"iq_swap={variant['iq_swap']} samplerate={variant['samplerate']} "
-        f"pipeline={variant['pipeline']}")
+        f"pipeline={variant['pipeline']} dc_block={variant.get('dc_block', True)}")
     scheduler_event(
         "capture.retry_queued",
         {
@@ -426,6 +435,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     label=f"{label} {suffix}",
                     samplerate=str(rule.get("samplerate", LRPT_RETRY_VARIANTS[0]["samplerate"])),
                     iq_swap=bool(rule.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"])),
+                    dc_block=bool(rule.get("dc_block", LRPT_RETRY_VARIANTS[0].get("dc_block", True))),
                     pipeline=str(rule.get("pipeline", default_pipeline)),
                     _retry_idx=0,
                     **meta,
@@ -465,6 +475,7 @@ def build_scan_now_job(command):
     slug = safe_name(name)
     samplerate = str(command.get("samplerate") or LRPT_RETRY_VARIANTS[0]["samplerate"])
     iq_swap = bool(command.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"]))
+    dc_block = bool(command.get("dc_block", LRPT_RETRY_VARIANTS[0].get("dc_block", True)))
     default_pipeline = "meteor_m2-x_lrpt" if profile == "meteor_lrpt_hackrf" else "orbcomm_stx_auto_plotter"
     pipeline = str(command.get("pipeline") or default_pipeline)
     _ri = command.get("_retry_idx")
@@ -494,6 +505,7 @@ def build_scan_now_job(command):
                 "samplerate": samplerate,
                 "iq_swap": iq_swap,
                 "pipeline": pipeline,
+                "dc_block": dc_block,
             },
         )
     return (
