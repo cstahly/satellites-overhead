@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SDR pass scheduler. Run once, handles everything, logs everything."""
-import json, subprocess, time, os, datetime, threading, uuid
+import json, subprocess, time, os, datetime, threading, uuid, sys
 
 HOME = os.path.expanduser("~")
 CAPDIR = os.path.join(HOME, "cosmos_captures")
@@ -24,6 +24,11 @@ RELOAD_INTERVAL_S = 60
 POLL_INTERVAL_S = 10
 MONITOR_DELAY_S = 90
 
+if REPO_DIR not in sys.path:
+    sys.path.insert(0, REPO_DIR)
+
+from sdr_runtime import emit_event
+
 # Retry variants tried in order when deframer NOSYNC with good signal.
 # First entry is the default; each subsequent entry is tried after a kill.
 LRPT_RETRY_VARIANTS = [
@@ -39,6 +44,15 @@ def log(msg):
     print(line, flush=True)
     with open(LOG, "a") as f:
         f.write(line + "\n")
+
+
+def scheduler_event(event_type, data=None, notification=None):
+    try:
+        return emit_event(event_type, "sdr_scheduler.py", data, notification)
+    except Exception as e:
+        log(f"EVENT WRITE FAIL {event_type} — {e}")
+        return None
+
 
 def seconds_until(timestr):
     now = datetime.datetime.now()
@@ -206,6 +220,19 @@ def _invoke_claude_monitor(capdir, monitor_result):
                 stderr=subprocess.STDOUT,
             )
         log(f"MONITOR Claude agent invoked for {os.path.basename(capdir)} — {claude_log}")
+        scheduler_event(
+            "claude.invoked",
+            {
+                "capture": os.path.basename(capdir),
+                "capture_path": capdir,
+                "status": status,
+                "log": claude_log,
+            },
+            {
+                "title": "Claude SDR diagnosis started",
+                "body": os.path.basename(capdir),
+            },
+        )
     except Exception as e:
         log(f"MONITOR Claude invoke FAIL — {e}")
 
@@ -244,6 +271,21 @@ def _queue_monitor_retry(orig_kwargs, variant, retry_idx):
     log(f"MONITOR retry {retry_idx + 1}/{len(LRPT_RETRY_VARIANTS)}: "
         f"iq_swap={variant['iq_swap']} samplerate={variant['samplerate']} "
         f"pipeline={variant['pipeline']}")
+    scheduler_event(
+        "capture.retry_queued",
+        {
+            "command_id": command["id"],
+            "norad": norad,
+            "name": name,
+            "retry_idx": retry_idx,
+            "variant": variant,
+        },
+        {
+            "title": "SDR capture retry queued",
+            "body": name,
+            "data": {"command_id": command["id"], "norad": norad},
+        },
+    )
 
 
 def _monitor_satdump(capdir, kwargs):
@@ -270,6 +312,19 @@ def _monitor_satdump(capdir, kwargs):
 
     status = result.get("status", "unknown")
     log(f"MONITOR {os.path.basename(capdir)} — {status}: {str(result.get('notes', ''))[:100]}")
+    scheduler_event(
+        "monitor.result",
+        {
+            "capture": os.path.basename(capdir),
+            "capture_path": capdir,
+            "status": status,
+            "result": result,
+        },
+        None if status == "synced" else {
+            "title": "SDR monitor needs attention",
+            "body": f"{os.path.basename(capdir)}: {status}",
+        },
+    )
 
     if status == "synced":
         return  # healthy, nothing to do
@@ -532,10 +587,13 @@ def run_job(ptype, kwargs):
                         ),
                         daemon=True,
                     ).start()
+        return {"ok": bool(outfile), "output": outfile}
     elif ptype == "satdump":
-        satdump_capture(**run_kwargs)
+        cadu_bytes = satdump_capture(**run_kwargs)
+        return {"ok": cadu_bytes > 0, "cadu_bytes": cadu_bytes}
     else:
         log(f"UNKNOWN JOB TYPE {ptype} — {run_kwargs}")
+        return {"ok": False, "error": f"unknown job type: {ptype}"}
 
 
 def status_job_payload(fire_time, ptype, kwargs):
@@ -562,6 +620,7 @@ def scheduler_loop():
     next_reload = 0.0
     log("SDR scheduler running — dynamic rule reload enabled")
     write_scheduler_status("idle", message="scheduler started")
+    scheduler_event("scheduler.started", {"pid": os.getpid()})
 
     while True:
         now_ts = time.time()
@@ -572,6 +631,14 @@ def scheduler_loop():
             if sig != last_sig:
                 rule_jobs = max(0, len(jobs) - len(MANUAL_JOBS))
                 log(f"Schedule loaded — {len(MANUAL_JOBS)} manual jobs, {rule_jobs} rule jobs")
+                scheduler_event(
+                    "schedule.changed",
+                    {
+                        "manual_jobs": len(MANUAL_JOBS),
+                        "dynamic_jobs": rule_jobs,
+                        "total_jobs": len(jobs),
+                    },
+                )
                 last_sig = sig
                 last_next = None
             next_reload = now_ts + RELOAD_INTERVAL_S
@@ -587,11 +654,35 @@ def scheduler_loop():
             write_scheduler_status("running", status_job_payload(fire_time, ptype, kwargs), "capture running")
             log(f"Running: {kwargs['label']} scheduled for {job_time_label(fire_time)}")
             started_at = utc_now_iso()
+            scheduler_event(
+                "capture.started",
+                {
+                    "job": status_job_payload(fire_time, ptype, kwargs),
+                    "norad": kwargs.get("_norad"),
+                    "name": kwargs.get("_name") or kwargs.get("label", ""),
+                    "profile": kwargs.get("_profile") or ptype,
+                    "source": kwargs.get("_source", "manual"),
+                    "started_at": started_at,
+                },
+                {
+                    "title": "SDR capture started",
+                    "body": kwargs.get("_name") or kwargs.get("label", ""),
+                },
+            )
+            run_result = None
+            run_error = None
             try:
-                run_job(ptype, kwargs)
+                run_result = run_job(ptype, kwargs)
+            except Exception as e:
+                run_error = str(e)
+                log(f"JOB FAIL {kwargs.get('label', '')} — {e}")
             finally:
                 ended_at = utc_now_iso()
-                write_scheduler_status("idle", message="last capture finished")
+                failed = bool(run_error) or not bool(run_result and run_result.get("ok"))
+                write_scheduler_status(
+                    "idle",
+                    message="last capture failed" if failed else "last capture finished",
+                )
                 output = kwargs.get("outfile") or kwargs.get("capdir")
                 size_bytes = 0
                 cadu_bytes = None
@@ -630,11 +721,22 @@ def scheduler_loop():
                     "size_bytes": size_bytes,
                     "cadu_bytes": cadu_bytes,
                     "report_path": report_path if (report_path and os.path.exists(report_path)) else None,
+                    "success": bool(run_result and run_result.get("ok")) and not run_error,
+                    "error": run_error or (run_result or {}).get("error"),
                 }
                 try:
                     append_capture_record(record)
                 except Exception as e:
                     log(f"HISTORY WRITE FAIL — {e}")
+                scheduler_event(
+                    "capture.failed" if failed else "capture.completed",
+                    {"capture": record, "result": run_result or {}},
+                    {
+                        "title": "SDR capture failed" if failed else "SDR capture completed",
+                        "body": record["name"],
+                        "data": {"capture_id": record["id"], "norad": record["norad"]},
+                    },
+                )
             next_reload = 0.0
             continue
 
