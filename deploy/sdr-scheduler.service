@@ -8,6 +8,7 @@ WorkingDirectory=/home/cstahly
 ExecStart=/usr/bin/python3 /home/cstahly/sdr_scheduler.py
 Restart=always
 RestartSec=5
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target

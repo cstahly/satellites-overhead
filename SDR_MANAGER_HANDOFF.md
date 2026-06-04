@@ -68,6 +68,7 @@ As of June 3 2026:
 | `monitor_capture.py` | T+90s satdump health monitor |
 | `predict.py` | Headless pass predictor |
 | `so50_process.py` | SO-50 FM demod + Whisper pipeline |
+| `analyze_150mhz.py` | Bounded-memory sampled spectrum analyzer for raw IQ captures |
 | `hackrf_fm_demod.py` | General FM demodulator (HackRF IQ → 50 kHz PCM) |
 | `hackrf_am_demod.py` | General AM demodulator (HackRF IQ → 16 kHz WAV) |
 | `check_m24_pass.sh` | One-shot post-pass diagnostic script (also installed as systemd timer) |
@@ -145,6 +146,11 @@ Rule fires (sat-27607-so50-fm)
       faster-whisper base → _report.md
 ```
 
+The generic IQ analyzer must remain bounded-memory. The previous temporary
+`/tmp/analyze_150mhz.py` loaded an entire multi-gigabyte capture and all FFT
+windows into RAM, causing an OOM kill on June 3, 2026. The scheduler now invokes
+the checked-in `analyze_150mhz.py`, which samples at most 4096 FFT windows.
+
 ### FM demod standalone
 
 ```bash
@@ -166,3 +172,32 @@ See CLAUDE.md for full details. Summary:
 - **CADU filename** — FIXED `ccfd2b0`. `satdump_capture` now uses `{pipeline}.cadu` not hardcoded name.
 - **Fire-time boundary** — FIXED June 3. 90s grace window prevents wrap-to-next-day.
 - **Completed set in-memory** — Scheduler restart re-evaluates all jobs. Avoid restarting during a pass window.
+- **Optional child OOM** — `OOMPolicy=continue` keeps the scheduler alive if an analyzer or postprocessor is killed.
+
+### June 3, 2026 prediction/OOM repair
+
+At 23:45 EDT, the SO-50 capture completed successfully at 3.1 GB. The old
+temporary `/tmp/analyze_150mhz.py` then loaded the entire IQ file and every FFT
+result into memory. Its process reached about 14 GB RSS and was OOM-killed at
+23:47, causing `sdr-scheduler.service` to restart. During the memory pressure,
+`/scheduler/upcoming` exceeded the CLI timeout; `sdr rules` discarded that error
+and incorrectly displayed `no passes predicted`.
+
+Repairs:
+
+- `analyze_150mhz.py` samples at most 4096 FFT windows and analyzed the same
+  3.1 GB capture in about 1.8 seconds.
+- The scheduler invokes the checked-in analyzer instead of `/tmp`.
+- The scheduler service uses `OOMPolicy=continue`.
+- `/scheduler/upcoming` parses each TLE group once per request and returns
+  explicit per-rule prediction errors.
+- `sdr rules` displays `prediction unavailable` plus a warning on API failure.
+
+Runtime rollback backups:
+
+- `/usr/local/bin/sdr.before-20260604-prediction-fix`
+- `~/.config/systemd/user/sdr-scheduler.service.before-20260604-prediction-fix`
+
+To fully undo, revert the repair commit, restore those two backup files, run
+`systemctl --user daemon-reload`, then restart the web and scheduler services
+outside a pass window.

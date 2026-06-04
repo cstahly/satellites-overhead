@@ -17,7 +17,7 @@ import sys
 import tarfile
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
 from predict import parse_start, parse_tles, predict_passes, select_tles
@@ -118,7 +118,10 @@ def write_json(handler, status, payload):
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
 
 
 def api_path(path):
@@ -178,6 +181,66 @@ def read_audit(limit=100):
         except json.JSONDecodeError:
             continue
     return list(reversed(records))
+
+
+def upcoming_scheduler_runs(hours=24, limit_per_rule=4):
+    results = []
+    parsed_tles_by_group = {}
+    start = parse_start(None)
+
+    for rule in read_rules():
+        if not rule.get("enabled", True) or rule.get("type") != "satellite_recurring":
+            continue
+        try:
+            group = rule.get("group", "radio")
+            if group not in parsed_tles_by_group:
+                tles_text, _ = fetch_tle(group)
+                parsed_tles_by_group[group] = parse_tles(tles_text)
+            tles = select_tles(parsed_tles_by_group[group], set(), {int(rule["norad"])})
+            passes = predict_passes(
+                tles,
+                lat=LAT,
+                lon=LON,
+                alt_m=ALT_M,
+                start=start,
+                hours=hours,
+                min_el=rule.get("min_peak_el", 10),
+                track_step_s=60,
+                limit=limit_per_rule,
+            )
+            start_offset_s = int(rule.get("start_offset_s", -30))
+            end_offset_s = int(rule.get("end_offset_s", 60))
+            for p in passes:
+                aos = datetime.fromisoformat(p["aos"].replace("Z", "+00:00"))
+                los = datetime.fromisoformat(p["los"].replace("Z", "+00:00"))
+                fire = aos + timedelta(seconds=start_offset_s)
+                end = los + timedelta(seconds=end_offset_s)
+                vga = int(rule.get("vga_gain", 48))
+                if float(p.get("max_el", 0)) >= 60:
+                    vga = max(0, vga - 12)
+                results.append({
+                    "rule_id": rule["id"],
+                    "name": rule.get("name", p["name"]),
+                    "norad": rule["norad"],
+                    "fire_time": fire.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "aos": p["aos"],
+                    "los": p["los"],
+                    "max_el": p["max_el"],
+                    "duration_s": int(p["duration_s"]) - start_offset_s + end_offset_s,
+                    "vga_gain": vga,
+                })
+        except Exception as e:
+            sys.stderr.write(f"[upcoming] rule {rule.get('id', '?')} failed: {e}\n")
+            results.append({
+                "rule_id": rule.get("id"),
+                "name": rule.get("name"),
+                "norad": rule.get("norad"),
+                "prediction_error": str(e),
+            })
+
+    results.sort(key=lambda r: r.get("fire_time", "9999"))
+    return results
 
 
 def read_rules():
@@ -671,49 +734,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         if path == "/scheduler/upcoming":
             qs = parse_qs(parsed.query)
-            hours = float(first_value(qs, "hours", "24"))
-            limit_per_rule = int(first_value(qs, "limit_per_rule", "4"))
             try:
-                rules = read_rules()
-                results = []
-                for rule in rules:
-                    if not rule.get("enabled", True):
-                        continue
-                    if rule.get("type") != "satellite_recurring":
-                        continue
-                    try:
-                        tles_text, _ = fetch_tle(rule.get("group", "radio"))
-                        tles = select_tles(parse_tles(tles_text), set(), {int(rule["norad"])})
-                        passes = predict_passes(tles, lat=LAT, lon=LON, alt_m=ALT_M,
-                                               start=parse_start(None), hours=hours,
-                                               min_el=rule.get("min_peak_el", 10),
-                                               track_step_s=60, limit=limit_per_rule)
-                        start_offset_s = int(rule.get("start_offset_s", -30))
-                        end_offset_s = int(rule.get("end_offset_s", 60))
-                        from datetime import timedelta as _td
-                        for p in passes:
-                            aos = datetime.fromisoformat(p["aos"].replace("Z", "+00:00"))
-                            los = datetime.fromisoformat(p["los"].replace("Z", "+00:00"))
-                            fire = aos + _td(seconds=start_offset_s)
-                            end = los + _td(seconds=end_offset_s)
-                            vga = int(rule.get("vga_gain", 48))
-                            if float(p.get("max_el", 0)) >= 60:
-                                vga = max(0, vga - 12)
-                            results.append({
-                                "rule_id": rule["id"],
-                                "name": rule.get("name", p["name"]),
-                                "norad": rule["norad"],
-                                "fire_time": fire.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                "aos": p["aos"],
-                                "los": p["los"],
-                                "max_el": p["max_el"],
-                                "duration_s": int(p["duration_s"]) - start_offset_s + end_offset_s,
-                                "vga_gain": vga,
-                            })
-                    except Exception:
-                        continue
-                results.sort(key=lambda r: r["fire_time"])
+                hours = float(first_value(qs, "hours", "24"))
+                limit_per_rule = int(first_value(qs, "limit_per_rule", "4"))
+                if hours <= 0:
+                    raise ValueError("hours must be > 0")
+                if limit_per_rule < 1:
+                    raise ValueError("limit_per_rule must be >= 1")
+                results = upcoming_scheduler_runs(hours, limit_per_rule)
+            except ValueError as e:
+                self.send_error(400, str(e))
+                return
             except Exception as e:
                 self.send_error(500, f"could not compute upcoming runs: {e}")
                 return

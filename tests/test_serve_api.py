@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.argv = ["test_serve_api.py"]
 import serve
@@ -53,6 +54,57 @@ class AuditTests(unittest.TestCase):
                     json.loads(f.readline())
         finally:
             serve.AUDIT_PATH = old_path
+
+
+class UpcomingRunsTests(unittest.TestCase):
+    @mock.patch("serve.select_tles", return_value=["selected TLE"])
+    @mock.patch("serve.predict_passes")
+    @mock.patch("serve.fetch_tle", return_value=("TLE data", "test"))
+    @mock.patch("serve.parse_tles", return_value=["parsed TLE"])
+    @mock.patch("serve.read_rules")
+    def test_reuses_parsed_tle_group(
+        self,
+        read_rules,
+        parse_tles,
+        fetch_tle,
+        predict_passes,
+        select_tles,
+    ):
+        read_rules.return_value = [
+            {"id": "one", "type": "satellite_recurring", "norad": 1, "group": "radio"},
+            {"id": "two", "type": "satellite_recurring", "norad": 2, "group": "radio"},
+        ]
+        predict_passes.return_value = [{
+            "name": "test",
+            "aos": "2026-06-04T01:00:00Z",
+            "los": "2026-06-04T01:10:00Z",
+            "max_el": 20,
+            "duration_s": 600,
+        }]
+
+        runs = serve.upcoming_scheduler_runs(hours=12, limit_per_rule=1)
+
+        self.assertEqual(len(runs), 2)
+        fetch_tle.assert_called_once_with("radio")
+        parse_tles.assert_called_once_with("TLE data")
+        self.assertEqual(select_tles.call_count, 2)
+        self.assertEqual(predict_passes.call_count, 2)
+
+    @mock.patch("serve.fetch_tle", side_effect=RuntimeError("TLE unavailable"))
+    @mock.patch("serve.read_rules")
+    def test_returns_per_rule_prediction_error(self, read_rules, fetch_tle):
+        read_rules.return_value = [
+            {"id": "one", "name": "One", "type": "satellite_recurring", "norad": 1, "group": "radio"},
+        ]
+
+        runs = serve.upcoming_scheduler_runs(hours=12, limit_per_rule=1)
+
+        self.assertEqual(runs, [{
+            "rule_id": "one",
+            "name": "One",
+            "norad": 1,
+            "prediction_error": "TLE unavailable",
+        }])
 
 
 if __name__ == "__main__":

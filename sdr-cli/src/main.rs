@@ -487,9 +487,16 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
     if rules.is_empty() { println!("{}", dim("  No rules configured.")); return Ok(()); }
 
     // Fetch upcoming runs and index by rule_id
-    let upcoming = get(client, &format!("{}/scheduler/upcoming?hours=48&limit_per_rule=1", base))
-        .unwrap_or(serde_json::json!([]));
-    let upcoming_arr = upcoming.as_array().cloned().unwrap_or_default();
+    let (upcoming_arr, upcoming_error) = match get(
+        client,
+        &format!("{}/scheduler/upcoming?hours=48&limit_per_rule=1", base),
+    ) {
+        Ok(upcoming) => match upcoming.as_array() {
+            Some(runs) => (runs.clone(), None),
+            None => (Vec::new(), Some("unexpected non-array response".to_string())),
+        },
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     let mut next_by_rule: std::collections::HashMap<&str, &Value> = std::collections::HashMap::new();
     for run in &upcoming_arr {
         if let Some(id) = run["rule_id"].as_str() {
@@ -523,12 +530,18 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
             r["vga_gain"].as_i64().unwrap_or(0),
             r["amp"].as_i64().unwrap_or(0));
         let (fire_str, end_str, max_el_str) = if let Some(run) = next_by_rule.get(id) {
-            let fire = run["fire_time"].as_str().map(|s| {
-                format!("{} {}", fmt_local(s), time_until(s))
-            }).unwrap_or_else(|| "—".to_string());
-            let end = run["end_time"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
-            let el = run["max_el"].as_f64().map(|e| fmt_el(e)).unwrap_or_else(|| "—".to_string());
-            (fire, end, el)
+            if run["prediction_error"].is_string() {
+                (yellow("prediction unavailable"), String::new(), "—".to_string())
+            } else {
+                let fire = run["fire_time"].as_str().map(|s| {
+                    format!("{} {}", fmt_local(s), time_until(s))
+                }).unwrap_or_else(|| "—".to_string());
+                let end = run["end_time"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
+                let el = run["max_el"].as_f64().map(|e| fmt_el(e)).unwrap_or_else(|| "—".to_string());
+                (fire, end, el)
+            }
+        } else if upcoming_error.is_some() {
+            (yellow("prediction unavailable"), String::new(), "—".to_string())
         } else {
             (dim("no passes predicted"), String::new(), "—".to_string())
         };
@@ -543,6 +556,12 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
             end_str,
         ]
     }).collect();
+    if let Some(error) = upcoming_error {
+        eprintln!(
+            "{}",
+            yellow(&format!("  Warning: could not load upcoming predictions: {}", error))
+        );
+    }
     print_table(&["Satellite", "On", "MHz", "Profile", "Gains", "Max El", "Next fire", "Window end"], &rows);
     println!();
     Ok(())

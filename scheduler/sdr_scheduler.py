@@ -12,6 +12,7 @@ LOG = os.path.join(HOME, "sdr_scheduler.log")
 PREDICTOR = os.path.join(HOME, "src", "satellites-overhead", "predict.py")
 MONITOR_SCRIPT = os.path.join(HOME, "src", "satellites-overhead", "monitor_capture.py")
 REPO_DIR = os.path.join(HOME, "src", "satellites-overhead")
+ANALYZER_SCRIPT = os.path.join(REPO_DIR, "analyze_150mhz.py")
 RULES_PATH = os.path.join(HOME, "sdr_scheduler_rules.json")
 COMMANDS_PATH = os.path.join(HOME, "sdr_scheduler_commands.json")
 STATUS_PATH = os.path.join(HOME, "sdr_scheduler_status.json")
@@ -119,11 +120,11 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
         except FileNotFoundError:
             pass
 
-def analyze_150mhz(iqfile, label):
+def analyze_150mhz(iqfile, label, center_hz):
     try:
         result = subprocess.check_output(
-            ["python3", "/tmp/analyze_150mhz.py", iqfile, label],
-            stderr=subprocess.DEVNULL, text=True)
+            ["python3", ANALYZER_SCRIPT, iqfile, label, str(center_hz)],
+            stderr=subprocess.DEVNULL, text=True, timeout=300)
         log(result.strip())
     except Exception as e:
         log(f"ANALYZE FAIL {label}: {e}")
@@ -518,7 +519,7 @@ def run_job(ptype, kwargs):
     if ptype == "iq":
         outfile = hackrf_capture(**run_kwargs)
         if outfile:
-            analyze_150mhz(outfile, run_kwargs["label"])
+            analyze_150mhz(outfile, run_kwargs["label"], run_kwargs["freq_hz"])
             norad = kwargs.get("_norad")
             if norad == 27607:  # SO-50 — FM demod + Whisper transcript
                 script = os.path.join(REPO_DIR, "so50_process.py")
