@@ -1,0 +1,13 @@
+[Unit]
+Description=SDR satellite pass scheduler
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cstahly
+ExecStart=/usr/bin/python3 /home/cstahly/sdr_scheduler.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

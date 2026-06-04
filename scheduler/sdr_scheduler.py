@@ -519,6 +519,18 @@ def run_job(ptype, kwargs):
         outfile = hackrf_capture(**run_kwargs)
         if outfile:
             analyze_150mhz(outfile, run_kwargs["label"])
+            norad = kwargs.get("_norad")
+            if norad == 27607:  # SO-50 — FM demod + Whisper transcript
+                script = os.path.join(REPO_DIR, "so50_process.py")
+                if os.path.exists(script):
+                    log(f"SO-50 post-process: {os.path.basename(outfile)}")
+                    threading.Thread(
+                        target=lambda: subprocess.run(
+                            ["python3", script, outfile],
+                            capture_output=False,
+                        ),
+                        daemon=True,
+                    ).start()
     elif ptype == "satdump":
         satdump_capture(**run_kwargs)
     else:
