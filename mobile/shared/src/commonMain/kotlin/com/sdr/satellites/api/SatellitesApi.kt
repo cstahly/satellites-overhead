@@ -22,6 +22,7 @@ import io.ktor.client.request.setBody
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import kotlin.native.HiddenFromObjC
 import kotlinx.serialization.json.Json
 
 class SatellitesApi(private val baseUrl: String, token: String) {
@@ -41,16 +42,19 @@ class SatellitesApi(private val baseUrl: String, token: String) {
         install(Logging) { level = LogLevel.NONE }
     }
 
+    @Throws(Exception::class)
     suspend fun getStatus(): SchedulerStatus =
         client.get("$baseUrl/api/v1/status") {
             header("Authorization", authHeader)
         }.body()
 
+    @Throws(Exception::class)
     suspend fun getRules(): List<Rule> =
         client.get("$baseUrl/api/v1/rules") {
             header("Authorization", authHeader)
         }.body()
 
+    @Throws(Exception::class)
     suspend fun getPasses(
         norad: Int,
         hours: Int = 24,
@@ -69,13 +73,15 @@ class SatellitesApi(private val baseUrl: String, token: String) {
             parameter("alt_m", altM)
         }.body()
 
-    suspend fun getCaptures(norad: Int? = null, limit: Int = 50): List<Capture> =
+    @Throws(Exception::class)
+    suspend fun getCaptures(norad: Int = -1, limit: Int = 50): List<Capture> =
         client.get("$baseUrl/api/v1/captures") {
             header("Authorization", authHeader)
-            norad?.let { parameter("norad", it) }
+            if (norad > 0) parameter("norad", norad)
             parameter("limit", limit)
         }.body()
 
+    @Throws(Exception::class)
     suspend fun getEvents(after: String? = null, limit: Int = 50): List<SdrEvent> =
         client.get("$baseUrl/api/v1/events") {
             header("Authorization", authHeader)
@@ -83,6 +89,7 @@ class SatellitesApi(private val baseUrl: String, token: String) {
             parameter("limit", limit)
         }.body()
 
+    @Throws(Exception::class)
     suspend fun triggerScanNow(request: ScanNowRequest) {
         client.post("$baseUrl/api/v1/scans") {
             header("Authorization", authHeader)
@@ -91,6 +98,7 @@ class SatellitesApi(private val baseUrl: String, token: String) {
         }
     }
 
+    @Throws(Exception::class)
     suspend fun setRuleEnabled(ruleId: String, enabled: Boolean) {
         client.post("$baseUrl/api/v1/rules") {
             header("Authorization", authHeader)

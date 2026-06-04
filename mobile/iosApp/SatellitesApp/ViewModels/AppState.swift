@@ -1,5 +1,5 @@
 import Foundation
-import Shared  // KMP XCFramework — build with: ./gradlew :shared:assembleXCFramework
+import Shared  // KMP XCFramework — build with: ./gradlew :shared:assembleSharedXCFramework
 
 // Default location: Lafayette IN
 private let defaultLat = 40.42
@@ -52,7 +52,8 @@ final class AppState: ObservableObject {
         let lon = UserDefaults.standard.double(forKey: "longitude").nonZero ?? defaultLon
         let alt = UserDefaults.standard.double(forKey: "altitude_m").nonZero ?? defaultAlt
         do {
-            passes = try await api.getPasses(norad: norad, hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt) as! [Pass]
+            let result = try await api.getPasses(norad: norad, hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt)
+            passes = result as? [Pass] ?? []
             passesError = nil
         } catch {
             passesError = error.localizedDescription
@@ -60,9 +61,11 @@ final class AppState: ObservableObject {
         isLoadingPasses = false
     }
 
-    func refreshCaptures(norad: Int32? = nil) async {
+    // norad: -1 means all satellites
+    func refreshCaptures(norad: Int32 = -1) async {
         do {
-            captures = try await api.getCaptures(norad: norad, limit: 50) as! [Capture]
+            let result = try await api.getCaptures(norad: norad, limit: 50)
+            captures = result as? [Capture] ?? []
             capturesError = nil
         } catch {
             capturesError = error.localizedDescription
@@ -71,7 +74,8 @@ final class AppState: ObservableObject {
 
     func refreshEvents() async {
         do {
-            let incoming = try await api.getEvents(after: nil, limit: 50) as! [SdrEvent]
+            let result = try await api.getEvents(after: nil, limit: 50)
+            let incoming = result as? [SdrEvent] ?? []
             let merged = (incoming + events).uniqued(by: \.id).prefix(100)
             events = Array(merged)
             eventsError = nil
