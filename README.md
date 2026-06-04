@@ -179,6 +179,10 @@ The scheduler (`scheduler/sdr_scheduler.py`) is a single Python process that:
 | `~/sdr_scheduler_status.json` | Scheduler | Web UI / MCP |
 | `~/sdr_capture_history.json` | Scheduler | Web UI |
 | `~/sdr_scheduler.log` | Scheduler | You / monitor |
+| `~/sdr_scheduler_events.jsonl` | Scheduler / Web API | Mobile API |
+| `~/sdr_notification_outbox.jsonl` | Scheduler / Web API | Future push worker |
+| `~/sdr_api_tokens.json` | Token CLI / Web API | Web API |
+| `~/sdr_mobile_devices.json` | Mobile API | Future push worker |
 
 ### Rule fields
 
@@ -243,7 +247,9 @@ Each capture produces a `<capdir>/diagnostic_report.md` viewable from the web UI
 
 All endpoints are served by `serve.py` on port 8723. Existing paths remain
 supported. New clients should use the equivalent `/api/v1/...` paths listed by
-`GET /api/v1`.
+`GET /api/v1`. Every `/api/v1` request requires a revocable bearer token;
+legacy browser routes do not. Create and revoke tokens locally with
+`manage_api_tokens.py`.
 
 ### Scheduler
 
@@ -255,6 +261,10 @@ supported. New clients should use the equivalent `/api/v1/...` paths listed by
 | `DELETE` | `/scheduler/rules/<id>` | Delete a rule |
 | `POST` | `/scheduler/scan-now` | Queue an immediate capture |
 | `GET` | `/api/v1/audit?limit=100` | Recent rule/scan mutation audit records |
+| `GET` | `/api/v1/events?after=ID&limit=100` | Append-only scheduler/web event stream |
+| `GET` | `/api/v1/notifications?status=pending` | Pending notification outbox |
+| `GET/POST/DELETE` | `/api/v1/devices[/<id>]` | Mobile push-device registry |
+| `GET/POST/DELETE` | `/api/v1/tokens[/<id>]` | Revocable bearer-token management |
 
 ### Captures
 
@@ -278,10 +288,12 @@ supported. New clients should use the equivalent `/api/v1/...` paths listed by
 `hours`, `min_el`, `min_duration_s`, `track_step_s`, `limit`, `start`, `norad`
 (repeatable), `name` (repeatable).
 
-Public access at `https://sdr.sadbabyrabbit.com` is protected by nginx Basic
-Auth. Mutating requests made through that route are recorded in the append-only
-`~/sdr_web_audit.jsonl` log with the authenticated username and source address.
-See `HOSTING_RUNBOOK.md` for deployment and rollback details.
+Public website access at `https://sdr.sadbabyrabbit.com` is protected by nginx
+Basic Auth. The `/api/v1` subtree instead uses application bearer auth so native
+mobile clients do not store the website password. Mutating requests are
+recorded in `~/sdr_web_audit.jsonl`; scheduler and web lifecycle events are
+recorded in `~/sdr_scheduler_events.jsonl`. See `MOBILE_API_HANDOFF.md` and
+`HOSTING_RUNBOOK.md` for deployment and rollback details.
 
 ---
 

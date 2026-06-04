@@ -157,17 +157,20 @@ ssh sadbabyrabbit.com 'curl -fsS http://127.0.0.1:18723/scheduler/status'
 
 ## Authentication boundary
 
-The initial public deployment uses nginx HTTP Basic Auth for every route. This
-works with the current browser app because frontend and API remain same-origin.
-
-The later mobile API should use revocable bearer credentials or an identity
-provider. Do not remove Basic Auth until the application API enforces its own
-authentication and authorization.
+The browser frontend and legacy routes use nginx HTTP Basic Auth. The
+`/api/v1` subtree uses revocable bearer credentials enforced by `serve.py`;
+nginx disables Basic Auth only for exact `/api/v1` and `/api/v1/` paths and
+forwards the `Authorization` header. Never add a loopback bypass in `serve.py`,
+because reverse-tunnel requests arrive on loopback.
 
 nginx forwards the authenticated username to the app as `X-Remote-User`.
 Rule upserts/deletes and queued immediate scans are appended to
 `~/sdr_web_audit.jsonl`. Audit write failure is logged but does not prevent a
 scheduler command from being accepted.
+
+Create/revoke application tokens locally with `manage_api_tokens.py`. Token
+secrets are printed once and only SHA-256 hashes are stored in
+`~/sdr_api_tokens.json`. See `MOBILE_API_HANDOFF.md` for scopes and endpoints.
 
 ### Rotate the Basic Auth password
 

@@ -82,6 +82,10 @@ Runtime files **not** in git (home dir):
 - `~/sdr_scheduler_commands.json` — one-shot queue
 - `~/sdr_scheduler_status.json` — heartbeat
 - `~/sdr_scheduler.log` — scheduler log
+- `~/sdr_api_tokens.json` — hashed mobile API bearer tokens
+- `~/sdr_scheduler_events.jsonl` — append-only lifecycle event stream
+- `~/sdr_mobile_devices.json` — push-device registry
+- `~/sdr_notification_outbox.jsonl` — pending push records
 
 ---
 
@@ -106,6 +110,12 @@ The user is refactoring the web frontend to run on **sadbabyrabbit.com**. Curren
 - Scheduler is the single authority over HackRF
 
 The backend API and scheduler are already decoupled from the frontend. A refactor to serve the frontend from a different host (nginx reverse proxy, or separate static hosting) should only need to handle CORS on the API endpoints.
+
+The first mobile-backend phase is implemented. `/api/v1` uses revocable bearer
+tokens while legacy routes remain available for the Basic-authenticated web
+frontend. The scheduler writes events directly to local JSONL and does not
+depend on `serve.py`, nginx, or the public tunnel. Push delivery itself is not
+implemented yet. Read `MOBILE_API_HANDOFF.md` before changing this boundary.
 
 Do not restart the scheduler mid-pass. The completed set is in-memory — a restart during a pass window will cause the job to re-fire.
 

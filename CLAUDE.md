@@ -161,9 +161,12 @@ GET  /api/v1/audit?limit=100    — recent rule/scan mutation audit records
 ```
 
 Existing paths remain supported. New remote/mobile clients should use
-`/api/v1/...`. Public requests are authenticated by nginx, which forwards the
-username as `X-Remote-User`; mutations are appended to
-`~/sdr_web_audit.jsonl`.
+`/api/v1/...`. Public website requests are authenticated by nginx Basic Auth.
+The `/api/v1` subtree uses revocable application bearer tokens from
+`~/sdr_api_tokens.json`; create/revoke them with `manage_api_tokens.py`.
+Mutations are appended to `~/sdr_web_audit.jsonl`, and scheduler/web lifecycle
+events are appended to `~/sdr_scheduler_events.jsonl`. See
+`MOBILE_API_HANDOFF.md`.
 
 ## Verification after code changes
 
