@@ -222,6 +222,22 @@ def main():
     action = None
     killed_pid = None
 
+    # Pass manager lock: if Claude already acted mid-pass, skip monitor intervention
+    pass_manager_lock = os.path.join(capdir, "pass_manager.lock")
+    if os.path.exists(pass_manager_lock):
+        action = "pass_manager.lock present — skipping monitor intervention"
+        result = {
+            "status": status, "notes": notes, "action": action, "killed_pid": None,
+            "samples": len(samples),
+            "avg_snr": round(sum(s["snr"] for s in samples) / len(samples), 2) if samples else None,
+            "deframer_synced": any(s["deframer"] == "SYNCED" for s in samples),
+            "cadu_bytes": cadu_size(capdir),
+            "report_path": write_report(capdir, samples, status, notes, action, logfile),
+            "capdir": capdir, "logfile": logfile,
+        }
+        print(json.dumps(result))
+        sys.exit(0)
+
     if not check_only and status in ("saturated", "nosync_good_signal") and len(samples) >= 3:
         killed_pid = kill_satdump(capdir)
         if killed_pid:

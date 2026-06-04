@@ -215,38 +215,73 @@ def _invoke_pass_manager(capdir, kwargs):
     pipeline = kwargs.get("pipeline", "iq")
     duration_s = kwargs.get("duration_s", 300)
     max_el = kwargs.get("_max_el", "?")
+    retry_idx = kwargs.get("_retry_idx", -1)
+    lna = kwargs.get("lna", 16)
+    vga = kwargs.get("vga", 36)
+    amp = kwargs.get("amp", 1)
+    iq_swap = kwargs.get("iq_swap", True)
+    dc_block = kwargs.get("dc_block", True)
+    samplerate = kwargs.get("samplerate", "1e6")
     logfile = capdir + ".log"
     pidfile = capdir + ".pid"
     claude_log = capdir + ".claude_pass.log"
-    freq_mhz = freq / 1e6 if isinstance(freq, (int, float)) else "?"
+    freq_hz = int(freq) if isinstance(freq, (int, float)) else freq
+    freq_mhz = freq_hz / 1e6 if isinstance(freq_hz, int) else "?"
+
+    # Serialize retry variants so Claude knows exactly what to try next
+    variants_json = json.dumps(LRPT_RETRY_VARIANTS, indent=2)
+    next_idx = retry_idx + 1
+    next_variant = LRPT_RETRY_VARIANTS[next_idx] if 0 <= next_idx < len(LRPT_RETRY_VARIANTS) else None
+    next_variant_json = json.dumps(next_variant) if next_variant else "none — all variants exhausted"
+
+    # Build a ready-to-use retry curl template
+    retry_template = json.dumps({
+        "norad": norad,
+        "name": label.split(" scan")[0].split(" LRPT")[0].strip(),
+        "frequency_hz": freq_hz,
+        "profile": kwargs.get("_profile", "meteor_lrpt_hackrf"),
+        "pipeline": next_variant["pipeline"] if next_variant else pipeline,
+        "samplerate": next_variant["samplerate"] if next_variant else samplerate,
+        "iq_swap": next_variant["iq_swap"] if next_variant else iq_swap,
+        "dc_block": next_variant["dc_block"] if next_variant else dc_block,
+        "lna_gain": lna,
+        "vga_gain": vga,
+        "amp": amp,
+        "duration_s": max(60, duration_s - 120),
+        "_retry_idx": next_idx,
+    }, indent=2)
+
     prompt = (
-        f"You are the live pass manager for an SDR satellite capture that just started. "
-        f"Read {REPO_DIR}/CLAUDE.md now for full hardware and pipeline context before doing anything else.\n\n"
-        f"PASS DETAILS:\n"
-        f"  Label:     {label}\n"
-        f"  NORAD:     {norad}\n"
-        f"  Frequency: {freq_mhz} MHz\n"
-        f"  Pipeline:  {pipeline}\n"
-        f"  Max elev:  {max_el}°\n"
-        f"  Duration:  {duration_s}s\n"
-        f"  Log:       {logfile}\n"
-        f"  PID file:  {pidfile}\n"
-        f"  Cap dir:   {capdir}\n"
-        f"  Sched API: http://localhost:8723\n\n"
-        f"YOUR LOOP — run this until the capture ends (pidfile disappears or {duration_s}s elapsed):\n"
-        f"  1. `tail -5 {logfile}` — check SNR, Viterbi, Deframer lines\n"
-        f"  2. `wc -c {capdir}/*.cadu {capdir}/*.frm 2>/dev/null` — check for lock\n"
-        f"  3. Decide: healthy / needs retry / no signal — act immediately if needed\n"
-        f"  4. `sleep 25` then repeat\n\n"
-        f"ACTIONS you can take mid-pass:\n"
-        f"  Kill capture:  kill $(cat {pidfile})\n"
-        f"  Queue retry:   curl -s -X POST http://localhost:8723/scheduler/scan-now "
-        f"-H 'Content-Type: application/json' -d '{{...}}'\n"
-        f"  Check status:  curl -s http://localhost:8723/scheduler/status\n\n"
-        f"WHEN THE PASS ENDS (pidfile gone or you've looped for {duration_s}s):\n"
-        f"  Write a short pass_report.md to {capdir}/ covering: SNR peak, "
-        f"lock achieved Y/N, CADU bytes, any actions taken, next recommendation.\n"
-        f"  Then exit — do not keep running after the pass is over."
+        f"You are the live pass manager for an SDR satellite capture. Read "
+        f"{REPO_DIR}/CLAUDE.md first for hardware/pipeline context.\n\n"
+        f"PASS: {label} | NORAD {norad} | {freq_mhz} MHz | pipeline={pipeline} | "
+        f"max_el={max_el}° | duration={duration_s}s | retry_idx={retry_idx}\n"
+        f"  Log:     {logfile}\n"
+        f"  PID:     {pidfile}\n"
+        f"  Capdir:  {capdir}\n"
+        f"  Gains:   LNA={lna} VGA={vga} amp={amp} iq_swap={iq_swap} dc_block={dc_block}\n\n"
+        f"LOOP until pidfile gone or {duration_s}s elapsed — check every 25s:\n"
+        f"  tail -4 {logfile} | grep -E 'SNR|Viterbi|Deframer|Progress'\n"
+        f"  wc -c {capdir}/*.cadu {capdir}/*.frm 2>/dev/null\n"
+        f"  [ -f {pidfile} ] || break   # exit loop when capture ends\n\n"
+        f"ACT IMMEDIATELY (don't wait for T+90s monitor) if you see:\n"
+        f"  SNR>5 + BER=0.000 + Deframer NOSYNC  → LO false-lock, kill and retry with dc_block=true\n"
+        f"  SNR>5 + BER 0.05-0.15 + Deframer SYNCED → Real lock, let it run, watch CADU grow\n"
+        f"  SNR>28 or BER climbing to 0.5          → Saturated, kill and retry VGA-12\n"
+        f"  SNR=0 through max elevation             → No signal, note and let expire\n"
+        f"  Viterbi SYNCED + Deframer NOSYNC (any BER) → Wrong pipeline, retry next variant\n\n"
+        f"NEXT RETRY VARIANT (idx={next_idx}): {next_variant_json}\n\n"
+        f"ALL RETRY VARIANTS:\n{variants_json}\n\n"
+        f"TO KILL AND RETRY (use exact payload below, adjust pipeline/flags per variant):\n"
+        f"  kill $(cat {pidfile}) 2>/dev/null\n"
+        f"  curl -s -X POST http://localhost:8723/scheduler/scan-now \\\n"
+        f"    -H 'Content-Type: application/json' \\\n"
+        f"    -d '{retry_template}'\n\n"
+        f"NOTE: A T+90s monitor also runs independently. If you act before T+90s, "
+        f"write a one-line note to {capdir}/pass_manager.lock so the monitor skips "
+        f"its retry (check for that file in your loop too).\n\n"
+        f"WHEN DONE: write {capdir}/pass_report.md — SNR peak, lock Y/N, CADU bytes, "
+        f"actions taken, recommendation. Then exit."
     )
     try:
         with open(claude_log, "w") as lf:
