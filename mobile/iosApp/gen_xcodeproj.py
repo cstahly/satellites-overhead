@@ -60,7 +60,7 @@ XCF_PATH = "../shared/build/XCFrameworks/release/Shared.xcframework"
 BUNDLE_ID = "com.sdr.satellites"
 TEAM_ID   = "M9FV48P37T"
 APP_NAME  = "SatellitesApp"
-DEPLOY    = "16.0"
+DEPLOY    = "17.0"
 
 def pbx_build_file(bf, ref, name, extra=""):
     extra_s = f"; settings = {{{extra}}};" if extra else ""
