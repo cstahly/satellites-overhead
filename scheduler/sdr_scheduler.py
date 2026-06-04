@@ -207,6 +207,56 @@ def append_capture_record(record):
     atomic_write_json(HISTORY_PATH, history)
 
 
+def _invoke_pass_manager(capdir, kwargs):
+    """Spawn a claude --print agent at AOS to live-manage a pass."""
+    label = kwargs.get("label", "unknown")
+    norad = kwargs.get("_norad", "?")
+    freq = kwargs.get("freq", kwargs.get("freq_hz", "?"))
+    pipeline = kwargs.get("pipeline", "iq")
+    duration_s = kwargs.get("duration_s", 300)
+    max_el = kwargs.get("_max_el", "?")
+    logfile = capdir + ".log"
+    pidfile = capdir + ".pid"
+    claude_log = capdir + ".claude_pass.log"
+    prompt = (
+        f"You are live-managing an SDR satellite pass that just started.\n\n"
+        f"Pass: {label} | NORAD {norad} | {freq/1e6:.3f} MHz | pipeline={pipeline} | "
+        f"max_el={max_el}° | duration={duration_s}s\n"
+        f"Capture dir: {capdir}\n"
+        f"Log file: {logfile}\n"
+        f"PID file: {pidfile}\n"
+        f"Scheduler API: http://localhost:8723\n"
+        f"Read {REPO_DIR}/CLAUDE.md for full hardware/pipeline context.\n\n"
+        f"Your job:\n"
+        f"1. Monitor {logfile} — watch for SNR, Viterbi SYNCED/NOSYNC, Deframer status\n"
+        f"2. Watch CADU/FRM file size in {capdir}/ for lock confirmation\n"
+        f"3. If SNR rises above ~5 dB and Viterbi syncs: report success, note CADU bytes\n"
+        f"4. If SNR stays 0 and no lock through max elevation: diagnose why\n"
+        f"5. After LOS: summarize the pass (SNR peak, CADU bytes, lock Y/N) and write a\n"
+        f"   one-paragraph report to {capdir}/pass_report.md\n"
+        f"6. If the pass failed AND a retry makes sense (satellite still has signal, "
+        f"different pipeline needed), queue one via POST http://localhost:8723/command\n\n"
+        f"Check the log every 20-30 seconds. The pass is live — act quickly if you see "
+        f"the signal but pipeline is wrong. Do not wait for the pass to end before acting."
+    )
+    try:
+        with open(claude_log, "w") as lf:
+            subprocess.Popen(
+                ["claude", "--print", "-p", prompt],
+                cwd=REPO_DIR,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+            )
+        log(f"PASS MANAGER Claude started for {os.path.basename(capdir)} — {claude_log}")
+        scheduler_event(
+            "claude.pass_manager.started",
+            {"capture": os.path.basename(capdir), "label": label, "log": claude_log},
+            {"title": f"Claude managing {label}", "body": f"{max_el}° pass"},
+        )
+    except Exception as e:
+        log(f"PASS MANAGER Claude invoke FAIL — {e}")
+
+
 def _invoke_claude_monitor(capdir, monitor_result):
     """Spawn a claude --print agent to diagnose and act on a failed capture."""
     status = monitor_result.get("status", "unknown")
@@ -584,6 +634,8 @@ def run_job(ptype, kwargs):
         if capdir and os.path.exists(MONITOR_SCRIPT):
             t = threading.Thread(target=_monitor_satdump, args=(capdir, kwargs), daemon=True)
             t.start()
+        if capdir:
+            threading.Thread(target=_invoke_pass_manager, args=(capdir, kwargs), daemon=True).start()
     if ptype == "iq":
         outfile = hackrf_capture(**run_kwargs)
         if outfile:
