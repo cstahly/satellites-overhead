@@ -288,7 +288,7 @@ struct OverheadSkyPlot: View {
 }
 
 extension OverheadSat: Identifiable {
-    public var id: Int { norad }
+    public var id: Int32 { norad }
 }
 
 // MARK: - Scan Now Sheet
