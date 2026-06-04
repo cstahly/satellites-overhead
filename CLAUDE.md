@@ -156,7 +156,14 @@ GET  /captures/<id>/report      — diagnostic report (markdown)
 GET  /captures/<id>/download    — tar.gz of output directory or IQ file
 GET  /capture-settings?norad=N  — suggested frequency/gain from SatNOGS
 GET  /passes?...                — upcoming pass predictions
+GET  /api/v1                    — versioned API endpoint index
+GET  /api/v1/audit?limit=100    — recent rule/scan mutation audit records
 ```
+
+Existing paths remain supported. New remote/mobile clients should use
+`/api/v1/...`. Public requests are authenticated by nginx, which forwards the
+username as `X-Remote-User`; mutations are appended to
+`~/sdr_web_audit.jsonl`.
 
 ## Verification after code changes
 

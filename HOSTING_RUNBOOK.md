@@ -64,6 +64,8 @@ Installed and verified on June 3, 2026:
 - HTTP bootstrap nginx backup:
   `/etc/nginx/conf.d/sdr.conf.bootstrap-20260604`
 - Public URL: `https://sdr.sadbabyrabbit.com`
+- Versioned API index: `https://sdr.sadbabyrabbit.com/api/v1`
+- Mutation audit log on Kali: `~/sdr_web_audit.jsonl`
 
 ## Selected transport
 
@@ -157,6 +159,11 @@ works with the current browser app because frontend and API remain same-origin.
 The later mobile API should use revocable bearer credentials or an identity
 provider. Do not remove Basic Auth until the application API enforces its own
 authentication and authorization.
+
+nginx forwards the authenticated username to the app as `X-Remote-User`.
+Rule upserts/deletes and queued immediate scans are appended to
+`~/sdr_web_audit.jsonl`. Audit write failure is logged but does not prevent a
+scheduler command from being accepted.
 
 ## Rollback
 

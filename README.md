@@ -241,7 +241,9 @@ Each capture produces a `<capdir>/diagnostic_report.md` viewable from the web UI
 
 ## API endpoints
 
-All endpoints served by `serve.py` on port 8723.
+All endpoints are served by `serve.py` on port 8723. Existing paths remain
+supported. New clients should use the equivalent `/api/v1/...` paths listed by
+`GET /api/v1`.
 
 ### Scheduler
 
@@ -252,6 +254,7 @@ All endpoints served by `serve.py` on port 8723.
 | `POST` | `/scheduler/rules` | Create or update a rule |
 | `DELETE` | `/scheduler/rules/<id>` | Delete a rule |
 | `POST` | `/scheduler/scan-now` | Queue an immediate capture |
+| `GET` | `/api/v1/audit?limit=100` | Recent rule/scan mutation audit records |
 
 ### Captures
 
@@ -274,6 +277,11 @@ All endpoints served by `serve.py` on port 8723.
 `/passes` parameters: `group`, `lat` (required), `lon` (required), `alt_m`,
 `hours`, `min_el`, `min_duration_s`, `track_step_s`, `limit`, `start`, `norad`
 (repeatable), `name` (repeatable).
+
+Public access at `https://sdr.sadbabyrabbit.com` is protected by nginx Basic
+Auth. Mutating requests made through that route are recorded in the append-only
+`~/sdr_web_audit.jsonl` log with the authenticated username and source address.
+See `HOSTING_RUNBOOK.md` for deployment and rollback details.
 
 ---
 

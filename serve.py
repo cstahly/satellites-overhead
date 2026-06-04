@@ -31,8 +31,10 @@ RULES_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_rules.json")
 COMMANDS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_commands.json")
 STATUS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_status.json")
 HISTORY_PATH = os.path.join(os.path.expanduser("~"), "sdr_capture_history.json")
+AUDIT_PATH = os.path.join(os.path.expanduser("~"), "sdr_web_audit.jsonl")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 TX_TTL = 7 * 24 * 3600
+API_VERSION = "v1"
 
 # Only allow the catalogs the app exposes (also prevents using us as an open proxy).
 ALLOWED = {"active", "radio", "visual", "stations", "starlink", "gps-ops", "science"}
@@ -117,6 +119,65 @@ def write_json(handler, status, payload):
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def api_path(path):
+    aliases = {
+        "/api/v1/status": "/scheduler/status",
+        "/api/v1/rules": "/scheduler/rules",
+        "/api/v1/scans": "/scheduler/scan-now",
+        "/api/v1/upcoming": "/scheduler/upcoming",
+        "/api/v1/captures": "/captures",
+        "/api/v1/passes": "/passes",
+        "/api/v1/capture-settings": "/capture-settings",
+        "/api/v1/transmitters": "/transmitters",
+        "/api/v1/satellite": "/satellite",
+    }
+    if path.startswith("/api/v1/rules/"):
+        return "/scheduler/rules/" + path[len("/api/v1/rules/"):]
+    if path.startswith("/api/v1/captures/"):
+        return "/captures/" + path[len("/api/v1/captures/"):]
+    return aliases.get(path, path)
+
+
+def audit_actor(handler):
+    return {
+        "user": handler.headers.get("X-Remote-User") or "local-or-unknown",
+        "source_ip": handler.headers.get("X-Real-IP") or handler.client_address[0],
+        "forwarded_for": handler.headers.get("X-Forwarded-For") or "",
+        "user_agent": handler.headers.get("User-Agent") or "",
+    }
+
+
+def append_audit(handler, action, target, details=None):
+    record = {
+        "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "action": action,
+        "target": target,
+        "actor": audit_actor(handler),
+        "details": details or {},
+    }
+    try:
+        with open(AUDIT_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception as e:
+        sys.stderr.write(f"[audit] could not append {action}: {e}\n")
+    return record
+
+
+def read_audit(limit=100):
+    limit = max(1, min(int(limit), 1000))
+    if not os.path.exists(AUDIT_PATH):
+        return []
+    with open(AUDIT_PATH, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()[-limit:]
+    records = []
+    for line in lines:
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return list(reversed(records))
 
 
 def read_rules():
@@ -461,7 +522,32 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/tle":
+        path = api_path(parsed.path)
+        if path == "/api/v1":
+            write_json(self, 200, {
+                "api_version": API_VERSION,
+                "status": "/api/v1/status",
+                "rules": "/api/v1/rules",
+                "scans": "/api/v1/scans",
+                "upcoming": "/api/v1/upcoming",
+                "captures": "/api/v1/captures",
+                "passes": "/api/v1/passes",
+                "capture_settings": "/api/v1/capture-settings",
+                "transmitters": "/api/v1/transmitters",
+                "satellite": "/api/v1/satellite",
+                "audit": "/api/v1/audit",
+            })
+            return
+        if path == "/api/v1/audit":
+            try:
+                limit = int(first_value(parse_qs(parsed.query), "limit", "100"))
+                write_json(self, 200, read_audit(limit))
+            except ValueError as e:
+                self.send_error(400, str(e))
+            except Exception as e:
+                self.send_error(500, f"could not read audit log: {e}")
+            return
+        if path == "/tle":
             group = (parse_qs(parsed.query).get("group", ["active"])[0]).lower()
             if group not in ALLOWED:
                 self.send_error(400, "unknown group")
@@ -481,7 +567,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(body)
             sys.stderr.write(f"[tle] {group}: {source}, {len(body)} bytes\n")
             return
-        if parsed.path == "/passes":
+        if path == "/passes":
             qs = parse_qs(parsed.query)
             group = first_value(qs, "group", "active").lower()
             if group not in ALLOWED:
@@ -526,19 +612,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 f"[passes] {group}: {source}, {len(tles)} sats, {len(passes)} passes\n"
             )
             return
-        if parsed.path == "/scheduler/rules":
+        if path == "/scheduler/rules":
             try:
                 write_json(self, 200, read_rules())
             except Exception as e:
                 self.send_error(500, f"could not read scheduler rules: {e}")
             return
-        if parsed.path == "/scheduler/status":
+        if path == "/scheduler/status":
             try:
                 write_json(self, 200, scheduler_status())
             except Exception as e:
                 self.send_error(500, f"could not read scheduler status: {e}")
             return
-        if parsed.path == "/transmitters":
+        if path == "/transmitters":
             qs = parse_qs(parsed.query)
             try:
                 norad = int(first_value(qs, "norad"))
@@ -552,7 +638,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             write_json(self, 200, data)
             sys.stderr.write(f"[transmitters] {norad}: {source}, {len(data)} records\n")
             return
-        if parsed.path == "/capture-settings":
+        if path == "/capture-settings":
             qs = parse_qs(parsed.query)
             try:
                 norad = int(first_value(qs, "norad"))
@@ -569,7 +655,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 f"[capture-settings] {norad}: {data['source']}, {data['selected_band']}\n"
             )
             return
-        if parsed.path == "/satellite":
+        if path == "/satellite":
             qs = parse_qs(parsed.query)
             try:
                 norad = int(first_value(qs, "norad"))
@@ -583,7 +669,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             write_json(self, 200, data)
             sys.stderr.write(f"[satellite] {norad}: {source}\n")
             return
-        if parsed.path == "/scheduler/upcoming":
+        if path == "/scheduler/upcoming":
             qs = parse_qs(parsed.query)
             hours = float(first_value(qs, "hours", "24"))
             limit_per_rule = int(first_value(qs, "limit_per_rule", "4"))
@@ -633,7 +719,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             write_json(self, 200, results)
             return
-        if parsed.path == "/captures":
+        if path == "/captures":
             qs = parse_qs(parsed.query)
             norad_str = first_value(qs, "norad")
             try:
@@ -647,8 +733,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return
             write_json(self, 200, data)
             return
-        if parsed.path.startswith("/captures/") and parsed.path.endswith("/report"):
-            capture_id = parsed.path[len("/captures/"):-len("/report")]
+        if path.startswith("/captures/") and path.endswith("/report"):
+            capture_id = path[len("/captures/"):-len("/report")]
             try:
                 record = next((r for r in read_captures() if r.get("id") == capture_id), None)
                 if record is None:
@@ -672,8 +758,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f"could not read report: {e}")
             return
-        if parsed.path.startswith("/captures/") and parsed.path.endswith("/download"):
-            capture_id = parsed.path[len("/captures/"):-len("/download")]
+        if path.startswith("/captures/") and path.endswith("/download"):
+            capture_id = path[len("/captures/"):-len("/download")]
             try:
                 all_captures = read_captures()
                 record = next((r for r in all_captures if r.get("id") == capture_id), None)
@@ -720,7 +806,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/scheduler/rules":
+        path = api_path(parsed.path)
+        if path == "/scheduler/rules":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length).decode("utf-8")
@@ -746,10 +833,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f"could not save scheduler rule: {e}")
                 return
+            append_audit(
+                self,
+                "rule.upsert",
+                incoming["id"],
+                {"replaced": replaced, "rule": incoming},
+            )
             write_json(self, 200, incoming)
             sys.stderr.write(f"[scheduler] saved rule {incoming['id']}\n")
             return
-        if parsed.path == "/scheduler/scan-now":
+        if path == "/scheduler/scan-now":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length).decode("utf-8")
@@ -761,6 +854,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f"could not queue scan: {e}")
                 return
+            append_audit(self, "scan.queued", command["id"], {"command": command})
             write_json(self, 200, {"queued": True, "command": command, "status": scheduler_status()})
             sys.stderr.write(f"[scheduler] queued scan {command['id']}\n")
             return
@@ -768,15 +862,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         parsed = urlparse(self.path)
-        if parsed.path.startswith("/scheduler/rules/"):
-            rule_id = parsed.path.rsplit("/", 1)[-1]
+        path = api_path(parsed.path)
+        if path.startswith("/scheduler/rules/"):
+            rule_id = path.rsplit("/", 1)[-1]
             try:
                 rules = read_rules()
+                removed_rules = [rule for rule in rules if str(rule.get("id")) == rule_id]
                 next_rules = [rule for rule in rules if str(rule.get("id")) != rule_id]
                 write_rules(next_rules)
             except Exception as e:
                 self.send_error(500, f"could not delete scheduler rule: {e}")
                 return
+            append_audit(self, "rule.delete", rule_id, {"removed_rules": removed_rules})
             write_json(self, 200, {"deleted": rule_id, "count": len(next_rules)})
             sys.stderr.write(f"[scheduler] deleted rule {rule_id}\n")
             return
