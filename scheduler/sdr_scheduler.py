@@ -29,18 +29,19 @@ if REPO_DIR not in sys.path:
 
 from sdr_runtime import emit_event
 
-# Retry variants tried in order when deframer NOSYNC with good signal.
-# First entry is the default; each subsequent entry is tried after a kill.
+# Retry variants ordered by P(success). First entry is the initial capture default.
+# dc_block=True is required — without it the PLL false-locks on HackRF LO leakage at 137.1 MHz.
+# iq_swap polarity is uncertain; try both before moving to secondary hypotheses.
+# nrzm=False (meteor_m2-4_lrpt_nrzl) tests whether M2-4 uses NRZ-L vs NRZ-M encoding.
+# rs_usecheck=False variant is a diagnostic: frames through even if RS fails, reveals framing state.
+# dc_block=False is last resort — known to produce false Viterbi lock, but retained if all else fails.
 LRPT_RETRY_VARIANTS = [
-    # dc_block=True variants first — LO leakage at 137.1 MHz causes false Viterbi lock without it
-    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": True},
-    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": True},
-    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-4_lrpt_nrzl",  "dc_block": True},
-    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-4_lrpt_nrzl",  "dc_block": True},
-    # Fallback: original variants without dc_block (kept for reference)
-    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": False},
-    {"iq_swap": False, "samplerate": "1e6",  "pipeline": "meteor_m2-x_lrpt",       "dc_block": False},
-    {"iq_swap": True,  "samplerate": "1e6",  "pipeline": "meteor_m2-4_lrpt_nrzl_nors", "dc_block": True},
+    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # canonical fix
+    {"iq_swap": False, "samplerate": "1e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # iq_swap uncertainty
+    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzm=False hypothesis
+    {"iq_swap": False, "samplerate": "1e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzm=False + iq_swap
+    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-4_lrpt_nrzl_nors",  "dc_block": True},   # RS off diagnostic
+    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": False},  # last resort fallback
 ]
 
 def log(msg):
