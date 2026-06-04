@@ -408,6 +408,7 @@ def run_now(args: dict[str, Any]) -> dict[str, Any]:
         "lna_gain": int(rule.get("lna_gain", 32)),
         "vga_gain": int(rule.get("vga_gain", 48)),
         "amp": int(rule.get("amp", 1)),
+        "dc_block": bool(rule["dc_block"]) if "dc_block" in rule else (rule.get("profile") == "meteor_lrpt_hackrf"),
         "duration_s": duration_s,
         "source": "mcp",
         "source_rule_id": rule["id"],
