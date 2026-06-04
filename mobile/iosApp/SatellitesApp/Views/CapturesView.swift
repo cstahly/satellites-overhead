@@ -54,7 +54,10 @@ private struct CaptureRow: View {
                     .foregroundStyle(.secondary)
             }
             if let freq = capture.frequencyHz {
-                Text(String(format: "%.3f MHz  •  LNA=\(capture.lnaGain ?? 0) VGA=\(capture.vgaGain ?? 0)", freq / 1e6))
+                let freqMhz = freq.doubleValue / 1e6
+                let lna = capture.lnaGain?.int32Value ?? 0
+                let vga = capture.vgaGain?.int32Value ?? 0
+                Text(String(format: "%.3f MHz  •  LNA=\(lna) VGA=\(vga)", freqMhz))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

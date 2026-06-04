@@ -31,13 +31,15 @@ struct StatusView: View {
                             Section("Current Job") {
                                 LabeledContent("Label", value: job.label)
                                 if let freq = job.frequencyHz {
-                                    LabeledContent("Frequency", value: String(format: "%.3f MHz", freq / 1e6))
+                                    LabeledContent("Frequency", value: String(format: "%.3f MHz", freq.doubleValue / 1e6))
                                 }
                                 if let dur = job.durationSeconds {
-                                    LabeledContent("Duration", value: "\(dur)s")
+                                    LabeledContent("Duration", value: "\(dur.int32Value)s")
                                 }
                                 if let lna = job.lnaGain {
-                                    LabeledContent("Gains", value: "LNA=\(lna) VGA=\(job.vgaGain ?? 0) AMP=\(job.amp ?? 0)")
+                                    let vga = job.vgaGain?.int32Value ?? 0
+                                    let amp = job.amp?.int32Value ?? 0
+                                    LabeledContent("Gains", value: "LNA=\(lna.int32Value) VGA=\(vga) AMP=\(amp)")
                                 }
                                 if let t = job.fireTime {
                                     LabeledContent("Fire time", value: t.shortTime)
