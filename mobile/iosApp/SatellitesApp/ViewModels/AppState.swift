@@ -46,16 +46,20 @@ final class AppState: ObservableObject {
         isLoadingStatus = false
     }
 
-    func refreshPasses(norad: Int32 = 59051, hours: Int32 = 24) async {
+    func refreshPasses(hours: Int32 = 24) async {
         isLoadingPasses = true
         let lat = UserDefaults.standard.double(forKey: "latitude").nonZero ?? defaultLat
         let lon = UserDefaults.standard.double(forKey: "longitude").nonZero ?? defaultLon
         let alt = UserDefaults.standard.double(forKey: "altitude_m").nonZero ?? defaultAlt
-        do {
-            let result = try await api.getPasses(norad: norad, hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt)
-            passes = result as? [Pass] ?? []
-            passesError = nil
-        } catch { passesError = error.localizedDescription }
+        let ruleNorads = rules.isEmpty ? [59051] : Array(Set(rules.map { $0.norad }))
+        var all: [Pass] = []
+        for norad in ruleNorads {
+            if let result = try? await api.getPasses(norad: Int32(norad), hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt) {
+                all += result as? [Pass] ?? []
+            }
+        }
+        passes = all.sorted { $0.aos < $1.aos }
+        passesError = all.isEmpty ? "No passes in the next \(hours)h." : nil
         isLoadingPasses = false
     }
 
@@ -102,11 +106,12 @@ final class AppState: ObservableObject {
     }
 
     func refreshAll() async {
+        // Rules must load before passes (passes uses rule norads)
+        await refreshRules()
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.refreshStatus() }
             group.addTask { await self.refreshPasses() }
             group.addTask { await self.refreshCaptures() }
-            group.addTask { await self.refreshRules() }
             group.addTask { await self.refreshEvents() }
         }
     }

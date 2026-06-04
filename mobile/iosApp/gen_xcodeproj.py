@@ -61,7 +61,7 @@ FRAMEWORK_BUILD = g()
 XCF_PATH = "../shared/build/XCFrameworks/release/Shared.xcframework"
 
 BUNDLE_ID = "com.sdr.satellites"
-TEAM_ID   = "M9FV48P37T"
+TEAM_ID   = "634QAM3ZHG"
 APP_NAME  = "SatellitesApp"
 DEPLOY    = "17.0"
 

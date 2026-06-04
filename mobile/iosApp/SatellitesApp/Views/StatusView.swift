@@ -25,31 +25,23 @@ struct StatusView: View {
                                     .foregroundStyle(status.live ? .green : .primary)
                             }
                             Text(status.message).foregroundStyle(.secondary)
+                            if !status.live, let p = nextPass {
+                                Button { selectedTab = 1 } label: {
+                                    HStack {
+                                        Text(countdownText(to: p.aos))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Spacer()
+                                        Text(p.name)
+                                            .foregroundStyle(.primary)
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
                         }
 
                         Section("Scheduler") {
-                            Button { selectedTab = 1 } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text("Next capture pending").foregroundStyle(.primary)
-                                        if let p = nextPass {
-                                            Text(countdownText(to: p.aos))
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                    Spacer()
-                                    if let p = nextPass {
-                                        Text(String(format: "%.0f°", p.maxElevation))
-                                            .foregroundStyle(p.maxElevation >= 60 ? .green : .secondary)
-                                            .bold()
-                                    } else {
-                                        Text("None").foregroundStyle(.secondary)
-                                    }
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
                             Button { selectedTab = 2 } label: {
                                 HStack {
                                     Text("Pending queue").foregroundStyle(.primary)
