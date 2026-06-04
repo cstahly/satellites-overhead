@@ -29,6 +29,7 @@ class SatellitesApi(private val baseUrl: String, token: String) {
     private val authHeader = "Bearer $token"
 
     private val client = HttpClient {
+        expectSuccess = true  // throw ResponseException on 4xx/5xx before body is touched
         install(ContentNegotiation) {
             json(Json {
                 ignoreUnknownKeys = true
