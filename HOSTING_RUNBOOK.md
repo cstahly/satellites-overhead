@@ -63,6 +63,8 @@ Installed and verified on June 3, 2026:
 - HTTPS authenticated requests reach the SDR app
 - HTTP bootstrap nginx backup:
   `/etc/nginx/conf.d/sdr.conf.bootstrap-20260604`
+- nginx backup before authenticated-user forwarding:
+  `/etc/nginx/conf.d/sdr.conf.before-api-20260604031457`
 - Public URL: `https://sdr.sadbabyrabbit.com`
 - Versioned API index: `https://sdr.sadbabyrabbit.com/api/v1`
 - Mutation audit log on Kali: `~/sdr_web_audit.jsonl`
