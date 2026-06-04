@@ -3,7 +3,6 @@ import Shared
 
 struct PassesView: View {
     @EnvironmentObject private var app: AppState
-    @State private var scanTarget: Pass?
 
     var body: some View {
         NavigationStack {
@@ -15,8 +14,8 @@ struct PassesView: View {
                         description: Text(app.passesError ?? "No passes in the next 24 hours."))
                 } else {
                     List(app.passes, id: \.aos) { pass in
-                        PassRow(pass: pass) {
-                            scanTarget = pass
+                        NavigationLink(destination: PassDetailView(pass: pass)) {
+                            PassRow(pass: pass)
                         }
                     }
                 }
@@ -30,47 +29,26 @@ struct PassesView: View {
                 }
             }
             .refreshable { await app.refreshPasses() }
-            .alert(item: $scanTarget) { pass in
-                Alert(
-                    title: Text("Scan \(pass.name)?"),
-                    message: Text("Queue a \(pass.durationSeconds)s capture starting now."),
-                    primaryButton: .default(Text("Queue")) {
-                        Task { await app.triggerScan(norad: Int32(pass.norad), name: pass.name, durationS: Int32(pass.durationSeconds)) }
-                    },
-                    secondaryButton: .cancel()
-                )
-            }
         }
     }
 }
 
 private struct PassRow: View {
     let pass: Pass
-    let onScan: () -> Void
 
     var body: some View {
-        HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(pass.name).font(.headline)
-                    Spacer()
-                    Text(String(format: "%.0f°", pass.maxElevation))
-                        .font(.headline)
-                        .foregroundStyle(elevationColor)
-                }
-                Text("AOS \(pass.aos.shortTime)  •  \(pass.durationSeconds / 60)m \(pass.durationSeconds % 60)s")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("Az \(Int(pass.aosAzimuth))° → \(Int(pass.maxAzimuth))° → \(Int(pass.losAzimuth))°")
-                    .font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(pass.name).font(.headline)
+                Spacer()
+                Text(String(format: "%.0f°", pass.maxElevation))
+                    .font(.headline.bold())
+                    .foregroundStyle(elevationColor)
             }
-            Button {
-                onScan()
-            } label: {
-                Image(systemName: "dot.radiowaves.up.forward")
-                    .foregroundStyle(.green)
-                    .padding(.leading, 8)
-            }
-            .buttonStyle(.plain)
+            Text("AOS \(pass.aos.shortTime)  •  \(pass.durationSeconds / 60)m \(pass.durationSeconds % 60)s")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("Az \(Int(pass.aosAzimuth))° → \(Int(pass.maxAzimuth))° → \(Int(pass.losAzimuth))°")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
     }

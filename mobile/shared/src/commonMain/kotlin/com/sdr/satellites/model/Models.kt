@@ -32,6 +32,15 @@ data class CurrentJob(
 )
 
 @Serializable
+data class TrackPoint(
+    val t: String,
+    val az: Double,
+    val el: Double,
+    @SerialName("sub_lat") val subLat: Double,
+    @SerialName("sub_lon") val subLon: Double,
+)
+
+@Serializable
 data class Pass(
     val norad: Int,
     val name: String,
@@ -43,6 +52,8 @@ data class Pass(
     @SerialName("aos_az") val aosAzimuth: Double,
     @SerialName("los_az") val losAzimuth: Double,
     @SerialName("duration_s") val durationSeconds: Int,
+    @SerialName("track_step_s") val trackStepSeconds: Int = 30,
+    val track: List<TrackPoint> = emptyList(),
 )
 
 @Serializable

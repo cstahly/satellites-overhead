@@ -41,6 +41,8 @@ SOURCES = {
     "Views/CapturesView.swift":     (g(), g()),
     "Views/EventsView.swift":       (g(), g()),
     "Views/RulesView.swift":        (g(), g()),
+    "Views/SkyPlotView.swift":      (g(), g()),
+    "Views/PassDetailView.swift":   (g(), g()),
     "Views/SettingsView.swift":     (g(), g()),
 }
 

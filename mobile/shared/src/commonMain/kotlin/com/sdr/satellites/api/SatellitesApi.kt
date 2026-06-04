@@ -72,6 +72,7 @@ class SatellitesApi(private val baseUrl: String, token: String) {
             parameter("lat", lat)
             parameter("lon", lon)
             parameter("alt_m", altM)
+            parameter("track_step_s", 30)
         }.body()
 
     @Throws(Exception::class)

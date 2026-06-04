@@ -90,6 +90,8 @@ def look_at(sat: ephem.EarthSatellite, obs: ephem.Observer, at: datetime) -> dic
         "t": iso(at),
         "az": az,
         "el": el,
+        "sub_lat": degrees(float(sat.sublat)),
+        "sub_lon": degrees(float(sat.sublong)),
         "range": float(sat.range) / 1000.0,
         "range_rate": float(sat.range_velocity) / 1000.0,
     }
