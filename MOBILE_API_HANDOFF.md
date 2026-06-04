@@ -19,9 +19,9 @@ As of the last edit on June 4, 2026, the backend foundation is live:
   and Python compilation.
 - The live web and scheduler services have been restarted and verified.
 - The public nginx `/api/v1` bearer-auth split is installed and verified.
-- Initial full-scope token `tok_7c9873925e18470c` is active. Its one-time raw
-  secret is temporarily stored at `~/sdr_mobile_bootstrap_token.json`, mode
-  `0600`. Give it only to the owner/app, then delete that temporary file.
+- Active full-scope token `tok_7146ca216a1a42c8` replaced two revoked tokens
+  whose raw secrets were committed. Its one-time raw secret is stored at
+  `~/sdr_mobile_bootstrap_token.json`, mode `0600`.
 - A deployment read-only token was created, scope-tested, and revoked.
 - Device registration/redaction/removal was tested; the live device list is
   empty after cleanup.
@@ -39,7 +39,8 @@ Next implementation work:
 
 Deployment record:
 
-- Initial token id: `tok_7c9873925e18470c`
+- Active token id: `tok_7146ca216a1a42c8`
+- Revoked token ids: `tok_7c9873925e18470c`, `tok_893c1e6b86324d86`
 - Temporary raw-token handoff: `~/sdr_mobile_bootstrap_token.json` (`0600`)
 - EC2 nginx backup:
   `/etc/nginx/conf.d/sdr.conf.before-mobile-api-20260604T044109Z`

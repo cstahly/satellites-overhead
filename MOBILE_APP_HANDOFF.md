@@ -12,29 +12,38 @@ Mac: `MacBook-Pro-3.local` — SSH access available.
 Repo on Mac: `/Volumes/vela/src/satellites-overhead` (external drive, `/Volumes/vela/`)
 Xcode project: `mobile/iosApp/SatellitesApp.xcodeproj`
 
-### After every `git pull` on Mac — REQUIRED
+### Before every Mac build — REQUIRED
+
+From Linux, reset/pull the Mac repo and patch the bearer token without putting
+the secret in the handoff, shell history, or SSH command line:
 
 ```bash
+jq -r .token ~/sdr_mobile_bootstrap_token.json | ssh MacBook-Pro-3.local '
+set -e
+IFS= read -r TOKEN
 cd /Volumes/vela/src/satellites-overhead
-
-# 1. Reset and pull (Mac repo drifts from local token patch)
 git reset --hard origin/master && git pull --ff-only
-
-# 2. Patch the bearer token (NEVER committed — see Token section below)
-TOKEN="sdr_tok_893c1e6b86324d86_c0JG27sWfLNTAkr_IdPfUT6V5edKbwYnwnoxNDPglyA"
-sed -i '' 's|let token = UserDefaults.standard.string(forKey: "bearer_token") ?? ""|let token = UserDefaults.standard.string(forKey: "bearer_token") ?? "'$TOKEN'"|g' \
+sed -i "" "s|let token = UserDefaults.standard.string(forKey: \"bearer_token\") ?? \"\"|let token = UserDefaults.standard.string(forKey: \"bearer_token\") ?? \"$TOKEN\"|g" \
   mobile/iosApp/SatellitesApp/ViewModels/AppState.swift
+test "$(grep -Foc "$TOKEN" mobile/iosApp/SatellitesApp/ViewModels/AppState.swift)" -eq 2
+'
+```
 
-# 3. Rebuild XCFramework — ONLY if shared/ Kotlin code changed
-cd mobile
+Then on the Mac:
+
+```bash
+cd /Volumes/vela/src/satellites-overhead/mobile
+
+# 1. Run only if shared Kotlin code changed
 export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 export ANDROID_HOME=$HOME/Library/Android/sdk
 ./gradlew :shared:assembleSharedXCFramework
 
-# 4. Regenerate Xcode project — ONLY if new Swift files added to SOURCES dict
-cd iosApp && python3 gen_xcodeproj.py
+# 2. Enter iosApp; regenerate only if new Swift files were added to SOURCES
+cd iosApp
+python3 gen_xcodeproj.py
 
-# 5. Build iOS app
+# 3. Always build the iOS app
 xcodebuild -project SatellitesApp.xcodeproj -target SatellitesApp \
   -sdk iphonesimulator26.5 -configuration Debug CODE_SIGNING_ALLOWED=NO
 ```
@@ -47,17 +56,20 @@ Add to the `SOURCES` dict in `mobile/iosApp/gen_xcodeproj.py`, then re-run
 
 ## Bearer token
 
-**NEVER commit.** Token `tok_893c1e6b86324d86` was created after the previous
-token (`tok_7c9873925e18470c`) was accidentally committed and immediately
-revoked. The raw token value is patched locally via sed after every pull.
+**NEVER commit the raw token.** The active token was rotated after raw
+credentials were committed. The raw value is patched locally via stdin after
+every pull.
 
-- Token ID: `tok_893c1e6b86324d86`
-- Raw token: `sdr_tok_893c1e6b86324d86_c0JG27sWfLNTAkr_IdPfUT6V5edKbwYnwnoxNDPglyA`
+- Active token ID: `tok_7146ca216a1a42c8`
+- Revoked token IDs: `tok_7c9873925e18470c`, `tok_893c1e6b86324d86`
 - Managed with `manage_api_tokens.py` on Linux
-- Saved at: `~/sdr_mobile_bootstrap_token.json` on Linux
+- Raw active token saved only at: `~/sdr_mobile_bootstrap_token.json` on Linux
+  (`0600`)
 
 The token defaults in `AppState.swift` in git read `?? ""`. The sed patch
 replaces both occurrences (in `init()` and `rebuildApi()`).
+Existing installs that saved `bearer_token` in `UserDefaults` keep the revoked
+value until it is replaced in Settings or the app is uninstalled and reinstalled.
 
 ---
 

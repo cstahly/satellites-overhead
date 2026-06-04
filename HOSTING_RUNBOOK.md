@@ -74,7 +74,9 @@ Installed and verified on June 3/4, 2026:
 - Basic Auth remains live for `/` and legacy browser routes
 - nginx backup before the `/api/v1` bearer split:
   `/etc/nginx/conf.d/sdr.conf.before-mobile-api-20260604T044109Z`
-- Initial mobile API token id: `tok_7c9873925e18470c`
+- Active mobile API token id: `tok_7146ca216a1a42c8`
+- Revoked mobile API token ids: `tok_7c9873925e18470c`,
+  `tok_893c1e6b86324d86`
 - Temporary mode-`0600` raw-token handoff:
   `~/sdr_mobile_bootstrap_token.json` on Kali; delete after app provisioning
 
