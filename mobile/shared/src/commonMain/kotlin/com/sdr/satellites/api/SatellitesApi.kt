@@ -2,6 +2,7 @@ package com.sdr.satellites.api
 
 import com.sdr.satellites.model.Capture
 import com.sdr.satellites.model.CurrentJob
+import com.sdr.satellites.model.OverheadSat
 import com.sdr.satellites.model.Pass
 import com.sdr.satellites.model.Rule
 import com.sdr.satellites.model.ScanNowRequest
