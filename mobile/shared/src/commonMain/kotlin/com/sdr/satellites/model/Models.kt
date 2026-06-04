@@ -36,8 +36,8 @@ data class TrackPoint(
     val t: String,
     val az: Double,
     val el: Double,
-    @SerialName("sub_lat") val subLat: Double,
-    @SerialName("sub_lon") val subLon: Double,
+    @SerialName("sub_lat") val subLat: Double = 0.0,
+    @SerialName("sub_lon") val subLon: Double = 0.0,
 )
 
 @Serializable
