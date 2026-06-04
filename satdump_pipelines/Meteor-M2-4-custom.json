@@ -1,0 +1,82 @@
+{
+    "meteor_m2-4_lrpt_nrzl": {
+        "name": "METEOR M2-4 LRPT 72k (NRZ-L test)",
+        "live": true,
+        "live_cfg": [[1, 0], [2, 0]],
+        "frequencies": [["Primary", 137.1e6]],
+        "parameters": {
+            "samplerate": {"value": 1e6}
+        },
+        "work": {
+            "baseband": {},
+            "soft": {
+                "psk_demod": {
+                    "constellation": "oqpsk",
+                    "symbolrate": 72e3,
+                    "rrc_alpha": 0.5,
+                    "pll_bw": 0.002
+                }
+            },
+            "cadu": {
+                "ccsds_conv_concat_decoder": {
+                    "constellation": "oqpsk",
+                    "nrzm": false,
+                    "cadu_size": 8192,
+                    "viterbi_ber_thresold": 0.300,
+                    "viterbi_outsync_after": 20,
+                    "derandomize": true,
+                    "rs_i": 4,
+                    "rs_dualbasis": false,
+                    "rs_type": "rs223",
+                    "rs_usecheck": true
+                }
+            },
+            "products": {
+                "meteor_msumr_lrpt": {
+                    "m2x_mode": true,
+                    "max_fill_lines": 50
+                }
+            }
+        }
+    },
+    "meteor_m2-4_lrpt_nrzl_nors": {
+        "name": "METEOR M2-4 LRPT 72k (NRZ-L, RS disabled)",
+        "live": true,
+        "live_cfg": [[1, 0], [2, 0]],
+        "frequencies": [["Primary", 137.1e6]],
+        "parameters": {
+            "samplerate": {"value": 1e6}
+        },
+        "work": {
+            "baseband": {},
+            "soft": {
+                "psk_demod": {
+                    "constellation": "oqpsk",
+                    "symbolrate": 72e3,
+                    "rrc_alpha": 0.5,
+                    "pll_bw": 0.002
+                }
+            },
+            "cadu": {
+                "ccsds_conv_concat_decoder": {
+                    "constellation": "oqpsk",
+                    "nrzm": false,
+                    "cadu_size": 8192,
+                    "viterbi_ber_thresold": 0.300,
+                    "viterbi_outsync_after": 20,
+                    "derandomize": true,
+                    "rs_i": 4,
+                    "rs_dualbasis": false,
+                    "rs_type": "rs223",
+                    "rs_usecheck": false
+                }
+            },
+            "products": {
+                "meteor_msumr_lrpt": {
+                    "m2x_mode": true,
+                    "max_fill_lines": 50
+                }
+            }
+        }
+    }
+}
