@@ -7,21 +7,26 @@ OS: Kali Linux, bare-metal. Full sudo. `bypassPermissions` mode enabled.
 ## Services
 
 ```bash
-systemctl --user status satellites-overhead.service   # web UI on :8723
-systemctl --user status sdr-scheduler.service         # SDR scheduler
-systemctl --user restart <service>
+# Scheduler runs directly (not via systemd):
+ps aux | grep sdr_scheduler         # find PID
+kill <PID> && python3 ~/src/satellites-overhead/scheduler/sdr_scheduler.py &
+
+# MCP server:
+ps aux | grep scheduler_mcp
+kill <PID> && python3 ~/src/satellites-overhead/scheduler_mcp.py &
+
+# Web UI on :8723:
+ps aux | grep serve.py
 ```
 
-Both are enabled and should always be running. The scheduler is authoritative
-for hardware. The web server and MCP enqueue work; they do not run HackRF or
-satdump directly.
+The scheduler is authoritative for hardware. The web server and MCP enqueue
+work; they do not run HackRF or satdump directly.
 
 ## File map
 
 | File | Purpose |
 |------|---------|
-| `~/sdr_scheduler.py` | Live scheduler (the real one) |
-| `scheduler/sdr_scheduler.py` | Repo backup — keep in sync with live |
+| `scheduler/sdr_scheduler.py` | Live scheduler (symlinked from `~/sdr_scheduler.py`) |
 | `~/sdr_scheduler_rules.json` | Recurring satellite rules |
 | `~/sdr_scheduler_commands.json` | One-shot queue (scan-now etc.) |
 | `~/sdr_scheduler_status.json` | Scheduler heartbeat + current job |
@@ -31,32 +36,90 @@ satdump directly.
 | `scheduler_mcp.py` | MCP server (sdr-scheduler) |
 | `monitor_capture.py` | Capture monitor/diagnostic script |
 | `predict.py` | Headless pass predictor (uses PyEphem) |
+| `satdump_pipelines/` | Custom satdump pipelines (copy to /usr/share/satdump/pipelines/) |
 
-After changing `scheduler/sdr_scheduler.py`, sync it:
-```bash
-cp scheduler/sdr_scheduler.py ~/sdr_scheduler.py
-systemctl --user restart sdr-scheduler.service
-```
+After changing `scheduler/sdr_scheduler.py`:
+- No copy needed — `~/sdr_scheduler.py` is a symlink to the repo file
+- Restart: `kill <PID> && python3 ~/src/satellites-overhead/scheduler/sdr_scheduler.py &`
+
+## CRITICAL: HackRF LO false-lock (discovered June 4 2026)
+
+**The HackRF LO leakage creates a DC spike at the tuned frequency in baseband.**
+Without `--dc_block`, the OQPSK PLL locks onto this spike instead of the
+satellite signal, producing fake "Viterbi SYNCED BER 0.000 Deframer NOSYNC"
+at ~27 dB SNR on EVERY capture regardless of pipeline or gains.
+
+**Every M2-4 capture before June 4 was a false lock.** The "confirmed working
+23 dB SNR" previously documented here was the LO spike, not a satellite signal.
+
+Fix: `--dc_block` is now passed to all satdump captures by default.
+With dc_block active, noise floor correctly shows SNR=0, Viterbi NOSYNC,
+BER≈0.41. A real satellite signal will appear as SNR > 0 above this floor.
 
 ## Current target: METEOR-M2 4 (NORAD 59051)
 
-LRPT status page (check before every session):
-`https://ub8qbd.satdump.org/wx_report_new.html`
+LRPT status: check `https://ub8qbd.satdump.org/wx_report_new.html` before acting.
+Last verified ON: June 3 2026. As of June 4 morning: **STATUS UNKNOWN** — two
+passes (03:59 26.6°, 05:39 38°) showed SNR=0 throughout with dc_block active.
+The signal may be absent (satellite transmitter off?) or genuinely too weak.
 
-As of June 3 2026:
-- **M2-4 LRPT ON at 137.1 MHz** ← the target
-- M2-3 LRPT OFF (beacon only 137.9 MHz)
+**No real M2-4 LRPT lock has ever been achieved on this setup.**
 
-Confirmed working gains (23 dB SNR, BER 0.000):
-- LNA=16, VGA=36, amp=1 for passes < 60° elevation
-- LNA=16, VGA=24, amp=1 for passes ≥ 60° elevation (auto-applied by scheduler)
+### Current pipeline config (as of June 4 2026)
 
-Pipeline: `meteor_m2-x_lrpt`
-Samplerate: `1e6` (pipeline expects 1 MSPS, not 2)
-IQ swap: `True` (HackRF I/Q orientation; `--iq_swap` flag required)
+```
+Frequency:  137.1 MHz
+Pipeline:   meteor_m2-4_lrpt_nrzl  (NRZ-L hypothesis — front-loaded)
+Samplerate: 1,000,000 (integer — satdump rejects "1e6" string)
+IQ swap:    True
+dc_block:   True  (REQUIRED — see above)
+LNA=16, VGA=36, amp=1 for passes < 60°
+LNA=16, VGA=24, amp=1 for passes ≥ 60° (auto-applied by scheduler)
+```
 
-The scheduler's `build_rule_jobs` applies VGA-12 automatically for ≥60° passes.
-The `satdump_capture()` function defaults to `samplerate="1e6"` and `iq_swap=True`.
+### LRPT_RETRY_VARIANTS order (by P(success))
+
+When Deframer NOSYNC at T+90s, monitor kills satdump and retries:
+1. `nrzl + iq_swap=True + dc_block=True`  ← initial capture uses this
+2. `nrzl + iq_swap=False + dc_block=True`
+3. `nrzl_nors + iq_swap=True + dc_block=True`  (RS disabled — diagnostic)
+4. `m2-x_lrpt + iq_swap=True + dc_block=True`  (NRZ-M, known NOSYNC)
+5. `m2-x_lrpt + iq_swap=False + dc_block=True`
+6. `m2-x_lrpt + iq_swap=True + dc_block=False`  (last resort — false-locks)
+
+Custom pipelines `meteor_m2-4_lrpt_nrzl` and `meteor_m2-4_lrpt_nrzl_nors`
+are in `/usr/share/satdump/pipelines/Meteor-M2-4-custom.json`.
+
+### What a real lock looks like (expected, not yet seen)
+
+```
+SNR > 5–15 dB (above 0.000 baseline)
+Viterbi: SYNCED  BER: 0.05–0.15 (not 0.000 — that's the false lock)
+Deframer: SYNCED
+CADU file growing (check with: wc -c <capdir>/*.cadu)
+```
+
+### Decision tree
+
+| Condition | Action |
+|-----------|--------|
+| SNR > 5, BER 0.05–0.15, Deframer SYNCED | Real lock — let it run |
+| SNR > 5, BER ≈ 0.000, Deframer NOSYNC | LO false-lock — add/check dc_block |
+| SNR = 0, BER ≈ 0.41–0.43 | Correct noise floor with dc_block — no signal yet |
+| SNR = 0 persists through max elevation | M2-4 not transmitting or wrong freq |
+| SNR > 5, Viterbi SYNCED, Deframer NOSYNC | Wrong pipeline — retry next variant |
+
+## ORBCOMM FM112 (NORAD 41184)
+
+Frequency: 137.663 MHz  
+Pipeline: `orbcomm_stx_auto_plotter`  
+Samplerate: 1e6, dc_block: **false** (signal at center freq — dc_block kills it)  
+VGA=24, LNA=16 (lower gain — strong terrestrial signal)
+
+No successful ORBCOMM decode yet. All previous passes had dc_block=True
+(inherited from LRPT defaults) — this was fixed June 4 2026.
+Output: `*.frm` file in capdir (not .cadu). Log shows only "Progress inf%"
+(normal for this pipeline — no per-frame SNR output).
 
 ## Queuing a capture
 
@@ -65,83 +128,28 @@ Via MCP (preferred):
 mcp: run_scheduler_rule_now(rule_id="sat-59051-meteor_lrpt_hackrf", confirm=True, duration_s=<N>)
 ```
 
-Via web endpoint:
+Via curl:
 ```bash
-curl -s http://localhost:8723/scheduler/status   # check state first
-# POST /scheduler/scan-now — see serve.py for payload shape
+curl -s http://localhost:8723/scheduler/status
+curl -s -X POST http://localhost:8723/scheduler/scan-now \
+  -H "Content-Type: application/json" \
+  -d '{"norad":59051,"frequency_hz":137100000,"duration_s":300,...}'
 ```
 
 **Do not run satdump or hackrf_transfer directly.** Always enqueue through the
 scheduler so the single-device lock is respected.
 
-## Monitoring a capture — DO THIS EVERY TIME
+## Monitoring a capture
 
-When you queue a capture, immediately schedule a monitoring check for T+90s
-using `ScheduleWakeup` (if the session will stay open) or `/schedule` (for
-unattended operation). The monitor:
-
-1. Reads the satdump log at `<capdir>.log`
-2. Checks SNR, Viterbi BER, and Deframer SYNC status
-3. Kills satdump and writes a diagnostic report if intervention is needed
-4. Writes `<capdir>/diagnostic_report.md` (shown in the web UI capture list)
-
-Run the monitor script directly:
 ```bash
 python3 monitor_capture.py ~/noaa_captures/<capdir>
+# exits 0=healthy, 1=intervened/problem, 2=log not ready
 ```
 
-Or call it inside your monitoring loop — it exits 0 if healthy, 1 if it
-intervened or found a problem, 2 if the log isn't there yet.
-
-### Decision tree
-
-| Condition | Action |
-|-----------|--------|
-| SNR > 10, BER < 0.05, Deframer SYNCED | Healthy — let it run, check at LOS |
-| SNR > 10, BER ≈ 0, Deframer NOSYNC | Kill, retry with different pipeline/flags (see below) |
-| SNR > 28, BER climbing | Saturated — kill, retry with amp=0 or VGA-12 |
-| SNR < 5 | Signal too weak — check frequency, antenna, gains |
-
-### NOSYNC troubleshooting order
-
-The persistent `Viterbi SYNCED + BER 0.000 + Deframer NOSYNC` issue has been
-seen on every M2-4 capture so far (~27 dB SNR, BER=0.000, no CCSDS lock).
-Root cause is OQPSK phase ambiguity or IQ swap. The scheduler auto-retries
-all 4 variants below via `LRPT_RETRY_VARIANTS` (monitor fires at T+90s):
-
-1. `--iq_swap --samplerate 1e6 --pipeline meteor_m2-x_lrpt`
-2. No `--iq_swap`, `--samplerate 1e6`
-3. `--iq_swap`, `--samplerate 2e6`
-4. No `--iq_swap`, pipeline `meteor_m2_lrpt` (older QPSK decoder)
-
-**Important:** Variant 1 (iq_swap=True, 1e6) was NEVER actually tried on any
-pass before June 3 — due to a retry_idx off-by-one bug that skipped variant[0]
-and started at variant[1]. Fixed June 3 2026. This means iq_swap=True+1e6 is
-still untested — it's the most likely fix. Watch the next M2-4 pass closely.
-
-Next M2-4 pass: **June 4 15:21 EDT, 42°**
-
-SatDump v1.2.3 is installed. The pre-1.0 Viterbi padding bug is not present.
-The CCSDS ASM (0x1ACFFC1D) repeats every frame — NOSYNC is not caused by
-joining mid-pass. It is a pipeline configuration issue.
-
-## Scheduler known bugs / quirks
-
-**Retry variant off-by-one (FIXED June 3 2026):** The monitor retry loop was
-using `int(kwargs.get("_retry_idx") or 0)` — when `_retry_idx` was None (initial
-rule job) or 0 (new scan-now), this yielded 0, so `next_idx = 1` and
-`LRPT_RETRY_VARIANTS[0]` (iq_swap=True, 1e6) was NEVER tried. Fixed by using
-`-1` as the sentinel for "no retry yet", so `next_idx = 0` picks variant[0].
-
-**Fire-time boundary bug (FIXED June 3 2026):** `job_fire_dt("HH:MM")` used to
-wrap to the next day if a poll landed at exactly `HH:MM:00.xxx`. Fixed with a
-90-second grace window. If a pass is missed, check whether the scheduler log
-shows `Next: <satellite> at HH:MM (in 0s)` followed by a jump to the next pass
-without a `Running:` line — that's the symptom.
-
-**Completed set is in-memory:** The scheduler's `completed` set is reset on
-restart. Restarting the scheduler will re-evaluate all jobs including ones that
-already fired this session. Avoid restarting unnecessarily during a pass window.
+Check `<capdir>.log` for SNR/Viterbi/Deframer lines (appear every 10s).
+Check `<capdir>/*.cadu` size for lock confirmation.
+PID of running satdump: `cat <capdir>.pid`
+Kill satdump: `kill $(cat <capdir>.pid)`
 
 ## Web endpoints
 
@@ -149,47 +157,23 @@ already fired this session. Avoid restarting unnecessarily during a pass window.
 GET  /scheduler/status          — scheduler heartbeat + queue count
 GET  /scheduler/rules           — list rules
 POST /scheduler/rules           — create/update rule
-DEL  /scheduler/rules/<id>      — delete rule
 POST /scheduler/scan-now        — enqueue immediate capture
 GET  /captures?norad=NNN        — capture history for a satellite
 GET  /captures/<id>/report      — diagnostic report (markdown)
-GET  /captures/<id>/download    — tar.gz of output directory or IQ file
-GET  /capture-settings?norad=N  — suggested frequency/gain from SatNOGS
 GET  /passes?...                — upcoming pass predictions
 GET  /api/v1                    — versioned API endpoint index
-GET  /api/v1/audit?limit=100    — recent rule/scan mutation audit records
 ```
-
-Existing paths remain supported. New remote/mobile clients should use
-`/api/v1/...`. Public website requests are authenticated by nginx Basic Auth.
-The `/api/v1` subtree uses revocable application bearer tokens from
-`~/sdr_api_tokens.json`; create/revoke them with `manage_api_tokens.py`.
-Mutations are appended to `~/sdr_web_audit.jsonl`, and scheduler/web lifecycle
-events are appended to `~/sdr_scheduler_events.jsonl`. See
-`MOBILE_API_HANDOFF.md`.
 
 ## Verification after code changes
 
 ```bash
-python3 -m py_compile serve.py scheduler_mcp.py scheduler/sdr_scheduler.py ~/sdr_scheduler.py monitor_capture.py
-
-node - <<'NODE'
-const fs = require('fs');
-const html = fs.readFileSync('index.html', 'utf8');
-for (const src of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(src[1]);
-console.log('inline scripts ok');
-NODE
-
+python3 -m py_compile serve.py scheduler_mcp.py scheduler/sdr_scheduler.py monitor_capture.py
 curl -fsS http://localhost:8723/scheduler/status
-curl -fsS 'http://localhost:8723/capture-settings?norad=59051'
-curl -fsS 'http://localhost:8723/captures?norad=59051'
 ```
 
 ## Rollback
 
-Each major change is committed. To undo: `git revert <commit>` or
-`git checkout <commit> -- <file>`. See `SDR_MANAGER_HANDOFF.md` for manual
-rollback instructions for the queue/status architecture.
-
-Do not commit `.tlecache/active.tle` — it is updated at runtime by CelesTrak
-fetches and is intentionally gitignored.
+```bash
+git log --oneline -10
+git revert <commit>
+```
