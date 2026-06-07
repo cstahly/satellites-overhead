@@ -6,7 +6,7 @@
     <application
         android:name=".SatellitesApp"
         android:label="Satellites Overhead"
-        android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
+        android:theme="@android:style/Theme.Material.NoActionBar"
         android:supportsRtl="true">
         <activity
             android:name=".MainActivity"

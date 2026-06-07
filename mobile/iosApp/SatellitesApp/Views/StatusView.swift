@@ -6,23 +6,55 @@ struct StatusView: View {
     @Binding var selectedTab: Int
     @State private var showScanSheet = false
     @State private var now = Date()
-    @State private var selectedOverheadSat: OverheadSat?
     private let ticker = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-    private let overheadTimer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     var nextPass: Pass? { app.passes.first }
+    var nextRun: UpcomingRun? { app.upcoming.first { $0.fireTime != nil } }
 
     var body: some View {
         NavigationStack {
             Group {
                 if let status = app.status {
                     List {
-                        // Sky plot
-                        Section {
-                            OverheadSkyPlot(sats: app.overhead, selected: $selectedOverheadSat)
-                                .aspectRatio(1, contentMode: .fit)
-                                .listRowInsets(EdgeInsets())
-                                .listRowBackground(Color.clear)
+                        Section("Summary") {
+                            HStack(spacing: 12) {
+                                SummaryPill(title: "Queue", value: "\(status.queueCount)", systemImage: "tray.full")
+                                SummaryPill(title: "Captures", value: "\(app.captures.count)", systemImage: "clock.arrow.circlepath")
+                            }
+                            if let run = nextRun {
+                                Button {
+                                    selectedTab = 1
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Label("Next Scheduled", systemImage: "calendar.badge.clock")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                            Spacer()
+                                            Text(countdownText(to: run.fireTime ?? ""))
+                                                .font(.caption.bold())
+                                                .foregroundStyle(.green)
+                                        }
+                                        Text(run.name ?? "Unknown target")
+                                            .font(.headline)
+                                        HStack {
+                                            if let maxEl = run.maxElevation {
+                                                Text(String(format: "%.1f° peak", maxEl.doubleValue))
+                                            }
+                                            if let dur = run.durationSeconds {
+                                                Text("\(dur.int32Value / 60)m \(dur.int32Value % 60)s")
+                                            }
+                                            if run.partial {
+                                                Text("partial")
+                                                    .foregroundStyle(.orange)
+                                            }
+                                        }
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
 
                         // Capture running / next pass
@@ -70,7 +102,21 @@ struct StatusView: View {
                             } else {
                                 // Idle — show next pass countdown
                                 Text(status.message).foregroundStyle(.secondary)
-                                if let p = nextPass {
+                                if let run = nextRun {
+                                    Button {
+                                        selectedTab = 1
+                                    } label: {
+                                        HStack {
+                                            Text(countdownText(to: run.fireTime ?? ""))
+                                                .font(.caption).foregroundStyle(.secondary)
+                                            Spacer()
+                                            Text(run.name ?? "Next scheduled").foregroundStyle(.primary)
+                                            Image(systemName: "chevron.right")
+                                                .font(.caption).foregroundStyle(Color(white: 0.4))
+                                        }
+                                    }
+                                    .buttonStyle(.plain)
+                                } else if let p = nextPass {
                                     Button {
                                         selectedTab = 1
                                     } label: {
@@ -95,10 +141,6 @@ struct StatusView: View {
                             }
                         }
                     }
-                    .sheet(item: $selectedOverheadSat) { sat in
-                        OverheadSatSheet(sat: sat)
-                            .presentationDetents([.fraction(0.35)])
-                    }
                 } else if app.isLoadingStatus {
                     ProgressView()
                 } else {
@@ -115,12 +157,8 @@ struct StatusView: View {
                     }
                 }
             }
-            .refreshable {
-                await app.refreshAll()
-                await app.refreshOverhead()
-            }
+            .refreshable { await app.refreshAll() }
             .onReceive(ticker) { now = $0 }
-            .onReceive(overheadTimer) { _ in Task { await app.refreshOverhead() } }
             .sheet(isPresented: $showScanSheet) {
                 ScanNowSheet().presentationDetents([.medium])
             }
@@ -148,6 +186,27 @@ struct StatusView: View {
         if h > 0 { return "in \(h)h \(m)m" }
         if m > 0 { return "in \(m)m \(s)s" }
         return "in \(s)s"
+    }
+}
+
+private struct SummaryPill: View {
+    let title: String
+    let value: String
+    let systemImage: String
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .foregroundStyle(.green)
+            Text(value)
+                .font(.headline)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color.green.opacity(0.08).cornerRadius(10))
     }
 }
 

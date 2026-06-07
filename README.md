@@ -1,8 +1,9 @@
 # Satellites Overhead
 
 Real-time satellite tracker, pass predictor, SDR capture scheduler, and MCP
-server for AI agents. Built for a single HackRF One + V-dipole setup receiving
-METEOR LRPT weather imagery, but the web UI and scheduler are hardware-agnostic.
+server for AI agents. Built around a single V-dipole + RTL-SDR v3 setup
+receiving METEOR LRPT weather imagery, but the web UI and scheduler support
+both RTL-SDR and HackRF One and are hardware-agnostic at the rule level.
 
 ---
 
@@ -16,6 +17,10 @@ METEOR LRPT weather imagery, but the web UI and scheduler are hardware-agnostic.
 | `scheduler_mcp.py` | Stdio MCP server exposing all scheduler/prediction tools to AI agents |
 | `scheduler/sdr_scheduler.py` | SDR pass scheduler (symlinked from `~/sdr_scheduler.py`) |
 | `monitor_capture.py` | Capture monitor: parses satdump logs, kills bad runs, writes diagnostic reports |
+| `sat_iq_summary.py` | Post-process raw IQ captures: FM demod, burst detection, Whisper transcription, Claude narrative |
+| `satdump_pass_summary.py` | Post-decode summary for satdump captures: reads log, extracts metrics, calls Claude |
+| `schedule_windows.py` | Utility: list upcoming pass windows across all enabled rules |
+| `sdr-cli/` | Rust CLI (`sdr`): dashboard showing current job, last capture, and upcoming passes |
 | `CLAUDE.md` | Full context file for AI agents working in this repo |
 | `systemd/` | Systemd user service unit files |
 | `.tlecache/` | TLE disk cache (auto-created, safe to delete) |
@@ -28,8 +33,11 @@ METEOR LRPT weather imagery, but the web UI and scheduler are hardware-agnostic.
 
 - Python 3.9+
 - `ephem` (PyEphem) — `pip install ephem` or your distro package
-- `satdump` — for LRPT image decoding (optional, scheduler only)
-- `hackrf_transfer` — HackRF IQ capture (optional, scheduler only)
+- `rtl-sdr` — `sudo apt install rtl-sdr` — provides `rtl_sdr` for IQ capture
+- `satdump` — for LRPT image decoding (offline decode pipeline)
+- `hackrf_transfer` — optional, HackRF IQ capture only
+- Rust toolchain — `curl https://sh.rustup.rs | sh` — for `sdr-cli`
+- `faster-whisper` — `pip install faster-whisper` — for `sat_iq_summary.py` voice transcription
 - Internet access — CelesTrak TLEs, SatNOGS DB
 
 ---
@@ -59,7 +67,15 @@ python3 -m venv .venv-mcp
 .venv-mcp/bin/pip install mcp ephem
 ```
 
-### 3. Symlink the live scheduler
+### 3. Build the `sdr` CLI
+
+```bash
+cd sdr-cli
+cargo build --release
+sudo cp target/release/sdr /usr/local/bin/sdr
+```
+
+### 4. Symlink the live scheduler
 
 The scheduler runs from `~/sdr_scheduler.py` so systemd can find it. Symlink
 it to the source-controlled copy so edits and git history stay in one place:
@@ -69,7 +85,7 @@ ln -sf /home/<user>/src/satellites-overhead/scheduler/sdr_scheduler.py \
        ~/sdr_scheduler.py
 ```
 
-### 4. Configure your location
+### 5. Configure your location
 
 Edit `scheduler/sdr_scheduler.py` and update:
 
@@ -81,7 +97,7 @@ ALT_M = 180    # meters above sea level
 
 These are also used by the MCP server via `predict.py`.
 
-### 5. Systemd user services
+### 6. Systemd user services
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -104,7 +120,7 @@ systemctl --user status satellites-overhead.service
 systemctl --user status sdr-scheduler.service
 ```
 
-### 6. MCP server registration (Codex / Claude Code)
+### 7. MCP server registration (Codex / Claude Code)
 
 Add to `~/.codex/config.toml`:
 
@@ -188,29 +204,32 @@ The scheduler (`scheduler/sdr_scheduler.py`) is a single Python process that:
 
 ```json
 {
-  "id": "sat-59051-meteor_lrpt_hackrf",
+  "id": "sat-59051-meteor_lrpt_rtlsdr",
   "enabled": true,
   "type": "satellite_recurring",
   "name": "METEOR-M2 4",
   "norad": 59051,
   "group": "radio",
   "frequency_hz": 137100000,
-  "profile": "meteor_lrpt_hackrf",
-  "lna_gain": 16,
+  "profile": "meteor_lrpt_rtlsdr",
+  "lna_gain": 40,
   "vga_gain": 36,
-  "amp": 1,
+  "amp": 0,
   "min_peak_el": 20,
   "start_offset_s": -30,
   "end_offset_s": 60,
-  "samplerate": "1e6",
+  "samplerate": "2e6",
   "iq_swap": true,
   "pipeline": "meteor_m2-x_lrpt"
 }
 ```
 
-`start_offset_s` is applied before AOS (negative = start early). `end_offset_s`
-is added after predicted LOS. For passes ≥ 60° elevation the scheduler
-automatically reduces VGA by 12 dB to avoid ADC saturation.
+Profiles ending in `_rtlsdr` use `rtl_sdr` for capture; `_hackrf` use
+`hackrf_transfer`. `lna_gain` is repurposed as the single RTL-SDR gain knob
+when using an RTL-SDR profile. `start_offset_s` is applied before AOS
+(negative = start early). `end_offset_s` is added after predicted LOS. For
+passes ≥ 60° elevation the scheduler automatically reduces VGA by 12 dB to
+avoid ADC saturation.
 
 ### Scan-now command queue
 
@@ -234,12 +253,79 @@ signal state:
 
 The retry sequence for LRPT NOSYNC (tries in order):
 
-1. `--iq_swap --samplerate 1e6` pipeline `meteor_m2-x_lrpt` (default)
-2. no `--iq_swap`, `--samplerate 1e6`
-3. `--iq_swap --samplerate 2e6`
-4. `--samplerate 1e6` pipeline `meteor_m2_lrpt` (older decoder)
+1. `--iq_swap --samplerate 2e6 --dc_block` pipeline `meteor_m2-x_lrpt` (default)
+2. no `--iq_swap`, `--samplerate 2e6 --dc_block`
+3. `--iq_swap --samplerate 1e6 --dc_block`
+4. `--samplerate 2e6 --dc_block` pipeline `meteor_m2_lrpt` (older decoder)
 
 Each capture produces a `<capdir>/diagnostic_report.md` viewable from the web UI.
+
+### Pass manager (Claude at AOS)
+
+For LRPT captures the scheduler spawns a Claude pass manager subprocess at AOS.
+The pass manager monitors satdump output in real time, classifies sync state,
+kills bad runs, injects retry variants, and writes a final pass report. The lock
+file `~/sdr_scheduler.lock` prevents the background monitoring thread from
+conflicting with a running pass manager.
+
+---
+
+## `sdr` CLI
+
+The `sdr` command (built from `sdr-cli/`) provides a quick terminal dashboard:
+
+```
+sdr              # NOW / LAST / next 10 upcoming passes
+sdr -c 20        # show 20 upcoming passes
+sdr passes       # upcoming passes only
+sdr rules        # list scheduler rules
+sdr status       # raw scheduler status JSON
+```
+
+**NOW** shows the running job (satellite, elevation, time remaining) or "idle".
+**LAST** shows the most recent completed capture (satellite, duration, size).
+Upcoming passes are sorted by AOS across all enabled rules in a 48-hour window.
+
+---
+
+## Pass post-processing
+
+### `sat_iq_summary.py` — FM/SSB IQ analysis
+
+Processes raw CU8 IQ captures from `raw_iq_rtlsdr` rules (SO-50, AO-73, linear
+transponder birds):
+
+```bash
+python3 sat_iq_summary.py <capdir.iq> [--force-summary]
+```
+
+1. FM demodulates the IQ file
+2. Detects activity bursts (10th-percentile noise floor, 3× threshold)
+3. Transcribes voice bursts with Whisper (CPU-only, `base.en` model)
+4. Calls Claude to produce a narrative pass summary
+
+Skips the Claude call if no bursts are detected (no activity = nothing to
+summarise). Use `--force-summary` to override.
+
+**Gain/noise reference:**
+
+| Bird type | Typical noise RMS | Notes |
+|-----------|-------------------|-------|
+| FM (no carrier) | ~6500 | AGC-normalized noise hash — correct, not a failure |
+| FM (carrier present) | ~200–400 | FM quieting when satellite is transmitting |
+| SSB/linear transponder | ~74 | Different demod path, different scale |
+
+### `satdump_pass_summary.py` — LRPT decode summary
+
+Generates a Claude narrative for a completed satdump decode:
+
+```bash
+python3 satdump_pass_summary.py <capdir>
+```
+
+Reads the satdump `.log` file, extracts Viterbi SNR, lock percentage, frame
+counts, and image file list, then calls Claude for a one-paragraph summary.
+Useful for automated post-pass reporting from the scheduler pipeline.
 
 ---
 
@@ -386,6 +472,9 @@ const html = fs.readFileSync('index.html', 'utf8');
 for (const src of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(src[1]);
 console.log('ok');
 NODE
+
+# Rebuild sdr CLI after Rust changes
+cd sdr-cli && cargo build --release && sudo cp target/release/sdr /usr/local/bin/sdr && cd ..
 
 # Restart services
 systemctl --user restart satellites-overhead.service sdr-scheduler.service

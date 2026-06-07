@@ -23,8 +23,12 @@ data class CurrentJob(
     val label: String,
     @SerialName("fire_time") val fireTime: String? = null,
     @SerialName("command_id") val commandId: String? = null,
+    @SerialName("queued_at") val queuedAt: String? = null,
     @SerialName("frequency_hz") val frequencyHz: Double? = null,
     @SerialName("duration_s") val durationSeconds: Int? = null,
+    val partial: Boolean = false,
+    @SerialName("original_fire_time") val originalFireTime: String? = null,
+    @SerialName("original_duration_s") val originalDurationSeconds: Int? = null,
     @SerialName("lna_gain") val lnaGain: Int? = null,
     @SerialName("vga_gain") val vgaGain: Int? = null,
     val amp: Int? = null,
@@ -75,6 +79,8 @@ data class Capture(
     @SerialName("size_bytes") val sizeBytes: Long? = null,
     @SerialName("cadu_bytes") val caduBytes: Long? = null,
     @SerialName("report_path") val reportPath: String? = null,
+    val success: Boolean? = null,
+    val error: String? = null,
 )
 
 @Serializable
@@ -87,6 +93,7 @@ data class Rule(
     val group: String? = null,
     @SerialName("frequency_hz") val frequencyHz: Double? = null,
     val profile: String? = null,
+    val priority: Double? = null,
     @SerialName("min_peak_el") val minPeakElevation: Double? = null,
     @SerialName("start_offset_s") val startOffsetSeconds: Int? = null,
     @SerialName("end_offset_s") val endOffsetSeconds: Int? = null,
@@ -102,8 +109,39 @@ data class SdrEvent(
     val id: String,
     val type: String,
     val source: String? = null,
-    @SerialName("ts") val timestamp: String,
+    @SerialName("at") val timestamp: String,
     val data: JsonObject? = null,
+)
+
+@Serializable
+data class UpcomingRun(
+    @SerialName("rule_id") val ruleId: String? = null,
+    val name: String? = null,
+    val norad: Int? = null,
+    val priority: Double = 0.0,
+    @SerialName("fire_time") val fireTime: String? = null,
+    @SerialName("end_time") val endTime: String? = null,
+    val aos: String? = null,
+    val los: String? = null,
+    @SerialName("max_el") val maxElevation: Double? = null,
+    @SerialName("duration_s") val durationSeconds: Int? = null,
+    @SerialName("vga_gain") val vgaGain: Int? = null,
+    @SerialName("prediction_error") val predictionError: String? = null,
+    val partial: Boolean = false,
+    @SerialName("partial_part") val partialPart: Int? = null,
+    @SerialName("partial_parts") val partialParts: Int? = null,
+    @SerialName("original_fire_time") val originalFireTime: String? = null,
+    @SerialName("original_end_time") val originalEndTime: String? = null,
+    @SerialName("original_duration_s") val originalDurationSeconds: Int? = null,
+)
+
+@Serializable
+data class SchedulerLogs(
+    @SerialName("scheduler_log_path") val schedulerLogPath: String,
+    @SerialName("satdump_log_path") val satdumpLogPath: String? = null,
+    @SerialName("scheduler_tail") val schedulerTail: List<String> = emptyList(),
+    @SerialName("satdump_tail") val satdumpTail: List<String> = emptyList(),
+    @SerialName("signal_tail") val signalTail: List<String> = emptyList(),
 )
 
 @Serializable

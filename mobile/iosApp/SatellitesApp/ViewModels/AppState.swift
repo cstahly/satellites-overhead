@@ -13,13 +13,18 @@ final class AppState: ObservableObject {
     @Published var rules: [Rule] = []
     @Published var overhead: [OverheadSat] = []
     @Published var events: [SdrEvent] = []
+    @Published var upcoming: [UpcomingRun] = []
+    @Published var logs: SchedulerLogs?
     @Published var statusError: String?
     @Published var passesError: String?
     @Published var capturesError: String?
     @Published var rulesError: String?
     @Published var eventsError: String?
+    @Published var upcomingError: String?
+    @Published var logsError: String?
     @Published var isLoadingStatus = false
     @Published var isLoadingPasses = false
+    @Published var isLoadingLogs = false
     @Published var scanResult: String?
 
     private(set) var api: SatellitesApi
@@ -52,17 +57,30 @@ final class AppState: ObservableObject {
         let lat = UserDefaults.standard.double(forKey: "latitude").nonZero ?? defaultLat
         let lon = UserDefaults.standard.double(forKey: "longitude").nonZero ?? defaultLon
         let alt = UserDefaults.standard.double(forKey: "altitude_m").nonZero ?? defaultAlt
-        // All-sats prediction is too slow; use rule norads
-        let ruleNorads = rules.isEmpty ? [59051] : Array(Set(rules.map { $0.norad }))
+        let norads: [Int32] = rules.map { $0.norad }
+        guard !norads.isEmpty else {
+            passes = []
+            passesError = "No rules configured."
+            isLoadingPasses = false
+            return
+        }
         var all: [Pass] = []
-        for norad in ruleNorads {
-            if let result = try? await api.getPasses(norad: Int32(norad), hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt) {
-                all += result as? [Pass] ?? []
+        for norad in norads {
+            if let result = try? await api.getPasses(norad: norad, hours: hours, minEl: 10.0, lat: lat, lon: lon, altM: alt) {
+                all += result
             }
         }
-        passes = all.sorted { $0.aos < $1.aos }
-        passesError = all.isEmpty ? (rules.isEmpty ? "No rules configured." : nil) : nil
+        passes = Array(all.sorted { $0.aos < $1.aos }.prefix(20))
+        passesError = nil
         isLoadingPasses = false
+    }
+
+    func refreshUpcoming(hours: Int32 = 24) async {
+        do {
+            let result = try await api.getUpcoming(hours: hours, limitPerRule: 4)
+            upcoming = result as? [UpcomingRun] ?? []
+            upcomingError = nil
+        } catch { upcomingError = error.localizedDescription }
     }
 
     func refreshOverhead() async {
@@ -119,15 +137,29 @@ final class AppState: ObservableObject {
         } catch { eventsError = error.localizedDescription }
     }
 
+    func refreshLogs(tail: Int32 = 80) async {
+        isLoadingLogs = true
+        do {
+            logs = try await api.getLogs(tail: tail)
+            logsError = nil
+        } catch { logsError = error.localizedDescription }
+        isLoadingLogs = false
+    }
+
+    func captureReport(for captureId: String) async throws -> String {
+        try await api.getCaptureReport(captureId: captureId)
+    }
+
     func refreshAll() async {
         // Rules must load before passes (passes uses rule norads)
         await refreshRules()
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.refreshStatus() }
             group.addTask { await self.refreshPasses() }
+            group.addTask { await self.refreshUpcoming() }
             group.addTask { await self.refreshCaptures() }
             group.addTask { await self.refreshEvents() }
-            group.addTask { await self.refreshOverhead() }
+            group.addTask { await self.refreshLogs() }
         }
     }
 }

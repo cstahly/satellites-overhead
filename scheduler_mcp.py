@@ -145,7 +145,13 @@ def validate_rule(rule: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("rule.vga_gain must be between 0 and 62")
     if amp not in {0, 1}:
         raise ValueError("rule.amp must be 0 or 1")
-    return {
+    known_keys = {
+        "id", "enabled", "type", "name", "norad", "group", "frequency_hz",
+        "profile", "lna_gain", "vga_gain", "amp", "min_peak_el",
+        "start_offset_s", "end_offset_s", "created_at", "updated_at",
+    }
+    extra = {k: v for k, v in rule.items() if k not in known_keys}
+    validated = {
         "id": rule_id,
         "enabled": bool(rule.get("enabled", True)),
         "type": "satellite_recurring",
@@ -163,6 +169,8 @@ def validate_rule(rule: dict[str, Any]) -> dict[str, Any]:
         "created_at": str(rule.get("created_at") or ""),
         "updated_at": str(rule.get("updated_at") or ""),
     }
+    validated.update(extra)
+    return validated
 
 
 def upsert_rule(rule: dict[str, Any]) -> dict[str, Any]:

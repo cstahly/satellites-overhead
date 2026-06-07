@@ -59,9 +59,18 @@ BER≈0.41. A real satellite signal will appear as SNR > 0 above this floor.
 ## Current target: METEOR-M2 4 (NORAD 59051)
 
 LRPT status: check `https://ub8qbd.satdump.org/wx_report_new.html` before acting.
-Last verified ON: June 3 2026. As of June 4 morning: **STATUS UNKNOWN** — two
-passes (03:59 26.6°, 05:39 38°) showed SNR=0 throughout with dc_block active.
-The signal may be absent (satellite transmitter off?) or genuinely too weak.
+Note: community status page was last updated January 6 2026 — **treat as stale**.
+
+Last verified ON: June 3 2026. As of June 5 morning: **LIKELY OFF** — three
+consecutive zero-SNR passes with dc_block active:
+- June 4 03:59 26.6° pass: SNR=0 throughout
+- June 4 05:39 38° pass: SNR=0 throughout
+- June 5 05:17 59.4° pass: SNR=0 throughout (best geometry yet — still nothing)
+
+The June 5 pass was a high-elevation 59.4° pass with correct configuration.
+SNR=0/BER≈0.41 is the correct noise floor — the signal is absent, not misconfigured.
+The transmitter is most likely off. Note: pass manager failed to spawn for June 5
+pass (retry variants not cycled), but SNR=0 means no variant would have helped.
 
 **No real M2-4 LRPT lock has ever been achieved on this setup.**
 
@@ -177,3 +186,41 @@ curl -fsS http://localhost:8723/scheduler/status
 git log --oneline -10
 git revert <commit>
 ```
+
+## Mobile app (KMP — iOS + Android)
+
+Shared KMP library: `mobile/shared/` — models in `Models.kt`, API in `SatellitesApi.kt`.
+Android UI: `mobile/androidApp/src/main/kotlin/com/sdr/satellites/android/`
+iOS UI: `mobile/iosApp/SatellitesApp/`
+
+**iOS and Android must be kept at feature parity.** Adding a feature to one requires the same on the other.
+
+### Token rule
+- Raw token lives ONLY on Linux at `~/sdr_mobile_bootstrap_token.json`. Never commit it.
+- Android default patch: `SatellitesApp.kt` — `settings.getString(KEY_BEARER_TOKEN, "<token>")`
+- iOS default patch: `AppState.swift` — `string(forKey: "bearer_token") ?? "<token>"` (both `init` and `rebuildApi`)
+- Patch the Mac build copy only. Linux source intentionally has empty string defaults.
+
+### Build (Mac only — Linux has no ANDROID_HOME)
+```bash
+# On MacBook-Pro-3.local, Mac repo at /Volumes/vela/src/satellites-overhead/mobile
+export JAVA_HOME=$(/usr/libexec/java_home -v 21)
+export ANDROID_HOME=$HOME/Library/Android/sdk
+./gradlew --no-daemon -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8" :androidApp:assembleDebug
+```
+
+### Sync workflow
+```bash
+# From Linux: sync changed files to Mac, then build
+rsync -av mobile/androidApp/src/.../ui/   MacBook-Pro-3.local:/Volumes/vela/.../ui/
+rsync -av mobile/androidApp/src/.../viewmodel/  MacBook-Pro-3.local:/Volumes/vela/.../viewmodel/
+rsync -av mobile/iosApp/SatellitesApp/Views/    MacBook-Pro-3.local:/Volumes/vela/.../Views/
+rsync -av mobile/iosApp/SatellitesApp/ViewModels/ MacBook-Pro-3.local:/Volumes/vela/.../ViewModels/
+# Patching AppState.swift from Linux OVERWRITES the iOS token — re-patch after every sync
+```
+
+### Current mobile state (as of June 5 2026)
+- Passes show all rule satellites (capped at 20), not just M2-4
+- Android: Status, Passes+detail, Rules, Captures+detail, Events/Diag, Overhead (on-demand), Settings
+- iOS: same screens; overhead removed from StatusView (now on-demand only)
+- APK: `mobile/androidApp/build/outputs/apk/debug/androidApp-debug.apk` (SHA256 d4d4643f...)

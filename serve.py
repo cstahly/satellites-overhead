@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
 from predict import overhead_now, parse_start, parse_tles, predict_passes, select_tles
+from schedule_windows import priority_score, trim_overlapping_windows
 from sdr_runtime import (
     authenticate_api_token,
     create_api_token,
@@ -45,6 +46,7 @@ COMMANDS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_commands.js
 STATUS_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler_status.json")
 HISTORY_PATH = os.path.join(os.path.expanduser("~"), "sdr_capture_history.json")
 AUDIT_PATH = os.path.join(os.path.expanduser("~"), "sdr_web_audit.jsonl")
+SCHEDULER_LOG_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler.log")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 TX_TTL = 7 * 24 * 3600
 API_VERSION = "v1"
@@ -57,6 +59,7 @@ RADIO_NAME_TERMS = (
     "AO-", "SO-", "FO-", "IO-", "RS-", "CAS-", "XW-", "TEVEL", "LILACSAT",
     "SKYTERRA", "INMARSAT", "IRIDIUM", "GLOBALSTAR", "ORBCOMM",
 )
+AMATEUR_DESIGNATOR_TERMS = {"AO-", "SO-", "FO-", "IO-", "RS-", "CAS-", "XW-"}
 BAND_RANGES = {
     "vdipole": {
         "label": "V-dipole VHF",
@@ -185,6 +188,7 @@ def api_path(path):
         "/api/v1/rules": "/scheduler/rules",
         "/api/v1/scans": "/scheduler/scan-now",
         "/api/v1/upcoming": "/scheduler/upcoming",
+        "/api/v1/logs": "/scheduler/logs",
         "/api/v1/captures": "/captures",
         "/api/v1/passes": "/passes",
         "/api/v1/capture-settings": "/capture-settings",
@@ -296,6 +300,7 @@ def upcoming_scheduler_runs(hours=24, limit_per_rule=4):
                     "rule_id": rule["id"],
                     "name": rule.get("name", p["name"]),
                     "norad": rule["norad"],
+                    "priority": float(rule.get("priority", 0) or 0),
                     "fire_time": fire.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "aos": p["aos"],
@@ -313,8 +318,41 @@ def upcoming_scheduler_runs(hours=24, limit_per_rule=4):
                 "prediction_error": str(e),
             })
 
+    schedulable = [r for r in results if r.get("fire_time") and r.get("end_time")]
+    unscheduled = [r for r in results if r not in schedulable]
+    selected, _ = trim_overlapping_windows(
+        schedulable,
+        start_fn=lambda r: datetime.fromisoformat(r["fire_time"].replace("Z", "+00:00")),
+        end_fn=lambda r: datetime.fromisoformat(r["end_time"].replace("Z", "+00:00")),
+        score_fn=lambda r: priority_score(r.get("priority", 0), r.get("max_el", 0), r.get("duration_s", 0)),
+        trim_fn=trim_upcoming_run_to_window,
+        min_duration_s=60,
+    )
+    results = selected + unscheduled
     results.sort(key=lambda r: r.get("fire_time", "9999"))
     return results
+
+
+def iso_utc(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def trim_upcoming_run_to_window(run, start, end, part_index, part_count):
+    original_start = datetime.fromisoformat(run["fire_time"].replace("Z", "+00:00"))
+    original_end = datetime.fromisoformat(run["end_time"].replace("Z", "+00:00"))
+    if start == original_start and end == original_end:
+        return run
+    next_run = dict(run)
+    next_run["fire_time"] = iso_utc(start)
+    next_run["end_time"] = iso_utc(end)
+    next_run["duration_s"] = max(1, int((end - start).total_seconds()))
+    next_run["partial"] = True
+    next_run["partial_part"] = part_index
+    next_run["partial_parts"] = part_count
+    next_run["original_fire_time"] = iso_utc(original_start)
+    next_run["original_end_time"] = iso_utc(original_end)
+    next_run["original_duration_s"] = run.get("duration_s")
+    return next_run
 
 
 def read_rules():
@@ -387,6 +425,35 @@ def scheduler_status():
     }
 
 
+def tail_text_file(path, limit=80):
+    limit = max(1, min(int(limit), 500))
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [line.rstrip("\n") for line in f.readlines()[-limit:]]
+
+
+def scheduler_logs(limit=80):
+    status = scheduler_status()
+    job = status.get("current_job") if isinstance(status.get("current_job"), dict) else {}
+    output = job.get("output") if isinstance(job, dict) else None
+    satdump_log_path = None
+    if output:
+        candidate = safe_output_path(str(output) + ".log")
+        if candidate:
+            satdump_log_path = candidate
+    satdump_tail = tail_text_file(satdump_log_path, limit) if satdump_log_path else []
+    signal_terms = ("SNR", "Viterbi", "Deframer", "SYNCED", "NOSYNC", "Timeout")
+    signal_tail = [line for line in satdump_tail if any(term in line for term in signal_terms)]
+    return {
+        "scheduler_log_path": SCHEDULER_LOG_PATH,
+        "satdump_log_path": satdump_log_path,
+        "scheduler_tail": tail_text_file(SCHEDULER_LOG_PATH, limit),
+        "satdump_tail": satdump_tail,
+        "signal_tail": signal_tail[-limit:],
+    }
+
+
 def read_captures(norad=None):
     if not os.path.exists(HISTORY_PATH):
         return []
@@ -432,6 +499,7 @@ def validate_rule(rule):
     min_el = float(rule.get("min_peak_el", 10))
     if min_el < 0 or min_el > 90:
         raise ValueError("rule.min_peak_el must be between 0 and 90")
+    priority = float(rule.get("priority", 0) or 0)
     profile = str(rule.get("profile", "raw_iq_hackrf"))
     if profile not in {"meteor_lrpt_hackrf", "raw_iq_hackrf", "satdump_hackrf"}:
         raise ValueError("unsupported rule.profile")
@@ -457,23 +525,40 @@ def validate_rule(rule):
         "vga_gain": vga_gain,
         "amp": amp,
         "min_peak_el": min_el,
+        "priority": priority,
         "start_offset_s": int(rule.get("start_offset_s", -30)),
         "end_offset_s": int(rule.get("end_offset_s", 60)),
         "pipeline": str(rule.get("pipeline") or ""),
         "samplerate": str(rule.get("samplerate") or ""),
         "iq_swap": bool(rule.get("iq_swap", False)),
+        "dc_block": bool(rule.get("dc_block", True)),
         "created_at": str(rule.get("created_at") or ""),
         "updated_at": str(rule.get("updated_at") or ""),
     }
     return clean
 
 
+def radio_name_matches(name):
+    name = name.upper()
+    for term in RADIO_NAME_TERMS:
+        if term not in AMATEUR_DESIGNATOR_TERMS:
+            if term in name:
+                return True
+            continue
+
+        idx = name.find(term)
+        while idx != -1:
+            if idx == 0 or not name[idx - 1].isalnum():
+                return True
+            idx = name.find(term, idx + 1)
+    return False
+
+
 def filter_radio_tles(text):
     out = []
     tles = parse_tles(text)
     for tle in tles:
-        name = tle.name.upper()
-        if any(term in name for term in RADIO_NAME_TERMS):
+        if radio_name_matches(tle.name):
             out.extend([tle.name, tle.line1, tle.line2])
     return "\n".join(out) + ("\n" if out else "")
 
@@ -670,6 +755,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "scans": "/api/v1/scans",
                 "upcoming": "/api/v1/upcoming",
                 "captures": "/api/v1/captures",
+                "logs": "/api/v1/logs",
                 "passes": "/api/v1/passes",
                 "capture_settings": "/api/v1/capture-settings",
                 "transmitters": "/api/v1/transmitters",
@@ -884,6 +970,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(500, f"could not compute upcoming runs: {e}")
                 return
             write_json(self, 200, results)
+            return
+        if path == "/scheduler/logs":
+            qs = parse_qs(parsed.query)
+            try:
+                limit = int(first_value(qs, "tail", "80"))
+                write_json(self, 200, scheduler_logs(limit))
+            except ValueError as e:
+                self.send_error(400, str(e))
+            except Exception as e:
+                self.send_error(500, f"could not read scheduler logs: {e}")
             return
         if path == "/captures":
             qs = parse_qs(parsed.query)

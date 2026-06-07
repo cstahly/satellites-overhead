@@ -8,8 +8,11 @@ import com.sdr.satellites.model.Rule
 import com.sdr.satellites.model.ScanNowRequest
 import com.sdr.satellites.model.SdrEvent
 import com.sdr.satellites.model.SchedulerStatus
+import com.sdr.satellites.model.SchedulerLogs
+import com.sdr.satellites.model.UpcomingRun
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
+import io.ktor.client.statement.bodyAsText
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.logging.LogLevel
@@ -54,6 +57,14 @@ class SatellitesApi(private val baseUrl: String, token: String) {
     suspend fun getRules(): List<Rule> =
         client.get("$baseUrl/api/v1/rules") {
             header("Authorization", authHeader)
+        }.body()
+
+    @Throws(Exception::class)
+    suspend fun getUpcoming(hours: Int = 24, limitPerRule: Int = 4): List<UpcomingRun> =
+        client.get("$baseUrl/api/v1/upcoming") {
+            header("Authorization", authHeader)
+            parameter("hours", hours)
+            parameter("limit_per_rule", limitPerRule)
         }.body()
 
     @Throws(Exception::class)
@@ -106,6 +117,19 @@ class SatellitesApi(private val baseUrl: String, token: String) {
             after?.let { parameter("after", it) }
             parameter("limit", limit)
         }.body()
+
+    @Throws(Exception::class)
+    suspend fun getLogs(tail: Int = 80): SchedulerLogs =
+        client.get("$baseUrl/api/v1/logs") {
+            header("Authorization", authHeader)
+            parameter("tail", tail)
+        }.body()
+
+    @Throws(Exception::class)
+    suspend fun getCaptureReport(captureId: String): String =
+        client.get("$baseUrl/api/v1/captures/$captureId/report") {
+            header("Authorization", authHeader)
+        }.bodyAsText()
 
     @Throws(Exception::class)
     suspend fun triggerScanNow(request: ScanNowRequest) {

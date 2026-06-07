@@ -50,6 +50,7 @@ class ApiPathTests(unittest.TestCase):
         self.assertEqual(serve.api_path("/api/v1/rules/example"), "/scheduler/rules/example")
         self.assertEqual(serve.api_path("/api/v1/scans"), "/scheduler/scan-now")
         self.assertEqual(serve.api_path("/api/v1/captures/example/report"), "/captures/example/report")
+        self.assertEqual(serve.api_path("/api/v1/logs"), "/scheduler/logs")
         self.assertEqual(serve.api_path("/api/v1/satellite"), "/satellite")
 
     def test_legacy_paths_are_unchanged(self):
@@ -93,6 +94,13 @@ class ApiPathTests(unittest.TestCase):
         authenticate.assert_not_called()
 
 
+class RadioFilterTests(unittest.TestCase):
+    def test_amateur_designator_requires_boundary(self):
+        self.assertTrue(serve.radio_name_matches("SAUDISAT 1C (SO-50)"))
+        self.assertTrue(serve.radio_name_matches("FUNCUBE-1 (AO-73)"))
+        self.assertFalse(serve.radio_name_matches("BEIDOU-3 IGSO-1"))
+
+
 class AuditTests(unittest.TestCase):
     def test_append_and_read_audit(self):
         old_path = serve.AUDIT_PATH
@@ -109,6 +117,44 @@ class AuditTests(unittest.TestCase):
                     json.loads(f.readline())
         finally:
             serve.AUDIT_PATH = old_path
+
+
+class SchedulerLogsTests(unittest.TestCase):
+    def test_scheduler_logs_tails_scheduler_and_current_satdump_log(self):
+        old_status = serve.STATUS_PATH
+        old_commands = serve.COMMANDS_PATH
+        old_scheduler_log = serve.SCHEDULER_LOG_PATH
+        try:
+            with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as tmp:
+                output = os.path.join(tmp, "capture")
+                satdump_log = output + ".log"
+                serve.STATUS_PATH = os.path.join(tmp, "status.json")
+                serve.COMMANDS_PATH = os.path.join(tmp, "commands.json")
+                serve.SCHEDULER_LOG_PATH = os.path.join(tmp, "scheduler.log")
+                with open(serve.STATUS_PATH, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "live": True,
+                        "updated_at": "2026-06-05T01:00:00Z",
+                        "current_job": {"output": output},
+                    }, f)
+                with open(serve.COMMANDS_PATH, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+                with open(serve.SCHEDULER_LOG_PATH, "w", encoding="utf-8") as f:
+                    f.write("scheduler one\nscheduler two\nscheduler three\n")
+                with open(satdump_log, "w", encoding="utf-8") as f:
+                    f.write("start\nSNR 12\nSYNCED\n")
+
+                logs = serve.scheduler_logs(limit=2)
+
+                self.assertEqual(logs["scheduler_log_path"], serve.SCHEDULER_LOG_PATH)
+                self.assertEqual(logs["satdump_log_path"], satdump_log)
+                self.assertEqual(logs["scheduler_tail"], ["scheduler two", "scheduler three"])
+                self.assertEqual(logs["satdump_tail"], ["SNR 12", "SYNCED"])
+                self.assertEqual(logs["signal_tail"], ["SNR 12", "SYNCED"])
+        finally:
+            serve.STATUS_PATH = old_status
+            serve.COMMANDS_PATH = old_commands
+            serve.SCHEDULER_LOG_PATH = old_scheduler_log
 
 
 class UpcomingRunsTests(unittest.TestCase):
@@ -129,13 +175,22 @@ class UpcomingRunsTests(unittest.TestCase):
             {"id": "one", "type": "satellite_recurring", "norad": 1, "group": "radio"},
             {"id": "two", "type": "satellite_recurring", "norad": 2, "group": "radio"},
         ]
-        predict_passes.return_value = [{
-            "name": "test",
-            "aos": "2026-06-04T01:00:00Z",
-            "los": "2026-06-04T01:10:00Z",
-            "max_el": 20,
-            "duration_s": 600,
-        }]
+        predict_passes.side_effect = [
+            [{
+                "name": "test one",
+                "aos": "2026-06-04T01:00:00Z",
+                "los": "2026-06-04T01:10:00Z",
+                "max_el": 20,
+                "duration_s": 600,
+            }],
+            [{
+                "name": "test two",
+                "aos": "2026-06-04T02:00:00Z",
+                "los": "2026-06-04T02:10:00Z",
+                "max_el": 30,
+                "duration_s": 600,
+            }],
+        ]
 
         runs = serve.upcoming_scheduler_runs(hours=12, limit_per_rule=1)
 
@@ -160,6 +215,49 @@ class UpcomingRunsTests(unittest.TestCase):
             "norad": 1,
             "prediction_error": "TLE unavailable",
         }])
+
+    @mock.patch("serve.select_tles", return_value=["selected TLE"])
+    @mock.patch("serve.predict_passes")
+    @mock.patch("serve.fetch_tle", return_value=("TLE data", "test"))
+    @mock.patch("serve.parse_tles", return_value=["parsed TLE"])
+    @mock.patch("serve.read_rules")
+    def test_overlapping_upcoming_runs_trim_lower_priority_pass(
+        self,
+        read_rules,
+        parse_tles,
+        fetch_tle,
+        predict_passes,
+        select_tles,
+    ):
+        read_rules.return_value = [
+            {"id": "low", "name": "Low", "type": "satellite_recurring", "norad": 1, "group": "radio"},
+            {"id": "high", "name": "High", "type": "satellite_recurring", "norad": 2, "group": "radio"},
+        ]
+        predict_passes.side_effect = [
+            [{
+                "name": "low",
+                "aos": "2026-06-04T01:00:00Z",
+                "los": "2026-06-04T01:10:00Z",
+                "max_el": 20,
+                "duration_s": 600,
+            }],
+            [{
+                "name": "high",
+                "aos": "2026-06-04T01:05:00Z",
+                "los": "2026-06-04T01:15:00Z",
+                "max_el": 70,
+                "duration_s": 600,
+            }],
+        ]
+
+        runs = serve.upcoming_scheduler_runs(hours=12, limit_per_rule=1)
+
+        self.assertEqual([run["rule_id"] for run in runs], ["low", "high"])
+        self.assertTrue(runs[0]["partial"])
+        self.assertEqual(runs[0]["fire_time"], "2026-06-04T00:59:30Z")
+        self.assertEqual(runs[0]["end_time"], "2026-06-04T01:04:30Z")
+        self.assertEqual(runs[0]["duration_s"], 300)
+        self.assertEqual(runs[1].get("partial"), None)
 
 
 if __name__ == "__main__":

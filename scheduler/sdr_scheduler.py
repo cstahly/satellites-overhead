@@ -23,10 +23,12 @@ ALT_M = 180
 RELOAD_INTERVAL_S = 60
 POLL_INTERVAL_S = 10
 MONITOR_DELAY_S = 90
+MIN_PARTIAL_CAPTURE_S = 60
 
 if REPO_DIR not in sys.path:
     sys.path.insert(0, REPO_DIR)
 
+from schedule_windows import priority_score, trim_overlapping_windows
 from sdr_runtime import emit_event
 
 # Retry variants ordered by P(success). First entry is the initial capture default.
@@ -68,6 +70,98 @@ def seconds_until(timestr):
         target += datetime.timedelta(days=1)
     return (target - now).total_seconds()
 
+RTL_SDR_LOCK = os.path.join(HOME, ".rtlsdr.lock")
+
+def _rtlsdr_usb_reset():
+    """Find RTL-SDR in /sys and trigger a USB port reset. Returns True if reset attempted."""
+    try:
+        import glob
+        # RTL2832U vendor/product IDs
+        for vid_pid in ("0bda:2838", "0bda:2832", "0bda:2837"):
+            vid, pid = vid_pid.split(":")
+            matches = glob.glob(f"/sys/bus/usb/devices/*/idVendor")
+            for vpath in matches:
+                base = os.path.dirname(vpath)
+                try:
+                    v = open(vpath).read().strip()
+                    p = open(os.path.join(base, "idProduct")).read().strip()
+                    if v == vid and p == pid:
+                        auth = os.path.join(base, "authorized")
+                        open(auth, "w").write("0")
+                        time.sleep(0.5)
+                        open(auth, "w").write("1")
+                        time.sleep(2)
+                        log(f"RTL-SDR USB reset triggered at {base}")
+                        return True
+                except Exception:
+                    continue
+        log("RTL-SDR USB reset: device not found in /sys")
+        return False
+    except Exception as e:
+        log(f"RTL-SDR USB reset failed: {e}")
+        return False
+
+
+def rtl_sdr_capture(freq_hz, outfile, duration_s, gain=40, label=""):
+    logfile = outfile + ".log"
+    log(f"START {label} — rtl_sdr {freq_hz/1e6:.3f} MHz gain={gain} → {outfile} (tail -f {logfile})")
+    cmd = ["rtl_sdr", "-f", str(freq_hz), "-s", "2000000", "-g", str(gain), outfile]
+
+    # Kill any orphaned rtl_sdr processes that may still hold the USB interface
+    r = subprocess.run(["pgrep", "-x", "rtl_sdr"], capture_output=True, text=True)
+    for pid_s in r.stdout.split():
+        try:
+            os.kill(int(pid_s), 9)
+            log(f"Killed orphaned rtl_sdr PID {pid_s}")
+            time.sleep(0.5)
+        except ProcessLookupError:
+            pass
+
+    # Acquire per-process lock so concurrent scheduler instances can't both open the device
+    try:
+        lock_fd = open(RTL_SDR_LOCK, "w")
+        import fcntl
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        log(f"SKIP  {label} — RTL-SDR lock held by another process")
+        return None
+
+    try:
+        for attempt in range(2):
+            with open(logfile, "w" if attempt == 0 else "a") as lf:
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf)
+            time.sleep(1.5)
+            if proc.poll() is not None:
+                # Process already exited — check for USB claim error
+                err = open(logfile).read() if os.path.exists(logfile) else ""
+                if "usb_claim_interface" in err or "No supported devices" in err or "Failed to open" in err:
+                    if attempt == 0:
+                        log(f"RTL-SDR claim failed — attempting USB reset (attempt {attempt+1})")
+                        _rtlsdr_usb_reset()
+                        continue
+                log(f"FAIL  {label} — rtl_sdr exited early (see {logfile})")
+                return None
+            try:
+                proc.wait(timeout=duration_s)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                proc.wait(timeout=5)
+            break
+        size = os.path.getsize(outfile) if os.path.exists(outfile) else 0
+        log(f"DONE  {label} — {size/1e6:.0f} MB captured")
+        return outfile if size > 0 else None
+    except Exception as e:
+        log(f"FAIL  {label} — {e}")
+        return None
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
+
+
 def hackrf_capture(freq_hz, outfile, duration_s, lna=32, vga=40, amp=1, label=""):
     logfile = outfile + ".log"
     log(f"START {label} — {freq_hz/1e6:.3f} MHz → {outfile} (tail -f {logfile})")
@@ -103,19 +197,21 @@ def hackrf_capture(freq_hz, outfile, duration_s, lna=32, vga=40, amp=1, label=""
 
 def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, label="",
                     samplerate="1e6", iq_swap=True, pipeline="meteor_m2-x_lrpt",
-                    dc_block=True):
+                    dc_block=True, source="hackrf"):
     logfile = capdir + ".log"
     pidfile = capdir + ".pid"
     # Convert samplerate to integer — satdump rejects scientific notation strings
     sr_int = int(float(samplerate)) if samplerate else 1_000_000
     flags = ("--iq_swap " if iq_swap else "") + f"sr={sr_int}" + (" dc_block" if dc_block else "")
-    log(f"START {label} — satdump {pipeline} {freq/1e6:.1f} MHz [{flags}] → {capdir} (tail -f {logfile})")
+    log(f"START {label} — satdump/{source} {pipeline} {freq/1e6:.1f} MHz [{flags}] → {capdir} (tail -f {logfile})")
     cmd = ["satdump", "live", pipeline, capdir,
-           "--source", "hackrf", "--samplerate", str(sr_int),
+           "--source", source, "--samplerate", str(sr_int),
            "--frequency", str(freq),
-           "--lna_gain", str(lna), "--vga_gain", str(vga),
-           "--amp", str(amp),
            "--timeout", str(duration_s)]
+    if source == "rtlsdr":
+        cmd += ["--gain", str(lna)]   # lna_gain repurposed as single RTL-SDR gain
+    else:
+        cmd += ["--lna_gain", str(lna), "--vga_gain", str(vga), "--amp", str(amp)]
     if iq_swap:
         cmd.append("--iq_swap")
     if dc_block:
@@ -142,6 +238,52 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
             os.unlink(pidfile)
         except FileNotFoundError:
             pass
+
+def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
+                          samplerate=1_000_000, iq_swap=True, dc_block=True,
+                          pipeline="meteor_m2-x_lrpt"):
+    """Capture CU8 IQ with rtl_sdr, then decode offline with satdump baseband mode."""
+    iqfile  = capdir + ".iq"
+    logfile = capdir + ".log"
+    os.makedirs(capdir, exist_ok=True)
+
+    # Step 1: capture IQ
+    iq_result = rtl_sdr_capture(freq, iqfile, duration_s, gain=gain, label=label)
+    if not iq_result:
+        log(f"DECODE SKIP {label} — IQ capture failed")
+        return 0
+
+    iq_mb = os.path.getsize(iqfile) / 1e6
+    log(f"DECODE {label} — {iq_mb:.0f} MB IQ → satdump offline {pipeline}")
+
+    # Step 2: decode offline
+    cmd = ["satdump", pipeline, "baseband", iqfile, capdir,
+           "--samplerate", str(samplerate),
+           "--baseband_format", "cu8"]
+    if iq_swap:
+        cmd.append("--iq_swap")
+    if dc_block:
+        cmd.append("--dc_block")
+
+    try:
+        with open(logfile, "w") as lf:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=lf)
+        proc.wait(timeout=duration_s * 2)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except Exception as e:
+        log(f"DECODE FAIL {label} — {e}")
+        return 0
+
+    cadu = os.path.join(capdir, f"{pipeline}.cadu")
+    size = os.path.getsize(cadu) if os.path.exists(cadu) else 0
+    if size > 0:
+        log(f"DECODE DONE {label} — {size} bytes CADU — IMAGES LIKELY")
+    else:
+        log(f"DECODE DONE {label} — 0 bytes CADU — no lock — check {logfile}")
+    return size
+
 
 def analyze_150mhz(iqfile, label, center_hz):
     try:
@@ -513,10 +655,15 @@ def build_rule_jobs(rule, hours=24, limit=4):
             _profile=rule.get("profile", "raw_iq_hackrf"),
             _source="rule",
             _max_el=float(p.get("max_el", 0)),
+            _priority=float(rule.get("priority", 0) or 0),
         )
-        if rule.get("profile") in ("meteor_lrpt_hackrf", "satdump_hackrf"):
-            default_pipeline = "meteor_m2-x_lrpt" if rule.get("profile") == "meteor_lrpt_hackrf" else "orbcomm_stx_auto_plotter"
-            suffix = "LRPT" if rule.get("profile") == "meteor_lrpt_hackrf" else "SDR"
+        profile = rule.get("profile", "raw_iq_hackrf")
+        rtlsdr = profile.endswith("_rtlsdr")
+        if profile in ("meteor_lrpt_hackrf", "satdump_hackrf",
+                       "meteor_lrpt_rtlsdr", "satdump_rtlsdr"):
+            is_lrpt = "meteor_lrpt" in profile
+            default_pipeline = "meteor_m2-x_lrpt" if is_lrpt else "orbcomm_stx_auto_plotter"
+            suffix = "LRPT" if is_lrpt else "SDR"
             jobs.append((
                 fire_time,
                 "satdump",
@@ -527,6 +674,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     lna=lna,
                     vga=vga,
                     amp=amp,
+                    source="rtlsdr" if rtlsdr else "hackrf",
                     label=f"{label} {suffix}",
                     samplerate=str(rule.get("samplerate", LRPT_RETRY_VARIANTS[0]["samplerate"])),
                     iq_swap=bool(rule.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"])),
@@ -571,7 +719,9 @@ def build_scan_now_job(command):
     samplerate = str(command.get("samplerate") or LRPT_RETRY_VARIANTS[0]["samplerate"])
     iq_swap = bool(command.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"]))
     dc_block = bool(command.get("dc_block", LRPT_RETRY_VARIANTS[0].get("dc_block", True)))
-    default_pipeline = "meteor_m2-x_lrpt" if profile == "meteor_lrpt_hackrf" else "orbcomm_stx_auto_plotter"
+    rtlsdr = profile.endswith("_rtlsdr")
+    is_lrpt = "meteor_lrpt" in profile
+    default_pipeline = "meteor_m2-x_lrpt" if is_lrpt else "orbcomm_stx_auto_plotter"
     pipeline = str(command.get("pipeline") or default_pipeline)
     _ri = command.get("_retry_idx")
     retry_idx = int(_ri) if _ri is not None else -1  # -1 so first retry picks variant[0]
@@ -589,7 +739,8 @@ def build_scan_now_job(command):
         "amp": amp,
         "label": label,
     }
-    if profile in ("meteor_lrpt_hackrf", "satdump_hackrf"):
+    if profile in ("meteor_lrpt_hackrf", "satdump_hackrf",
+                   "meteor_lrpt_rtlsdr", "satdump_rtlsdr"):
         return (
             datetime.datetime.now().astimezone(),
             "satdump",
@@ -597,6 +748,7 @@ def build_scan_now_job(command):
                 **common,
                 "capdir": f"{NOAADIR}/{slug}_{stamp}",
                 "freq": frequency_hz,
+                "source": "rtlsdr" if rtlsdr else "hackrf",
                 "samplerate": samplerate,
                 "iq_swap": iq_swap,
                 "pipeline": pipeline,
@@ -639,7 +791,10 @@ def optional_rule_jobs(log_loaded=True):
                 log(f"Loaded {len(rule_jobs)} jobs from rule {rule.get('id')}")
         except Exception as e:
             log(f"RULE PREDICT FAIL {rule.get('id', '?')} — no jobs added: {e}")
-    return jobs
+    selected, skipped = resolve_rule_job_overlaps(jobs)
+    if log_loaded and skipped:
+        log(f"Skipped {len(skipped)} overlapping rule job segment(s) shorter than {MIN_PARTIAL_CAPTURE_S}s")
+    return selected
 
 def job_fire_dt(fire_time):
     if isinstance(fire_time, datetime.datetime):
@@ -661,6 +816,53 @@ def job_key(job):
     fire_time, ptype, kwargs = job
     return (job_fire_dt(fire_time).isoformat(timespec="minutes"), ptype, kwargs.get("label", ""))
 
+def job_end_dt(job):
+    return job_fire_dt(job[0]) + datetime.timedelta(seconds=max(1, int(job[2].get("duration_s", 1))))
+
+def job_priority_score(job):
+    kwargs = job[2]
+    return priority_score(
+        kwargs.get("_priority", 0),
+        kwargs.get("_max_el", 0),
+        kwargs.get("duration_s", 0),
+    )
+
+def _suffix_path(path, suffix):
+    root, ext = os.path.splitext(path)
+    return f"{root}{suffix}{ext}" if ext else f"{path}{suffix}"
+
+def trim_job_to_window(job, start, end, part_index, part_count):
+    original_start = job_fire_dt(job[0])
+    original_end = job_end_dt(job)
+    if start == original_start and end == original_end:
+        return job
+
+    _, ptype, kwargs = job
+    next_kwargs = dict(kwargs)
+    suffix = f"_part{part_index}" if part_count > 1 else "_partial"
+    duration_s = max(1, int((end - start).total_seconds()))
+    next_kwargs["duration_s"] = duration_s
+    next_kwargs["_partial"] = True
+    next_kwargs["_original_fire_time"] = original_start.isoformat()
+    next_kwargs["_original_duration_s"] = kwargs.get("duration_s")
+    label = kwargs.get("label", "")
+    next_kwargs["label"] = f"{label} partial" if part_count == 1 else f"{label} partial {part_index}/{part_count}"
+    if next_kwargs.get("capdir"):
+        next_kwargs["capdir"] = _suffix_path(next_kwargs["capdir"], suffix)
+    if next_kwargs.get("outfile"):
+        next_kwargs["outfile"] = _suffix_path(next_kwargs["outfile"], suffix)
+    return (start, ptype, next_kwargs)
+
+def resolve_rule_job_overlaps(jobs):
+    return trim_overlapping_windows(
+        jobs,
+        start_fn=lambda job: job_fire_dt(job[0]),
+        end_fn=job_end_dt,
+        score_fn=job_priority_score,
+        trim_fn=trim_job_to_window,
+        min_duration_s=MIN_PARTIAL_CAPTURE_S,
+    )
+
 def collect_jobs(log_loaded=False):
     jobs = command_jobs() + MANUAL_JOBS + optional_rule_jobs(log_loaded=log_loaded)
     jobs.sort(key=lambda job: job_fire_dt(job[0]))
@@ -671,7 +873,11 @@ def jobs_signature(jobs):
 
 def run_job(ptype, kwargs):
     run_kwargs = dict(kwargs)
-    for key in ("_command_id", "_queued_at", "_norad", "_name", "_profile", "_source", "_max_el", "_retry_idx"):
+    for key in (
+        "_command_id", "_queued_at", "_norad", "_name", "_profile", "_source",
+        "_max_el", "_retry_idx", "_priority", "_partial", "_original_fire_time",
+        "_original_duration_s",
+    ):
         run_kwargs.pop(key, None)
     if ptype == "satdump":
         capdir = run_kwargs.get("capdir")
@@ -681,24 +887,75 @@ def run_job(ptype, kwargs):
         if capdir:
             threading.Thread(target=_invoke_pass_manager, args=(capdir, kwargs), daemon=True).start()
     if ptype == "iq":
-        outfile = hackrf_capture(**run_kwargs)
+        profile  = kwargs.get("_profile", "")
+        norad    = kwargs.get("_norad")
+        name     = kwargs.get("_name", "unknown")
+        max_el   = kwargs.get("_max_el", 0.0)
+        freq_hz  = run_kwargs.get("freq_hz", 0)
+        if profile.endswith("_rtlsdr"):
+            rtl_kwargs = {k: v for k, v in run_kwargs.items()
+                          if k in ("freq_hz", "outfile", "duration_s", "label")}
+            rtl_kwargs["gain"] = run_kwargs.get("lna", 40)
+            outfile = rtl_sdr_capture(**rtl_kwargs)
+        else:
+            outfile = hackrf_capture(**run_kwargs)
+            analyze_150mhz(outfile, run_kwargs["label"], freq_hz)
         if outfile:
-            analyze_150mhz(outfile, run_kwargs["label"], run_kwargs["freq_hz"])
-            norad = kwargs.get("_norad")
-            if norad == 27607:  # SO-50 — FM demod + Whisper transcript
-                script = os.path.join(REPO_DIR, "so50_process.py")
-                if os.path.exists(script):
-                    log(f"SO-50 post-process: {os.path.basename(outfile)}")
-                    threading.Thread(
-                        target=lambda: subprocess.run(
-                            ["python3", script, outfile],
-                            capture_output=False,
-                        ),
-                        daemon=True,
-                    ).start()
+            summary_script = os.path.join(REPO_DIR, "sat_iq_summary.py")
+            if os.path.exists(summary_script):
+                log(f"Post-pass summary: {os.path.basename(outfile)}")
+                cmd = [
+                    "python3", summary_script, outfile,
+                    "--norad",  str(norad or 0),
+                    "--name",   name,
+                    "--max-el", str(max_el),
+                    "--freq",   str(freq_hz),
+                ]
+                threading.Thread(
+                    target=lambda c=cmd: subprocess.run(c, capture_output=False),
+                    daemon=True,
+                ).start()
         return {"ok": bool(outfile), "output": outfile}
     elif ptype == "satdump":
-        cadu_bytes = satdump_capture(**run_kwargs)
+        source   = run_kwargs.get("source", "hackrf")
+        capdir   = run_kwargs.get("capdir", "")
+        name     = kwargs.get("_name", "unknown")
+        norad    = kwargs.get("_norad", 0)
+        max_el   = kwargs.get("_max_el", 0.0)
+        pipeline = run_kwargs.get("pipeline", "meteor_m2-x_lrpt")
+        freq_hz  = int(run_kwargs.get("freq", 0))
+
+        if source == "rtlsdr":
+            # RTL-SDR: capture CU8 IQ then decode offline (live mode broken)
+            cadu_bytes = rtlsdr_satdump_decode(
+                capdir       = capdir,
+                duration_s   = run_kwargs.get("duration_s", 600),
+                freq         = freq_hz,
+                gain         = run_kwargs.get("lna", 37),
+                label        = run_kwargs.get("label", name),
+                samplerate   = int(float(run_kwargs.get("samplerate", "1e6"))),
+                iq_swap      = run_kwargs.get("iq_swap", True),
+                dc_block     = run_kwargs.get("dc_block", True),
+                pipeline     = pipeline,
+            )
+        else:
+            cadu_bytes = satdump_capture(**run_kwargs)
+
+        freq_hz    = int(run_kwargs.get("freq", 0))
+        summary_script = os.path.join(REPO_DIR, "satdump_pass_summary.py")
+        if capdir and os.path.exists(summary_script):
+            cmd = [
+                "python3", summary_script, capdir,
+                "--name",     name,
+                "--norad",    str(norad or 0),
+                "--max-el",   str(max_el),
+                "--pipeline", pipeline,
+                "--freq",     str(freq_hz),
+            ]
+            threading.Thread(
+                target=lambda c=cmd: subprocess.run(c, capture_output=False),
+                daemon=True,
+            ).start()
         return {"ok": cadu_bytes > 0, "cadu_bytes": cadu_bytes}
     else:
         log(f"UNKNOWN JOB TYPE {ptype} — {run_kwargs}")
@@ -714,6 +971,9 @@ def status_job_payload(fire_time, ptype, kwargs):
         "queued_at": kwargs.get("_queued_at"),
         "frequency_hz": kwargs.get("freq_hz") or kwargs.get("freq"),
         "duration_s": kwargs.get("duration_s"),
+        "partial": bool(kwargs.get("_partial")),
+        "original_fire_time": kwargs.get("_original_fire_time"),
+        "original_duration_s": kwargs.get("_original_duration_s"),
         "lna_gain": kwargs.get("lna"),
         "vga_gain": kwargs.get("vga"),
         "amp": kwargs.get("amp"),
@@ -820,6 +1080,9 @@ def scheduler_loop():
                     "iq_swap": kwargs.get("iq_swap"),
                     "pipeline": kwargs.get("pipeline"),
                     "max_el": kwargs.get("_max_el"),
+                    "partial": bool(kwargs.get("_partial")),
+                    "original_fire_time": kwargs.get("_original_fire_time"),
+                    "original_duration_s": kwargs.get("_original_duration_s"),
                     "label": kwargs.get("label", ""),
                     "command_id": kwargs.get("_command_id"),
                     "retry_idx": kwargs.get("_retry_idx"),
@@ -879,6 +1142,21 @@ def scheduler_loop():
 # ── SCHEDULE ─────────────────────────────────────────────────────────────────
 if __name__ != '__main__':
     raise ImportError("sdr_scheduler is not importable — run it directly")
+
+# ── Single-instance guard ─────────────────────────────────────────────────────
+_SCHED_PIDFILE = os.path.join(HOME, ".sdr_scheduler.pid")
+_my_pid = os.getpid()
+try:
+    import fcntl as _fcntl
+    # Open with "a" so we don't truncate before acquiring the lock
+    _pid_fd = open(_SCHED_PIDFILE, "a")
+    _fcntl.flock(_pid_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    # We have the lock — overwrite with our PID
+    _pid_fd.seek(0); _pid_fd.truncate(); _pid_fd.write(str(_my_pid)); _pid_fd.flush()
+except (IOError, OSError):
+    existing = open(_SCHED_PIDFILE).read().strip() if os.path.exists(_SCHED_PIDFILE) else "?"
+    print(f"[sdr_scheduler] Already running (PID {existing}) — exiting duplicate.", flush=True)
+    raise SystemExit(0)
 
 MANUAL_JOBS = [
     # Agent/user-created radio jobs belong here. They do not need to be

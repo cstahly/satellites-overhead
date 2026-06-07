@@ -1,6 +1,8 @@
+use anyhow::Context;
 use chrono::{DateTime, Duration, Local, Utc};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::io::IsTerminal;
 
 const DEFAULT_URL: &str = "http://localhost:8723";
@@ -135,33 +137,181 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
+fn summarize_body(body: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut last_space = false;
+    for c in body.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
+            }
+            _ if in_tag => {}
+            _ if c.is_whitespace() => {
+                if !last_space {
+                    out.push(' ');
+                    last_space = true;
+                }
+            }
+            _ => {
+                out.push(c);
+                last_space = false;
+            }
+        }
+    }
+    let trimmed = out.trim();
+    let shortened: String = trimmed.chars().take(240).collect();
+    if shortened.len() < trimmed.len() {
+        format!("{}...", shortened)
+    } else if trimmed.is_empty() {
+        "(empty response)".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn response_text(response: reqwest::blocking::Response, url: &str) -> anyhow::Result<String> {
+    let status = response.status();
+    let text = response
+        .text()
+        .with_context(|| format!("could not read response body from {}", url))?;
+    if !status.is_success() {
+        anyhow::bail!("{} returned {}: {}", url, status, summarize_body(&text));
+    }
+    Ok(text)
+}
+
 fn get(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<Value> {
-    Ok(client.get(url).send()?.json()?)
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {} failed", url))?;
+    let text = response_text(response, url)?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("error decoding JSON from {}: {}", url, summarize_body(&text)))
 }
 
 fn get_text(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<String> {
-    Ok(client.get(url).send()?.text()?)
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {} failed", url))?;
+    response_text(response, url)
 }
 
 fn post(client: &reqwest::blocking::Client, url: &str, body: &Value) -> anyhow::Result<Value> {
-    Ok(client.post(url).json(body).send()?.json()?)
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .with_context(|| format!("POST {} failed", url))?;
+    let text = response_text(response, url)?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("error decoding JSON from {}: {}", url, summarize_body(&text)))
 }
 
+#[allow(dead_code)]
 fn delete_req(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<Value> {
-    Ok(client.delete(url).send()?.json()?)
+    let response = client
+        .delete(url)
+        .send()
+        .with_context(|| format!("DELETE {} failed", url))?;
+    let text = response_text(response, url)?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("error decoding JSON from {}: {}", url, summarize_body(&text)))
+}
+
+fn rule_pass_targets(client: &reqwest::blocking::Client, base: &str) -> anyhow::Result<Vec<(u32, String)>> {
+    let data = get(client, &format!("{}/scheduler/rules", base))?;
+    let rules = data
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("unexpected /scheduler/rules response"))?;
+    let mut targets = BTreeSet::new();
+    for rule in rules {
+        let Some(norad) = rule["norad"].as_u64() else { continue; };
+        if norad == 0 || norad > u32::MAX as u64 { continue; }
+        let group = rule["group"].as_str().unwrap_or("radio").to_string();
+        targets.insert((norad as u32, group));
+    }
+    if targets.is_empty() {
+        targets.insert((59051, "radio".to_string()));
+    }
+    Ok(targets.into_iter().collect())
+}
+
+fn pass_url(
+    base: &str,
+    norad: u32,
+    group: &str,
+    hours: f64,
+    min_el: f64,
+    start: Option<&str>,
+) -> String {
+    let mut url = format!(
+        "{}/passes?lat=40.42&lon=-86.88&alt_m=180&hours={}&min_el={}&group={}&track_step_s=60&norad={}",
+        base, hours, min_el, group, norad,
+    );
+    if let Some(value) = start {
+        url.push_str("&start=");
+        url.push_str(value);
+    }
+    url
+}
+
+fn fetch_passes_for_targets(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    targets: &[(u32, String)],
+    hours: f64,
+    min_el: f64,
+    start: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut passes = Vec::new();
+    for (norad, group) in targets {
+        let url = pass_url(base, *norad, group, hours, min_el, start);
+        let data = get(client, &url)
+            .with_context(|| format!("could not fetch passes for NORAD {}", norad))?;
+        let arr = data
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("unexpected /passes response for NORAD {}", norad))?;
+        passes.extend(arr.iter().cloned());
+    }
+    passes.sort_by_key(|p| p["aos"].as_str().unwrap_or("").to_string());
+    Ok(passes)
+}
+
+fn fetch_upcoming_windows(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    hours: f64,
+) -> anyhow::Result<Vec<Value>> {
+    let url = format!("{}/scheduler/upcoming?hours={}&limit_per_rule=100", base, hours);
+    let data = get(client, &url)?;
+    let arr = data
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("unexpected /scheduler/upcoming response"))?;
+    Ok(arr.iter().cloned().collect())
 }
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "sdr", about = "Satellite SDR scheduler CLI", version)]
+#[command(arg_required_else_help = false)]
 struct Cli {
     #[arg(long, default_value = DEFAULT_URL, global = true)]
     url: String,
     #[arg(long, global = true, help = "Raw JSON output")]
     json: bool,
+    #[arg(short = 'c', global = true, value_name = "N", help = "Number of passes to show (default: all in 48h)")]
+    count: Option<usize>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -425,17 +575,16 @@ fn cmd_logs(client: &reqwest::blocking::Client, base: &str, tail: usize) -> anyh
 
 fn cmd_overhead(client: &reqwest::blocking::Client, base: &str, min_el: f64, as_json: bool) -> anyhow::Result<()> {
     let start = (Utc::now() - Duration::hours(2)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let url = format!("{}/passes?lat=40.42&lon=-86.88&alt_m=180&hours=2.5&min_el={}&group=radio&track_step_s=60&start={}", base, min_el, start);
-    let data = get(client, &url)?;
-    if as_json { println!("{}", serde_json::to_string_pretty(&data)?); return Ok(()); }
+    let targets = rule_pass_targets(client, base)?;
+    let passes = fetch_passes_for_targets(client, base, &targets, 2.5, min_el, Some(&start))?;
 
     let now_ts = Utc::now().timestamp() as f64;
-    let passes = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
     let overhead: Vec<&Value> = passes.iter().filter(|p| {
         let aos = p["aos"].as_str().and_then(|s| parse_dt(s)).map(|d| d.timestamp() as f64).unwrap_or(f64::MAX);
         let los = p["los"].as_str().and_then(|s| parse_dt(s)).map(|d| d.timestamp() as f64).unwrap_or(0.0);
         aos <= now_ts && now_ts <= los
     }).collect();
+    if as_json { println!("{}", serde_json::to_string_pretty(&overhead)?); return Ok(()); }
 
     if overhead.is_empty() {
         println!("{}", dim("  Nothing above the horizon right now."));
@@ -458,23 +607,34 @@ fn cmd_overhead(client: &reqwest::blocking::Client, base: &str, min_el: f64, as_
 }
 
 fn cmd_passes(client: &reqwest::blocking::Client, base: &str, norad: Option<u32>, hours: f64, min_el: f64, as_json: bool) -> anyhow::Result<()> {
-    let mut url = format!("{}/passes?lat=40.42&lon=-86.88&alt_m=180&hours={}&min_el={}&group=radio&track_step_s=60", base, hours, min_el);
-    if let Some(n) = norad { url.push_str(&format!("&norad={}", n)); }
-    let data = get(client, &url)?;
-    if as_json { println!("{}", serde_json::to_string_pretty(&data)?); return Ok(()); }
+    let mut passes = if let Some(n) = norad {
+        fetch_passes_for_targets(client, base, &[(n, "radio".to_string())], hours, min_el, None)?
+    } else {
+        fetch_upcoming_windows(client, base, hours)?
+    };
+    if norad.is_none() {
+        passes.retain(|p| p["max_el"].as_f64().unwrap_or(0.0) >= min_el);
+    }
+    if as_json { println!("{}", serde_json::to_string_pretty(&passes)?); return Ok(()); }
 
-    let passes = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
     if passes.is_empty() { println!("{}", dim("  No passes found.")); return Ok(()); }
     println!();
-    let rows: Vec<Vec<String>> = passes.iter().map(|p| vec![
-        p["name"].as_str().unwrap_or("—").to_string(),
-        p["norad"].to_string(),
-        p["aos"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string()),
-        p["aos"].as_str().map(time_until).unwrap_or_default(),
-        fmt_el(p["max_el"].as_f64().unwrap_or(0.0)),
-        fmt_dur(p["duration_s"].as_f64().unwrap_or(0.0)),
-    ]).collect();
-    print_table(&["Satellite", "NORAD", "AOS (local)", "Until", "Max El", "Duration"], &rows);
+    let rows: Vec<Vec<String>> = passes.iter().map(|p| {
+        let start = p["fire_time"].as_str().or_else(|| p["aos"].as_str());
+        let mut duration = fmt_dur(p["duration_s"].as_f64().unwrap_or(0.0));
+        if p["partial"].as_bool().unwrap_or(false) {
+            duration = format!("{} partial", duration);
+        }
+        vec![
+            p["name"].as_str().unwrap_or("—").to_string(),
+            p["norad"].to_string(),
+            start.map(fmt_local).unwrap_or_else(|| "—".to_string()),
+            start.map(time_until).unwrap_or_default(),
+            fmt_el(p["max_el"].as_f64().unwrap_or(0.0)),
+            duration,
+        ]
+    }).collect();
+    print_table(&["Satellite", "NORAD", "Start (local)", "Until", "Max El", "Duration"], &rows);
     println!();
     Ok(())
 }
@@ -665,6 +825,81 @@ fn cmd_report(client: &reqwest::blocking::Client, base: &str, capture_id: &str) 
     Ok(())
 }
 
+// ── dashboard (default, no subcommand) ───────────────────────────────────────
+
+fn cmd_dashboard(client: &reqwest::blocking::Client, base: &str, count: Option<usize>) -> anyhow::Result<()> {
+    let status = get(client, &format!("{}/scheduler/status", base))?;
+    let live = status["live"].as_bool().unwrap_or(false);
+
+    println!();
+
+    // ── Now running ────────────────────────────────────────────────────────────
+    if live {
+        if let Some(job) = status["current_job"].as_object() {
+            let label = job.get("label").and_then(|v| v.as_str()).unwrap_or("—");
+            let freq = job.get("frequency_hz").and_then(|v| v.as_f64())
+                .map(|f| format!("  {:.3} MHz", f / 1e6)).unwrap_or_default();
+            let remaining = job.get("fire_time").and_then(|v| v.as_str())
+                .and_then(|ft| job.get("duration_s").and_then(|v| v.as_f64()).map(|dur| (ft, dur)))
+                .and_then(|(ft, dur)| parse_dt(ft).map(|start| {
+                    let end = start + Duration::seconds(dur as i64);
+                    let secs = (end - Utc::now()).num_seconds();
+                    if secs > 0 { cyan(&format!("{} remaining", fmt_dur(secs as f64))) }
+                    else { dim("finishing...") }
+                }))
+                .unwrap_or_default();
+            println!("  {}  {}{} {}", bold("NOW "), green(label), freq, remaining);
+        }
+    } else {
+        println!("  {}  {}", bold("NOW "), dim("idle"));
+    }
+
+    // ── Last run ───────────────────────────────────────────────────────────────
+    let captures_data = get(client, &format!("{}/captures", base)).unwrap_or(serde_json::json!([]));
+    if let Some(last) = captures_data.as_array().and_then(|a| a.first()) {
+        let name = last["name"].as_str().unwrap_or("—");
+        let time = last["started_at"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
+        let size = fmt_bytes(last["size_bytes"].as_f64().unwrap_or(0.0));
+        let cadu = last["cadu_bytes"].as_f64().unwrap_or(0.0);
+        let result_str = if cadu > 0.0 { green(&format!("decoded  {}", fmt_bytes(cadu))) }
+                         else { dim("no lock") };
+        println!("  {}  {}  {}  {}  {}", bold("LAST"), dim(&time), bold(name), size, result_str);
+    }
+
+    // ── Upcoming passes ────────────────────────────────────────────────────────
+    let mut windows = fetch_upcoming_windows(client, base, 48.0)?;
+    windows.truncate(count.unwrap_or(10));
+
+    if windows.is_empty() {
+        println!("\n{}", dim("  No passes scheduled in the next 48 hours."));
+    } else {
+        let now_local = Local::now();
+        println!("\n  {} {} – {}\n",
+            bold("Upcoming"),
+            now_local.format("%a %b %d"),
+            (now_local + chrono::Duration::days(1)).format("%a %b %d"),
+        );
+        let rows: Vec<Vec<String>> = windows.iter().map(|p| {
+            let start = p["fire_time"].as_str().or_else(|| p["aos"].as_str());
+            let mut duration = fmt_dur(p["duration_s"].as_f64().unwrap_or(0.0));
+            if p["partial"].as_bool().unwrap_or(false) {
+                duration = format!("{} partial", duration);
+            }
+            vec![
+                p["name"].as_str().unwrap_or("—").to_string(),
+                start.map(fmt_local).unwrap_or_else(|| "—".to_string()),
+                start.map(time_until).unwrap_or_default(),
+                fmt_el(p["max_el"].as_f64().unwrap_or(0.0)),
+                duration,
+            ]
+        }).collect();
+        print_table(&["Satellite", "Start (local)", "Until", "Max El", "Duration"], &rows);
+    }
+
+    println!();
+    Ok(())
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -675,15 +910,16 @@ fn main() {
         .expect("failed to build HTTP client");
 
     let result = match &cli.command {
-        Command::Status => cmd_status(&client, &cli.url, cli.json),
-        Command::Overhead { min_el } => cmd_overhead(&client, &cli.url, *min_el, cli.json),
-        Command::Passes { norad, hours, min_el } => cmd_passes(&client, &cli.url, *norad, *hours, *min_el, cli.json),
-        Command::Rules => cmd_rules(&client, &cli.url, cli.json),
-        Command::Rule { action, id } => cmd_rule_toggle(&client, &cli.url, id, matches!(action, RuleAction::Enable)),
-        Command::Captures { norad, limit } => cmd_captures(&client, &cli.url, *norad, *limit, cli.json),
-        Command::Scan { norad, duration } => cmd_scan(&client, &cli.url, *norad, *duration),
-        Command::Report { capture_id } => cmd_report(&client, &cli.url, capture_id),
-        Command::Logs { tail } => cmd_logs(&client, &cli.url, *tail),
+        None => cmd_dashboard(&client, &cli.url, cli.count),
+        Some(Command::Status) => cmd_status(&client, &cli.url, cli.json),
+        Some(Command::Overhead { min_el }) => cmd_overhead(&client, &cli.url, *min_el, cli.json),
+        Some(Command::Passes { norad, hours, min_el }) => cmd_passes(&client, &cli.url, *norad, *hours, *min_el, cli.json),
+        Some(Command::Rules) => cmd_rules(&client, &cli.url, cli.json),
+        Some(Command::Rule { action, id }) => cmd_rule_toggle(&client, &cli.url, id, matches!(action, RuleAction::Enable)),
+        Some(Command::Captures { norad, limit }) => cmd_captures(&client, &cli.url, *norad, *limit, cli.json),
+        Some(Command::Scan { norad, duration }) => cmd_scan(&client, &cli.url, *norad, *duration),
+        Some(Command::Report { capture_id }) => cmd_report(&client, &cli.url, capture_id),
+        Some(Command::Logs { tail }) => cmd_logs(&client, &cli.url, *tail),
     };
 
     if let Err(e) = result {

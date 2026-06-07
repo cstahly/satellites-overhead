@@ -18,7 +18,7 @@ struct ContentView: View {
                 .tabItem { Label("Rules", systemImage: "calendar.badge.clock") }
                 .tag(3)
             EventsView()
-                .tabItem { Label("Events", systemImage: "bolt.fill") }
+                .tabItem { Label("Diagnostics", systemImage: "waveform.path.ecg") }
                 .tag(4)
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gear") }
