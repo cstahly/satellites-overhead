@@ -195,6 +195,52 @@ iOS UI: `mobile/iosApp/SatellitesApp/`
 
 **iOS and Android must be kept at feature parity.** Adding a feature to one requires the same on the other.
 
+---
+
+## Disk cleanup — what to keep vs delete
+
+Two capture directories on this machine:
+- `~/noaa_captures/` — Meteor LRPT passes (IQ + satdump decode output)
+- `~/cosmos_captures/` — Amateur satellite passes (IQ + WAV + summary)
+
+### Always keep
+
+| What | Why |
+|------|-----|
+| Decode directories with images (`*/MSU-MR/*.png`) | Actual satellite imagery — the whole point |
+| `*_summary.md` files | Pass narrative, small, useful for history |
+| `*.wav` files | FM demod output, used for burst analysis and Whisper transcription |
+| `*.log` files | Satdump / rtl_sdr logs, used for diagnostics |
+| `*.claude_pass.log` files | Pass manager output, useful for debugging |
+
+### Safe to delete after processing
+
+| What | When safe |
+|------|-----------|
+| `*.iq` files in `~/noaa_captures/` | After satdump decode has run — check for images first |
+| `*.iq` files in `~/cosmos_captures/` | After `sat_iq_summary.py` has run (WAV + summary exist) |
+| Empty decode directories (only `product.cbor`, no PNGs) | Decode failed — nothing to keep |
+| `*_decode_noswap/` or other scratch decode attempts | Temporary retries, always deletable |
+
+### Before deleting a Meteor IQ file — checklist
+
+1. Does `<capdir>/MSU-MR/` contain `.png` files? If yes, IQ is safe to delete.
+2. If `MSU-MR/` only has `product.cbor` (no PNGs), the decode failed — check the log for SNR before deleting.
+3. SNR 0.0 dB throughout = no signal at all = IQ is worthless, delete immediately.
+4. SNR > 5 dB = satellite was transmitting — make sure it decoded before deleting. If it didn't, try re-decoding at `--samplerate 2000000 --baseband_format cu8 --iq_swap --dc_block` before giving up.
+
+### What "no signal" looks like
+
+SNR exactly 0.0 dB throughout with all MSU-MR channel line counts = 0 means the satellite wasn't transmitting. The IQ is pure noise. This happens routinely with M2-4 (currently not transmitting LRPT as of June 2026) and intermittently with M2-3.
+
+### Current satellite status (verify at https://ub8qbd.satdump.org/wx_report_new.html)
+
+- **Meteor-M2 3** — 137.900 MHz — transmitting intermittently as of June 2026. Our best results.
+- **Meteor-M2 2** — 137.900 MHz — weak from this location; only high-elevation passes worth keeping.
+- **Meteor-M2 4** — 137.100 MHz — **not transmitting LRPT** as of June 2026 despite status site saying otherwise. All captures are pure noise. Do not waste time retrying.
+
+---
+
 ### Token rule
 - Raw token lives ONLY on Linux at `~/sdr_mobile_bootstrap_token.json`. Never commit it.
 - Android default patch: `SatellitesApp.kt` — `settings.getString(KEY_BEARER_TOKEN, "<token>")`
