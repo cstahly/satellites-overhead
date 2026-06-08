@@ -38,13 +38,138 @@ from sdr_runtime import emit_event
 # rs_usecheck=False variant is a diagnostic: frames through even if RS fails, reveals framing state.
 # dc_block=False is last resort — known to produce false Viterbi lock, but retained if all else fails.
 LRPT_RETRY_VARIANTS = [
-    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+iq_swap (primary hypothesis)
-    {"iq_swap": False, "samplerate": "1e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+no_iq_swap
-    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-4_lrpt_nrzl_nors",  "dc_block": True},   # nrzl, RS off (diagnostic)
-    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+iq_swap (known NOSYNC, kept as fallback)
-    {"iq_swap": False, "samplerate": "1e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+no_iq_swap (known NOSYNC)
-    {"iq_swap": True,  "samplerate": "1e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": False},  # last resort fallback
+    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+iq_swap (primary hypothesis)
+    {"iq_swap": False, "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+no_iq_swap
+    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl_nors",  "dc_block": True},   # nrzl, RS off (diagnostic)
+    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+iq_swap (known NOSYNC, kept as fallback)
+    {"iq_swap": False, "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+no_iq_swap (known NOSYNC)
+    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": False},  # last resort fallback
 ]
+
+EC2_METEOR_USER = "ec2-user"
+EC2_METEOR_HOST = "sadbabyrabbit.com"
+EC2_METEOR_KEY = os.path.expanduser("~/.ssh/sadbabyrabbit.pem")
+EC2_METEOR_REMOTE_DIR = "/var/www/site/public/meteor"
+METEOR_MANIFEST_PATH = os.path.join(HOME, "meteor_push_manifest.json")
+
+
+def push_meteor_image(capdir, name, max_el, captured_at_iso):
+    """Push a Meteor MSA image to sadbabyrabbit.com/meteor/ and update index.json."""
+    image_path = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
+    if not os.path.exists(image_path):
+        log(f"PUSH SKIP — no MSA image in {capdir}/MSU-MR/")
+        return
+
+    ssh_opts = ["-o", "StrictHostKeyChecking=no", "-q", "-i", EC2_METEOR_KEY]
+    scp_opts = ["-o", "StrictHostKeyChecking=no", "-i", EC2_METEOR_KEY]
+
+    # e.g. "2026-06-08T16:30:00Z" → "20260608T1630"
+    ts = captured_at_iso.replace("-", "").replace(":", "").replace("Z", "")[:13]
+    remote_img = f"{ts}.png"
+
+    try:
+        subprocess.run(
+            ["ssh"] + ssh_opts + [f"{EC2_METEOR_USER}@{EC2_METEOR_HOST}",
+             f"mkdir -p {EC2_METEOR_REMOTE_DIR}"],
+            check=True, timeout=30,
+        )
+        subprocess.run(
+            ["scp"] + scp_opts + [image_path,
+             f"{EC2_METEOR_USER}@{EC2_METEOR_HOST}:{EC2_METEOR_REMOTE_DIR}/{remote_img}"],
+            check=True, timeout=120,
+        )
+
+        # Update local manifest
+        manifest = []
+        if os.path.exists(METEOR_MANIFEST_PATH):
+            try:
+                with open(METEOR_MANIFEST_PATH) as f:
+                    manifest = json.load(f)
+                if not isinstance(manifest, list):
+                    manifest = []
+            except Exception:
+                manifest = []
+        manifest = [e for e in manifest if e.get("filename") != remote_img]
+        manifest.append({
+            "filename": remote_img,
+            "name": name,
+            "captured_at": captured_at_iso,
+            "max_el": round(float(max_el or 0), 1),
+            "pass_id": os.path.basename(capdir),
+        })
+        manifest.sort(key=lambda e: e.get("captured_at", ""), reverse=True)
+        atomic_write_json(METEOR_MANIFEST_PATH, manifest)
+
+        # Push updated index to EC2 via temp file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+            json.dump(manifest, tf, indent=2)
+            tf_path = tf.name
+        try:
+            subprocess.run(
+                ["scp"] + scp_opts + [tf_path,
+                 f"{EC2_METEOR_USER}@{EC2_METEOR_HOST}:{EC2_METEOR_REMOTE_DIR}/index.json"],
+                check=True, timeout=30,
+            )
+        finally:
+            os.unlink(tf_path)
+
+        log(f"PUSH OK — {remote_img} → sadbabyrabbit.com/meteor/ ({len(manifest)} total)")
+        scheduler_event(
+            "meteor.image_pushed",
+            {"filename": remote_img, "name": name, "captured_at": captured_at_iso,
+             "total": len(manifest)},
+            {"title": "Meteor image live on site", "body": f"{name} — {max_el:.1f}°"},
+        )
+    except Exception as e:
+        log(f"PUSH FAIL — {e}")
+
+
+def backfill_meteor_images():
+    """Push any existing MSA images not in the manifest yet. Runs once at startup."""
+    import glob as _glob
+    pattern = os.path.join(NOAADIR, "*/MSU-MR/msu_mr_rgb_MSA_corrected_map.png")
+    candidates = sorted(_glob.glob(pattern), key=os.path.getmtime)
+    if not candidates:
+        return
+
+    history_by_capdir = {}
+    if os.path.exists(HISTORY_PATH):
+        try:
+            with open(HISTORY_PATH) as f:
+                for r in json.load(f):
+                    if r.get("output"):
+                        history_by_capdir[r["output"]] = r
+        except Exception:
+            pass
+
+    existing_manifest = set()
+    if os.path.exists(METEOR_MANIFEST_PATH):
+        try:
+            with open(METEOR_MANIFEST_PATH) as f:
+                for e in json.load(f):
+                    existing_manifest.add(e.get("filename", ""))
+        except Exception:
+            pass
+
+    for img_path in candidates:
+        capdir = os.path.dirname(os.path.dirname(img_path))
+        rec = history_by_capdir.get(capdir, {})
+        name = rec.get("name") or "METEOR-M2 3"
+        max_el = rec.get("max_el") or 0.0
+        captured_at = rec.get("started_at")
+        if not captured_at:
+            mtime = os.path.getmtime(img_path)
+            captured_at = datetime.datetime.fromtimestamp(
+                mtime, datetime.timezone.utc
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        ts = captured_at.replace("-", "").replace(":", "").replace("Z", "")[:13]
+        if f"{ts}.png" in existing_manifest:
+            continue
+        log(f"BACKFILL {os.path.basename(capdir)} → {ts}.png")
+        push_meteor_image(capdir, name, max_el, captured_at)
+
 
 def log(msg):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -240,7 +365,7 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
             pass
 
 def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
-                          samplerate=1_000_000, iq_swap=True, dc_block=True,
+                          samplerate=2_000_000, iq_swap=True, dc_block=True,
                           pipeline="meteor_m2-x_lrpt"):
     """Capture CU8 IQ with rtl_sdr, then decode offline with satdump baseband mode."""
     iqfile  = capdir + ".iq"
@@ -363,7 +488,7 @@ def _invoke_pass_manager(capdir, kwargs):
     amp = kwargs.get("amp", 1)
     iq_swap = kwargs.get("iq_swap", True)
     dc_block = kwargs.get("dc_block", True)
-    samplerate = kwargs.get("samplerate", "1e6")
+    samplerate = kwargs.get("samplerate", "2e6")
     logfile = capdir + ".log"
     pidfile = capdir + ".pid"
     claude_log = capdir + ".claude_pass.log"
@@ -933,7 +1058,7 @@ def run_job(ptype, kwargs):
                 freq         = freq_hz,
                 gain         = run_kwargs.get("lna", 37),
                 label        = run_kwargs.get("label", name),
-                samplerate   = int(float(run_kwargs.get("samplerate", "1e6"))),
+                samplerate   = int(float(run_kwargs.get("samplerate", "2e6"))),
                 iq_swap      = run_kwargs.get("iq_swap", True),
                 dc_block     = run_kwargs.get("dc_block", True),
                 pipeline     = pipeline,
@@ -956,6 +1081,16 @@ def run_job(ptype, kwargs):
                 target=lambda c=cmd: subprocess.run(c, capture_output=False),
                 daemon=True,
             ).start()
+        profile_str = kwargs.get("_profile", "")
+        if "meteor_lrpt" in profile_str and capdir:
+            img = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
+            if os.path.exists(img):
+                _captured_at = utc_now_iso()
+                threading.Thread(
+                    target=push_meteor_image,
+                    args=(capdir, name, max_el, _captured_at),
+                    daemon=True,
+                ).start()
         return {"ok": cadu_bytes > 0, "cadu_bytes": cadu_bytes}
     else:
         log(f"UNKNOWN JOB TYPE {ptype} — {run_kwargs}")
@@ -990,6 +1125,7 @@ def scheduler_loop():
     log("SDR scheduler running — dynamic rule reload enabled")
     write_scheduler_status("idle", message="scheduler started")
     scheduler_event("scheduler.started", {"pid": os.getpid()})
+    threading.Thread(target=backfill_meteor_images, daemon=True).start()
 
     while True:
         now_ts = time.time()
