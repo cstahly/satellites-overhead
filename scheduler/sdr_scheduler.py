@@ -49,7 +49,7 @@ LRPT_RETRY_VARIANTS = [
 EC2_METEOR_USER = "ec2-user"
 EC2_METEOR_HOST = "sadbabyrabbit.com"
 EC2_METEOR_KEY = os.path.expanduser("~/.ssh/sadbabyrabbit.pem")
-EC2_METEOR_REMOTE_DIR = "/var/www/site/public/meteor"
+EC2_METEOR_REMOTE_DIR = "/var/www/meteor"
 METEOR_MANIFEST_PATH = os.path.join(HOME, "meteor_push_manifest.json")
 
 
