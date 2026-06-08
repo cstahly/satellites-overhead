@@ -111,6 +111,11 @@ def push_meteor_image(capdir, name, max_el, captured_at_iso):
                  f"{EC2_METEOR_USER}@{EC2_METEOR_HOST}:{EC2_METEOR_REMOTE_DIR}/index.json"],
                 check=True, timeout=30,
             )
+            subprocess.run(
+                ["ssh"] + ssh_opts + [f"{EC2_METEOR_USER}@{EC2_METEOR_HOST}",
+                 f"chmod 644 {EC2_METEOR_REMOTE_DIR}/index.json"],
+                check=True, timeout=10,
+            )
         finally:
             os.unlink(tf_path)
 
