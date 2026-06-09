@@ -89,13 +89,15 @@ def push_meteor_image(capdir, name, max_el, captured_at_iso):
                     manifest = []
             except Exception:
                 manifest = []
-        manifest = [e for e in manifest if e.get("filename") != remote_img]
+        _pass_id = os.path.basename(capdir)
+        manifest = [e for e in manifest
+                    if e.get("filename") != remote_img and e.get("pass_id") != _pass_id]
         manifest.append({
             "filename": remote_img,
             "name": name,
             "captured_at": captured_at_iso,
             "max_el": round(float(max_el or 0), 1),
-            "pass_id": os.path.basename(capdir),
+            "pass_id": _pass_id,
         })
         manifest.sort(key=lambda e: e.get("captured_at", ""), reverse=True)
         atomic_write_json(METEOR_MANIFEST_PATH, manifest)
@@ -148,17 +150,19 @@ def backfill_meteor_images():
         except Exception:
             pass
 
-    existing_manifest = set()
+    existing_pass_ids = set()
     if os.path.exists(METEOR_MANIFEST_PATH):
         try:
             with open(METEOR_MANIFEST_PATH) as f:
                 for e in json.load(f):
-                    existing_manifest.add(e.get("filename", ""))
+                    existing_pass_ids.add(e.get("pass_id", ""))
         except Exception:
             pass
 
     for img_path in candidates:
         capdir = os.path.dirname(os.path.dirname(img_path))
+        if os.path.basename(capdir) in existing_pass_ids:
+            continue
         rec = history_by_capdir.get(capdir, {})
         name = rec.get("name") or "METEOR-M2 3"
         max_el = rec.get("max_el") or 0.0
@@ -170,8 +174,6 @@ def backfill_meteor_images():
             ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
         ts = captured_at.replace("-", "").replace(":", "").replace("Z", "")[:13]
-        if f"{ts}.png" in existing_manifest:
-            continue
         log(f"BACKFILL {os.path.basename(capdir)} → {ts}.png")
         push_meteor_image(capdir, name, max_el, captured_at)
 
@@ -1045,6 +1047,37 @@ def run_job(ptype, kwargs):
                     target=lambda c=cmd: subprocess.run(c, capture_output=False),
                     daemon=True,
                 ).start()
+            # gr_satellites decode for supported digital satellites
+            # Signal frequencies (actual) vs tuned center (offset -50 kHz to avoid DC spike)
+            GR_SAT_NAMES = {
+                39444: ("AO-73",   145935000),
+                44881: ("CAS-6",   145925000),
+                43803: ("JY1-Sat", 145865000),
+            }
+            gr_sat_info = GR_SAT_NAMES.get(norad)
+            if gr_sat_info:
+                gr_sat, sig_freq = gr_sat_info
+                freq_offset = sig_freq - freq_hz  # how far signal is from IQ center
+                outdir = outfile.replace(".iq", "_gr_decode")
+                os.makedirs(outdir, exist_ok=True)
+                log(f"gr_satellites decode: {gr_sat} offset={freq_offset:+d}Hz → {outdir}")
+                def _gr_decode(iqfile=outfile, sat=gr_sat, dumpdir=outdir, offset=freq_offset):
+                    try:
+                        import numpy as np
+                        data = np.fromfile(iqfile, dtype=np.uint8)
+                        cf32 = (data.astype(np.float32) - 128.0) / 128.0
+                        tmppath = iqfile.replace(".iq", "_tmp.cf32")
+                        cf32.tofile(tmppath)
+                        del cf32, data
+                        cmd = ["gr_satellites", sat, "--rawfile", tmppath,
+                               "--samp_rate", "2000000", "--iq", "--dump_path", dumpdir]
+                        if offset != 0:
+                            cmd += ["--freq_offset", str(offset)]
+                        subprocess.run(cmd, capture_output=False)
+                        os.unlink(tmppath)
+                    except Exception as e:
+                        log(f"gr_satellites decode failed: {e}")
+                threading.Thread(target=_gr_decode, daemon=True).start()
         return {"ok": bool(outfile), "output": outfile}
     elif ptype == "satdump":
         source   = run_kwargs.get("source", "hackrf")
@@ -1090,7 +1123,10 @@ def run_job(ptype, kwargs):
         if "meteor_lrpt" in profile_str and capdir:
             img = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
             if os.path.exists(img):
-                _captured_at = utc_now_iso()
+                _mtime = os.path.getmtime(img)
+                _captured_at = datetime.datetime.fromtimestamp(
+                    _mtime, datetime.timezone.utc
+                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
                 threading.Thread(
                     target=push_meteor_image,
                     args=(capdir, name, max_el, _captured_at),
