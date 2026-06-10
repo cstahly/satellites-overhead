@@ -53,6 +53,19 @@ EC2_METEOR_REMOTE_DIR = "/var/www/meteor"
 METEOR_MANIFEST_PATH = os.path.join(HOME, "meteor_push_manifest.json")
 
 
+def make_meteor_web_image(image_path, out_path):
+    """Render a web-sized WebP (~1MB vs 4-14MB raw PNG) for the gallery carousel."""
+    try:
+        subprocess.run(
+            ["magick", image_path, "-resize", "1600x1600>", "-quality", "82", out_path],
+            check=True, timeout=120,
+        )
+        return True
+    except Exception as exc:
+        log(f"PUSH WARN — web image conversion failed ({exc}); pushing full PNG only")
+        return False
+
+
 def push_meteor_image(capdir, name, max_el, captured_at_iso):
     """Push a Meteor MSA image to sadbabyrabbit.com/meteor/ and update index.json."""
     image_path = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
@@ -66,6 +79,9 @@ def push_meteor_image(capdir, name, max_el, captured_at_iso):
     # e.g. "2026-06-08T16:30:00Z" → "20260608T1630"
     ts = captured_at_iso.replace("-", "").replace(":", "").replace("Z", "")[:13]
     remote_img = f"{ts}.png"
+    web_img = f"{ts}_web.webp"
+    web_path = os.path.join(capdir, "MSU-MR", "msa_web.webp")
+    has_web = make_meteor_web_image(image_path, web_path)
 
     try:
         subprocess.run(
@@ -78,6 +94,12 @@ def push_meteor_image(capdir, name, max_el, captured_at_iso):
              f"{EC2_METEOR_USER}@{EC2_METEOR_HOST}:{EC2_METEOR_REMOTE_DIR}/{remote_img}"],
             check=True, timeout=120,
         )
+        if has_web:
+            subprocess.run(
+                ["scp"] + scp_opts + [web_path,
+                 f"{EC2_METEOR_USER}@{EC2_METEOR_HOST}:{EC2_METEOR_REMOTE_DIR}/{web_img}"],
+                check=True, timeout=60,
+            )
 
         # Update local manifest
         manifest = []
@@ -92,13 +114,16 @@ def push_meteor_image(capdir, name, max_el, captured_at_iso):
         _pass_id = os.path.basename(capdir)
         manifest = [e for e in manifest
                     if e.get("filename") != remote_img and e.get("pass_id") != _pass_id]
-        manifest.append({
+        entry = {
             "filename": remote_img,
             "name": name,
             "captured_at": captured_at_iso,
             "max_el": round(float(max_el or 0), 1),
             "pass_id": _pass_id,
-        })
+        }
+        if has_web:
+            entry["web"] = web_img
+        manifest.append(entry)
         manifest.sort(key=lambda e: e.get("captured_at", ""), reverse=True)
         atomic_write_json(METEOR_MANIFEST_PATH, manifest)
 
@@ -163,7 +188,8 @@ def backfill_meteor_images():
         capdir = os.path.dirname(os.path.dirname(img_path))
         if os.path.basename(capdir) in existing_pass_ids:
             continue
-        rec = history_by_capdir.get(capdir, {})
+        _lookup = capdir.removesuffix("_decode")
+        rec = history_by_capdir.get(capdir) or history_by_capdir.get(_lookup, {})
         name = rec.get("name") or "METEOR-M2 3"
         max_el = rec.get("max_el") or 0.0
         captured_at = rec.get("started_at")
@@ -234,7 +260,7 @@ def _rtlsdr_usb_reset():
         return False
 
 
-def rtl_sdr_capture(freq_hz, outfile, duration_s, gain=40, label=""):
+def rtl_sdr_capture(freq_hz, outfile, duration_s, gain=40, label="", bias_tee=False):
     logfile = outfile + ".log"
     log(f"START {label} — rtl_sdr {freq_hz/1e6:.3f} MHz gain={gain} → {outfile} (tail -f {logfile})")
     cmd = ["rtl_sdr", "-f", str(freq_hz), "-s", "2000000", "-g", str(gain), outfile]
@@ -257,6 +283,10 @@ def rtl_sdr_capture(freq_hz, outfile, duration_s, gain=40, label=""):
     except (IOError, OSError):
         log(f"SKIP  {label} — RTL-SDR lock held by another process")
         return None
+
+    if bias_tee:
+        subprocess.run(["rtl_biast", "-d", "0", "-b", "1"],
+                       capture_output=True)
 
     try:
         for attempt in range(2):
@@ -286,6 +316,9 @@ def rtl_sdr_capture(freq_hz, outfile, duration_s, gain=40, label=""):
         log(f"FAIL  {label} — {e}")
         return None
     finally:
+        if bias_tee:
+            subprocess.run(["rtl_biast", "-d", "0", "-b", "0"],
+                           capture_output=True)
         try:
             import fcntl
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -371,6 +404,42 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
         except FileNotFoundError:
             pass
 
+_SATDUMP_SETTINGS = os.path.expanduser("~/.config/satdump/settings.json")
+_SATDUMP_TLES     = os.path.expanduser("~/.config/satdump/satdump_tles.txt")
+_SCHEDULER_TLE_CACHE = os.path.join(HOME, "src", "satellites-overhead", ".tlecache", "active.tle")
+
+_TLE_SOURCES = [
+    "https://tle.ivanstanojevic.me/api/tle/?format=tle&page-size=5000",
+    "https://db.satnogs.org/api/tle/?format=tle&page_size=5000",
+]
+
+def refresh_satdump_tles():
+    """Fetch fresh TLEs into satdump's cache and stamp them so satdump skips its own fetch."""
+    import urllib.request, shutil
+    fetched = False
+    for url in _TLE_SOURCES:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                data = r.read().decode("utf-8", errors="ignore")
+            if len(data) > 1000 and "1 " in data:
+                with open(_SATDUMP_TLES, "w") as f:
+                    f.write(data)
+                fetched = True
+                break
+        except Exception:
+            continue
+    if not fetched and os.path.exists(_SCHEDULER_TLE_CACHE):
+        shutil.copy2(_SCHEDULER_TLE_CACHE, _SATDUMP_TLES)
+    try:
+        with open(_SATDUMP_SETTINGS) as f:
+            cfg = json.load(f)
+        cfg.setdefault("user", {})["tles_last_updated"] = int(time.time())
+        with open(_SATDUMP_SETTINGS, "w") as f:
+            json.dump(cfg, f, indent=4)
+    except Exception:
+        pass
+
+
 def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
                           samplerate=2_000_000, iq_swap=True, dc_block=True,
                           pipeline="meteor_m2-x_lrpt"):
@@ -388,6 +457,9 @@ def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
     iq_mb = os.path.getsize(iqfile) / 1e6
     log(f"DECODE {label} — {iq_mb:.0f} MB IQ → satdump offline {pipeline}")
 
+    # Refresh TLEs before satdump starts so it won't try to fetch them itself
+    refresh_satdump_tles()
+
     # Step 2: decode offline
     cmd = ["satdump", pipeline, "baseband", iqfile, capdir,
            "--samplerate", str(samplerate),
@@ -397,24 +469,26 @@ def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
     if dc_block:
         cmd.append("--dc_block")
 
-    try:
-        with open(logfile, "w") as lf:
-            proc = subprocess.Popen(cmd, stdout=lf, stderr=lf)
-        proc.wait(timeout=duration_s * 2)
-    except subprocess.TimeoutExpired:
-        proc.terminate()
-        proc.wait(timeout=10)
-    except Exception as e:
-        log(f"DECODE FAIL {label} — {e}")
-        return 0
+    def _run_decode():
+        try:
+            with open(logfile, "w") as lf:
+                proc = subprocess.Popen(cmd, stdout=lf, stderr=lf)
+            proc.wait(timeout=duration_s * 4)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception as e:
+            log(f"DECODE FAIL {label} — {e}")
+            return
+        cadu = os.path.join(capdir, f"{pipeline}.cadu")
+        size = os.path.getsize(cadu) if os.path.exists(cadu) else 0
+        if size > 0:
+            log(f"DECODE DONE {label} — {size} bytes CADU — IMAGES LIKELY")
+        else:
+            log(f"DECODE DONE {label} — 0 bytes CADU — no lock — check {logfile}")
 
-    cadu = os.path.join(capdir, f"{pipeline}.cadu")
-    size = os.path.getsize(cadu) if os.path.exists(cadu) else 0
-    if size > 0:
-        log(f"DECODE DONE {label} — {size} bytes CADU — IMAGES LIKELY")
-    else:
-        log(f"DECODE DONE {label} — 0 bytes CADU — no lock — check {logfile}")
-    return size
+    threading.Thread(target=_run_decode, daemon=False).start()
+    return 0
 
 
 def analyze_150mhz(iqfile, label, center_hz):
@@ -1028,6 +1102,7 @@ def run_job(ptype, kwargs):
             rtl_kwargs = {k: v for k, v in run_kwargs.items()
                           if k in ("freq_hz", "outfile", "duration_s", "label")}
             rtl_kwargs["gain"] = run_kwargs.get("lna", 40)
+            rtl_kwargs["bias_tee"] = run_kwargs.get("bias_tee", False)
             outfile = rtl_sdr_capture(**rtl_kwargs)
         else:
             outfile = hackrf_capture(**run_kwargs)
@@ -1042,10 +1117,11 @@ def run_job(ptype, kwargs):
                     "--name",   name,
                     "--max-el", str(max_el),
                     "--freq",   str(freq_hz),
+                    "--force-summary",
                 ]
                 threading.Thread(
                     target=lambda c=cmd: subprocess.run(c, capture_output=False),
-                    daemon=True,
+                    daemon=False,
                 ).start()
             # gr_satellites decode for supported digital satellites
             # Signal frequencies (actual) vs tuned center (offset -50 kHz to avoid DC spike)
@@ -1069,6 +1145,7 @@ def run_job(ptype, kwargs):
                         tmppath = iqfile.replace(".iq", "_tmp.cf32")
                         cf32.tofile(tmppath)
                         del cf32, data
+                        os.makedirs(dumpdir, exist_ok=True)
                         cmd = ["gr_satellites", sat, "--rawfile", tmppath,
                                "--samp_rate", "2000000", "--iq", "--dump_path", dumpdir]
                         if offset != 0:
@@ -1077,7 +1154,7 @@ def run_job(ptype, kwargs):
                         os.unlink(tmppath)
                     except Exception as e:
                         log(f"gr_satellites decode failed: {e}")
-                threading.Thread(target=_gr_decode, daemon=True).start()
+                threading.Thread(target=_gr_decode, daemon=False).start()
         return {"ok": bool(outfile), "output": outfile}
     elif ptype == "satdump":
         source   = run_kwargs.get("source", "hackrf")
