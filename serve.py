@@ -15,6 +15,7 @@ import os
 import socketserver
 import sys
 import tarfile
+import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -49,7 +50,12 @@ AUDIT_PATH = os.path.join(os.path.expanduser("~"), "sdr_web_audit.jsonl")
 SCHEDULER_LOG_PATH = os.path.join(os.path.expanduser("~"), "sdr_scheduler.log")
 TTL = 2 * 3600  # seconds; CelesTrak asks clients not to refetch a group within ~2h
 TX_TTL = 7 * 24 * 3600
+UPCOMING_TTL = 300  # cache upcoming pass predictions for 5 minutes
 API_VERSION = "v1"
+
+_upcoming_cache: dict = {}
+_upcoming_cache_lock = threading.Lock()
+_upcoming_recomputing: set = set()  # cache keys currently being recomputed
 
 # Only allow the catalogs the app exposes (also prevents using us as an open proxy).
 ALLOWED = {"active", "radio", "visual", "stations", "starlink", "gps-ops", "science"}
@@ -962,14 +968,43 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     raise ValueError("hours must be > 0")
                 if limit_per_rule < 1:
                     raise ValueError("limit_per_rule must be >= 1")
-                results = upcoming_scheduler_runs(hours, limit_per_rule)
             except ValueError as e:
                 self.send_error(400, str(e))
                 return
-            except Exception as e:
-                self.send_error(500, f"could not compute upcoming runs: {e}")
-                return
-            write_json(self, 200, results)
+            cache_key = (hours, limit_per_rule)
+            with _upcoming_cache_lock:
+                entry = _upcoming_cache.get(cache_key)
+                stale = entry and (time.time() - entry["ts"]) >= UPCOMING_TTL
+                if entry and (not stale or cache_key in _upcoming_recomputing):
+                    # Fresh or stale-but-recomputing: serve cached data immediately
+                    write_json(self, 200, entry["data"])
+                    return
+                if not entry:
+                    # Cold cache: must compute synchronously (warmup thread handles this at startup)
+                    try:
+                        results = upcoming_scheduler_runs(hours, limit_per_rule)
+                        _upcoming_cache[cache_key] = {"ts": time.time(), "data": results}
+                    except Exception as e:
+                        self.send_error(500, f"could not compute upcoming runs: {e}")
+                        return
+                    write_json(self, 200, results)
+                    return
+                # Stale: serve stale data now, kick off background recompute
+                _upcoming_recomputing.add(cache_key)
+            write_json(self, 200, entry["data"])
+            def _recompute():
+                try:
+                    results = upcoming_scheduler_runs(hours, limit_per_rule)
+                    with _upcoming_cache_lock:
+                        _upcoming_cache[cache_key] = {"ts": time.time(), "data": results}
+                        _upcoming_recomputing.discard(cache_key)
+                    sys.stderr.write("[upcoming] cache refreshed\n")
+                except Exception as e:
+                    with _upcoming_cache_lock:
+                        _upcoming_recomputing.discard(cache_key)
+                    sys.stderr.write(f"[upcoming] cache refresh failed: {e}\n")
+            threading.Thread(target=_recompute, daemon=True).start()
+            return
             return
         if path == "/scheduler/logs":
             qs = parse_qs(parsed.query)
@@ -1232,7 +1267,18 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def _warm_upcoming_cache():
+    try:
+        results = upcoming_scheduler_runs(48, 100)
+        with _upcoming_cache_lock:
+            _upcoming_cache[(48, 100)] = {"ts": time.time(), "data": results}
+        sys.stderr.write("[upcoming] cache warmed\n")
+    except Exception as e:
+        sys.stderr.write(f"[upcoming] cache warm failed: {e}\n")
+
+
 if __name__ == "__main__":
+    threading.Thread(target=_warm_upcoming_cache, daemon=True).start()
     with Server(("0.0.0.0", PORT), Handler) as httpd:
         print(f"Serving {ROOT} on http://localhost:{PORT}  (TLE proxy at /tle?group=active)")
         try:
