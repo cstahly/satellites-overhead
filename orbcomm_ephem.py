@@ -90,6 +90,31 @@ def terminal_codes(valid):
             out[''.join(c if 32 <= b < 127 else '.' for b, c in zip(raw, raw.decode('latin1')))] += 1
     return out
 
+# central growing corpus of pre-demuxed message blobs (DES-ECB encrypted core +
+# plaintext framing), pass-prefixed, for cross-pass structural analysis. Each pass
+# appends; nothing is decrypted — this is captured-data organization only.
+BLOB_CORPUS = os.path.expanduser("~/noaa_captures/orbcomm_blobs")
+
+def write_blobs(capdir, messages):
+    if not messages:
+        return 0
+    try:
+        os.makedirs(BLOB_CORPUS, exist_ok=True)
+        passname = os.path.basename(capdir.rstrip("/"))
+        man = os.path.join(BLOB_CORPUS, "corpus_manifest.txt")
+        new = not os.path.exists(man)
+        with open(man, "a") as mf:
+            if new:
+                mf.write("# ORBCOMM pre-demuxed message blobs (encrypted core + framing). file  bytes  hex\n")
+            for n, m in enumerate(messages):
+                fn = f"{passname}_{n:03d}.enc"
+                with open(os.path.join(BLOB_CORPUS, fn), "wb") as f:
+                    f.write(bytes.fromhex(m))
+                mf.write(f"{fn}  {len(m)//2:2d}  {m}\n")
+        return len(messages)
+    except Exception:
+        return 0
+
 def main():
     capdir = sys.argv[1]
     valid = load_valid(capdir)
@@ -105,10 +130,11 @@ def main():
                 pass
     messages = demux_messages(valid)
     termcodes = terminal_codes(valid)
+    n_blobs = write_blobs(capdir, messages)
 
     # --- summary (stdout + email + orbcomm_decoded.txt) ---
     lines = [f"ORBCOMM decode: {len(valid)} Fletcher-valid packets, "
-             f"{len(messages)} messages reassembled"]
+             f"{len(messages)} messages reassembled ({n_blobs} blobs -> corpus)"]
     if counts:
         lines.append("  types: " + ", ".join(f"{k}={v}" for k, v in counts.most_common()))
     if termcodes:
