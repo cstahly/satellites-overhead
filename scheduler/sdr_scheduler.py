@@ -37,13 +37,16 @@ from sdr_runtime import emit_event
 # 0 and 1) gives NOSYNC on every pass regardless of iq_swap. NRZ-L variants are now front-loaded.
 # rs_usecheck=False variant is a diagnostic: frames through even if RS fails, reveals framing state.
 # dc_block=False is last resort — known to produce false Viterbi lock, but retained if all else fails.
+# NRZ-M (meteor_m2-x_lrpt) is PROVEN correct for both M2-3 and M2-4 — recovered a
+# full 12-image M2-4 pass from a "0 CADU" capture on 2026-06-14 (the rule had been
+# wrongly set to nrzl: Viterbi SYNCED but Deframer NOSYNC = coding mismatch). nrzm
+# variants first; nrzl kept only as a last-ditch fallback.
 LRPT_RETRY_VARIANTS = [
-    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+iq_swap (primary hypothesis)
-    {"iq_swap": False, "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+no_iq_swap
-    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl_nors",  "dc_block": True},   # nrzl, RS off (diagnostic)
-    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+iq_swap (known NOSYNC, kept as fallback)
-    {"iq_swap": False, "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+no_iq_swap (known NOSYNC)
-    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": False},  # last resort fallback
+    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+iq_swap (PROVEN — primary)
+    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": False},  # nrzm+iq_swap, no dc_block (most CADU on the 06-14 recovery)
+    {"iq_swap": False, "samplerate": "2e6", "pipeline": "meteor_m2-x_lrpt",            "dc_block": True},   # nrzm+no_iq_swap
+    {"iq_swap": True,  "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl fallback (was wrongly primary)
+    {"iq_swap": False, "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+no_iq_swap fallback
 ]
 
 EC2_METEOR_USER = "ec2-user"
@@ -51,6 +54,7 @@ EC2_METEOR_HOST = "sadbabyrabbit.com"
 EC2_METEOR_KEY = os.path.expanduser("~/.ssh/sadbabyrabbit.pem")
 EC2_METEOR_REMOTE_DIR = "/var/www/meteor"
 METEOR_MANIFEST_PATH = os.path.join(HOME, "meteor_push_manifest.json")
+EMAIL_TO = "cstahly+sat@gmail.com"
 
 
 def make_meteor_web_image(image_path, out_path):
@@ -210,6 +214,90 @@ def log(msg):
     print(line, flush=True)
     with open(LOG, "a") as f:
         f.write(line + "\n")
+
+
+def send_pass_email(subject, body, attach=None):
+    try:
+        cmd = ["mail", "-s", subject]
+        if attach and os.path.exists(attach):
+            cmd += ["-A", attach]
+        cmd.append(EMAIL_TO)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        proc.communicate(input=body.encode(), timeout=30)
+        log(f"EMAIL SENT — {subject}")
+    except Exception as e:
+        log(f"EMAIL FAIL — {e}")
+
+
+def chain_health(iqfile, freq_hz, samplerate):
+    """Classify front-end state from raw IQ: healthy, no antenna, or dead LNA.
+
+    Calibrated 2026-06-12 against the SAWbird+ chain at gain 40 / 2 Msps:
+      antenna up + LNA powered : ~31 dB mean power, 137.680 MHz local birdie ~10 dB
+      antenna off, LNA powered : ~14 dB, birdie gone
+      LNA unpowered (blocked)  : ~1 dB
+    Recalibrate thresholds if the LNA or gain changes (e.g. LaNA swap).
+    """
+    try:
+        import numpy as np
+        raw = np.memmap(iqfile, dtype=np.uint8, mode="r")
+        n = min(len(raw) // 2, 40_000_000)
+        if n < 1_000_000:
+            return None
+        ch = raw[: n * 2].astype(np.float32) - 127.5
+        iq = ch[0::2] + 1j * ch[1::2]
+        iq -= iq.mean()
+        power = float(10 * np.log10(np.mean(np.abs(iq) ** 2) + 1e-9))
+        birdie = None
+        off = 137_679_700 - int(freq_hz)   # local always-on carrier, arrives via antenna
+        if abs(off) < 0.45 * samplerate:
+            nfft = 65536
+            sp = np.zeros(nfft)
+            win = np.hanning(nfft)
+            for k in range(20):
+                seg = iq[k * nfft:(k + 1) * nfft]
+                if len(seg) < nfft:
+                    break
+                sp += np.abs(np.fft.fftshift(np.fft.fft(seg * win)))
+            fr = np.fft.fftshift(np.fft.fftfreq(nfft, 1.0 / samplerate))
+            m = np.abs(fr - off) < 5000
+            if m.any():
+                birdie = float(20 * np.log10(sp[m].max() / np.median(sp)))
+        # Power is the reliable indicator. The 137.68 birdie is an unintentional
+        # LOCAL emitter that fades in/out on its own (9.9 dB one pass, 2.2 dB the
+        # next) — so a weak birdie is NOT evidence of an antenna fault and must
+        # not flip the verdict. It's reported as a note only. (2026-06-14: dropped
+        # the birdie<6 trigger after it false-alarmed a healthy 31 dB pass.)
+        if power < 7:
+            verdict = "LNA DEAD/UNPOWERED"
+        elif power < 22:
+            verdict = "NO ANTENNA?"
+        else:
+            verdict = "HEALTHY"
+        if birdie is not None:
+            b_str = f", birdie {birdie:.1f} dB" + (" (local emitter quiet)" if birdie < 6 else "")
+        else:
+            b_str = ""
+        return f"{verdict} (power {power:.1f} dB{b_str})"
+    except Exception as e:
+        return f"check failed: {e}"
+
+
+def make_email_thumb(src_png, max_px=800):
+    """Downscale a waterfall PNG to a reasonably-sized JPEG for email attachment."""
+    try:
+        from PIL import Image
+        out = os.path.splitext(src_png)[0] + "_email.jpg"
+        im = Image.open(src_png).convert("RGB")
+        im.thumbnail((max_px, max_px))
+        im.save(out, "JPEG", quality=82, optimize=True)
+        return out
+    except Exception as e:
+        log(f"THUMB FAIL {src_png} — {e}")
+        return None
 
 
 def scheduler_event(event_type, data=None, notification=None):
@@ -442,14 +530,16 @@ def refresh_satdump_tles():
 
 def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
                           samplerate=2_000_000, iq_swap=True, dc_block=True,
-                          pipeline="meteor_m2-x_lrpt"):
+                          pipeline="meteor_m2-x_lrpt", name="", norad=0,
+                          max_el=0.0, profile="", bias_tee=False):
     """Capture CU8 IQ with rtl_sdr, then decode offline with satdump baseband mode."""
     iqfile  = capdir + ".iq"
     logfile = capdir + ".log"
     os.makedirs(capdir, exist_ok=True)
 
     # Step 1: capture IQ
-    iq_result = rtl_sdr_capture(freq, iqfile, duration_s, gain=gain, label=label)
+    iq_result = rtl_sdr_capture(freq, iqfile, duration_s, gain=gain, label=label,
+                                bias_tee=bias_tee)
     if not iq_result:
         log(f"DECODE SKIP {label} — IQ capture failed")
         return 0
@@ -482,10 +572,85 @@ def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
             return
         cadu = os.path.join(capdir, f"{pipeline}.cadu")
         size = os.path.getsize(cadu) if os.path.exists(cadu) else 0
-        if size > 0:
-            log(f"DECODE DONE {label} — {size} bytes CADU — IMAGES LIKELY")
+
+        # Generate pass summary now that satdump has finished writing its output
+        summary_script = os.path.join(REPO_DIR, "satdump_pass_summary.py")
+        if os.path.exists(summary_script):
+            try:
+                subprocess.run(
+                    ["python3", summary_script, capdir,
+                     "--name", name or label, "--norad", str(norad or 0),
+                     "--max-el", str(max_el), "--pipeline", pipeline,
+                     "--freq", str(int(freq))],
+                    timeout=120,
+                )
+            except Exception as e:
+                log(f"SUMMARY FAIL {label} — {e}")
+
+        # Render a waterfall PNG from the raw IQ for at-a-glance "was anything on the air?"
+        wf_script = os.path.expanduser("~/iq_waterfall.py")
+        if os.path.exists(wf_script) and os.path.exists(iqfile):
+            try:
+                subprocess.run(
+                    ["python3", wf_script, iqfile,
+                     "--fs", str(samplerate), "--fc", str(int(freq)),
+                     "--out", os.path.join(capdir, "waterfall.png")],
+                    timeout=180,
+                )
+            except Exception as e:
+                log(f"WATERFALL FAIL {label} — {e}")
+
+        # Front-end health: was the antenna/LNA actually alive for this capture?
+        chain_str = chain_health(iqfile, int(freq), samplerate) if os.path.exists(iqfile) else None
+        if chain_str:
+            log(f"CHAIN {label} — {chain_str}")
+
+        summary_md = ""
+        summary_path = os.path.join(capdir, "pass_summary.md")
+        if os.path.exists(summary_path):
+            with open(summary_path) as f:
+                summary_md = f.read()
+
+        imgs = []
+        for root, _, files in os.walk(capdir):
+            if os.path.abspath(root) == os.path.abspath(capdir):
+                continue  # skip capdir root — satdump products live in subdirs (MSU-MR/);
+                          # ignores our own waterfall.png and other non-product artifacts
+            for fn in sorted(files):
+                if fn.lower().endswith((".png", ".jpg", ".webp")):
+                    imgs.append(os.path.relpath(os.path.join(root, fn), capdir))
+
+        if "meteor_lrpt" in profile and imgs:
+            msa = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
+            if os.path.exists(msa):
+                _mtime = os.path.getmtime(msa)
+                _captured_at = datetime.datetime.fromtimestamp(
+                    _mtime, datetime.timezone.utc
+                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                try:
+                    push_meteor_image(capdir, name or label, max_el, _captured_at)
+                except Exception as e:
+                    log(f"PUSH FAIL {label} — {e}")
+
+        # Attach a downscaled waterfall so the email shows whether anything was on the air
+        wf_png = os.path.join(capdir, "waterfall.png")
+        wf_thumb = make_email_thumb(wf_png) if os.path.exists(wf_png) else None
+
+        img_list = "\n".join(f"  {i}" for i in imgs) if imgs else "  (none)"
+        if size > 0 or imgs:
+            result = "DECODED" if size > 0 else "IMAGES (no CADU)"
+            log(f"DECODE DONE {label} — {size} bytes CADU — {len(imgs)} images")
+            body = summary_md if summary_md else f"Pass: {label}\nCADU: {size:,} bytes\n"
+            body += f"\nImages ({len(imgs)}):\n{img_list}\n"
+            if chain_str:
+                body += f"\nChain: {chain_str}\n"
+            send_pass_email(f"SAT PASS: {label} — {result}", body, attach=wf_thumb)
         else:
             log(f"DECODE DONE {label} — 0 bytes CADU — no lock — check {logfile}")
+            body = summary_md or f"Pass: {label}\nCADU: 0 bytes\nResult: NO LOCK\nLog: {logfile}\n"
+            if chain_str:
+                body += f"\nChain: {chain_str}\n"
+            send_pass_email(f"SAT PASS: {label} — NO LOCK", body, attach=wf_thumb)
 
     threading.Thread(target=_run_decode, daemon=False).start()
     return 0
@@ -886,6 +1051,7 @@ def build_rule_jobs(rule, hours=24, limit=4):
                     iq_swap=bool(rule.get("iq_swap", LRPT_RETRY_VARIANTS[0]["iq_swap"])),
                     dc_block=bool(rule.get("dc_block", LRPT_RETRY_VARIANTS[0].get("dc_block", True))),
                     pipeline=str(rule.get("pipeline", default_pipeline)),
+                    bias_tee=bool(rule.get("bias_tee", False)),
                     _retry_idx=0,
                     **meta,
                 ),
@@ -959,6 +1125,7 @@ def build_scan_now_job(command):
                 "iq_swap": iq_swap,
                 "pipeline": pipeline,
                 "dc_block": dc_block,
+                "bias_tee": bool(command.get("bias_tee", profile == "meteor_lrpt_rtlsdr")),
             },
         )
     return (
@@ -1022,6 +1189,10 @@ def job_key(job):
     fire_time, ptype, kwargs = job
     return (job_fire_dt(fire_time).isoformat(timespec="minutes"), ptype, kwargs.get("label", ""))
 
+# A LEO orbital period is ~95-105 min, so two rule-generated jobs for the same
+# satellite firing within this window are necessarily the same physical pass —
+# even if a TLE refresh shifted the predicted time/elevation and changed the
+# label (which defeats exact job_key dedup; see 2026-06-11 double-fire).
 def job_end_dt(job):
     return job_fire_dt(job[0]) + datetime.timedelta(seconds=max(1, int(job[2].get("duration_s", 1))))
 
@@ -1177,38 +1348,45 @@ def run_job(ptype, kwargs):
                 iq_swap      = run_kwargs.get("iq_swap", True),
                 dc_block     = run_kwargs.get("dc_block", True),
                 pipeline     = pipeline,
+                name         = name,
+                norad        = norad,
+                max_el       = max_el,
+                profile      = kwargs.get("_profile", ""),
+                bias_tee     = run_kwargs.get("bias_tee", False),
             )
         else:
             cadu_bytes = satdump_capture(**run_kwargs)
 
         freq_hz    = int(run_kwargs.get("freq", 0))
-        summary_script = os.path.join(REPO_DIR, "satdump_pass_summary.py")
-        if capdir and os.path.exists(summary_script):
-            cmd = [
-                "python3", summary_script, capdir,
-                "--name",     name,
-                "--norad",    str(norad or 0),
-                "--max-el",   str(max_el),
-                "--pipeline", pipeline,
-                "--freq",     str(freq_hz),
-            ]
-            threading.Thread(
-                target=lambda c=cmd: subprocess.run(c, capture_output=False),
-                daemon=True,
-            ).start()
-        profile_str = kwargs.get("_profile", "")
-        if "meteor_lrpt" in profile_str and capdir:
-            img = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
-            if os.path.exists(img):
-                _mtime = os.path.getmtime(img)
-                _captured_at = datetime.datetime.fromtimestamp(
-                    _mtime, datetime.timezone.utc
-                ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        if source != "rtlsdr":
+            # RTL-SDR: summary and image push are handled in _run_decode after the async decode
+            summary_script = os.path.join(REPO_DIR, "satdump_pass_summary.py")
+            if capdir and os.path.exists(summary_script):
+                cmd = [
+                    "python3", summary_script, capdir,
+                    "--name",     name,
+                    "--norad",    str(norad or 0),
+                    "--max-el",   str(max_el),
+                    "--pipeline", pipeline,
+                    "--freq",     str(freq_hz),
+                ]
                 threading.Thread(
-                    target=push_meteor_image,
-                    args=(capdir, name, max_el, _captured_at),
+                    target=lambda c=cmd: subprocess.run(c, capture_output=False),
                     daemon=True,
                 ).start()
+            profile_str = kwargs.get("_profile", "")
+            if "meteor_lrpt" in profile_str and capdir:
+                img = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
+                if os.path.exists(img):
+                    _mtime = os.path.getmtime(img)
+                    _captured_at = datetime.datetime.fromtimestamp(
+                        _mtime, datetime.timezone.utc
+                    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                    threading.Thread(
+                        target=push_meteor_image,
+                        args=(capdir, name, max_el, _captured_at),
+                        daemon=True,
+                    ).start()
         return {"ok": cadu_bytes > 0, "cadu_bytes": cadu_bytes}
     else:
         log(f"UNKNOWN JOB TYPE {ptype} — {run_kwargs}")
@@ -1266,7 +1444,16 @@ def scheduler_loop():
                 last_next = None
             next_reload = now_ts + RELOAD_INTERVAL_S
 
-        due = [job for job in jobs if job_key(job) not in completed and job_fire_dt(job[0]) <= now]
+        # NOTE: deliberately NO same-satellite "pass dedup" here. A TLE refresh can
+        # produce two predictions for one pass at different times/elevations; they
+        # are NOT redundant — one may be wrong (empty window) and the other real.
+        # Suppressing the "duplicate" once cost us the only good M2-4 pass of the
+        # week (2026-06-14). job_key (fire-minute + label) still stops a single
+        # job double-firing; that's all the dedup we want. Capture both windows —
+        # disk is cheap, missed intermittent passes are not.
+        due = [job for job in jobs
+               if job_key(job) not in completed
+               and job_fire_dt(job[0]) <= now]
         if due:
             job = sorted(due, key=lambda item: job_fire_dt(item[0]))[0]
             completed.add(job_key(job))
@@ -1354,6 +1541,15 @@ def scheduler_loop():
                     append_capture_record(record)
                 except Exception as e:
                     log(f"HISTORY WRITE FAIL — {e}")
+                if ptype == "iq":
+                    _el = record.get("max_el") or 0.0
+                    _status = "CAPTURED" if record["success"] else "FAILED"
+                    send_pass_email(
+                        f"SAT PASS: {record['name']} {_el:.1f}deg — {_status}",
+                        f"Satellite: {record['name']}\nMax elevation: {_el:.1f}°\n"
+                        f"Size: {record['size_bytes']:,} bytes\nResult: {_status}\n"
+                        f"Output: {record.get('output', 'n/a')}\n",
+                    )
                 scheduler_event(
                     "capture.failed" if failed else "capture.completed",
                     {"capture": record, "result": run_result or {}},
@@ -1366,7 +1562,9 @@ def scheduler_loop():
             next_reload = 0.0
             continue
 
-        future = [job for job in jobs if job_key(job) not in completed and job_fire_dt(job[0]) > now]
+        future = [job for job in jobs
+                  if job_key(job) not in completed
+                  and job_fire_dt(job[0]) > now]
         if future:
             job = sorted(future, key=lambda item: job_fire_dt(item[0]))[0]
             fire_dt = job_fire_dt(job[0])
