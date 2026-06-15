@@ -1,0 +1,7 @@
+{
+  "uuid": "sat-passes@cstahly",
+  "name": "Sat Passes",
+  "description": "Next satellite pass with a live countdown in the top bar; click for the upcoming-pass list. Reads ~/.local/share/sat-passes/passes.json (produced from the SDR scheduler's predictor).",
+  "shell-version": ["47", "48", "49", "50"],
+  "version": 1
+}
