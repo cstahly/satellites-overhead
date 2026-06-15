@@ -49,6 +49,12 @@ LRPT_RETRY_VARIANTS = [
     {"iq_swap": False, "samplerate": "2e6", "pipeline": "meteor_m2-4_lrpt_nrzl",       "dc_block": True},   # nrzl+no_iq_swap fallback
 ]
 
+# satdump pipelines that REQUIRE live decode (their demod throws if fed a file).
+# ORBCOMM's auto STX demod is live-only — must decode straight off the RTL-SDR,
+# not via the capture-IQ-then-offline path. (Found 2026-06-14: every ORBCOMM pass
+# was 0 CADU because the offline decode threw "live-only".)
+LIVE_ONLY_PIPELINES = {"orbcomm_stx_auto_plotter", "orbcomm_stx_auto"}
+
 EC2_METEOR_USER = "ec2-user"
 EC2_METEOR_HOST = "sadbabyrabbit.com"
 EC2_METEOR_KEY = os.path.expanduser("~/.ssh/sadbabyrabbit.pem")
@@ -450,19 +456,23 @@ def hackrf_capture(freq_hz, outfile, duration_s, lna=32, vga=40, amp=1, label=""
 
 def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, label="",
                     samplerate="1e6", iq_swap=True, pipeline="meteor_m2-x_lrpt",
-                    dc_block=True, source="hackrf"):
+                    dc_block=True, source="hackrf", bias_tee=False):
+    """Live satdump decode straight off the SDR (HackRF, or RTL-SDR for live-only
+    pipelines like ORBCOMM auto). No IQ is saved — satdump decodes in real time."""
     logfile = capdir + ".log"
     pidfile = capdir + ".pid"
     # Convert samplerate to integer — satdump rejects scientific notation strings
     sr_int = int(float(samplerate)) if samplerate else 1_000_000
     flags = ("--iq_swap " if iq_swap else "") + f"sr={sr_int}" + (" dc_block" if dc_block else "")
-    log(f"START {label} — satdump/{source} {pipeline} {freq/1e6:.1f} MHz [{flags}] → {capdir} (tail -f {logfile})")
+    log(f"START {label} — satdump/{source} live {pipeline} {freq/1e6:.1f} MHz [{flags}] → {capdir} (tail -f {logfile})")
     cmd = ["satdump", "live", pipeline, capdir,
            "--source", source, "--samplerate", str(sr_int),
-           "--frequency", str(freq),
+           "--frequency", str(int(float(freq))),
            "--timeout", str(duration_s)]
     if source == "rtlsdr":
         cmd += ["--gain", str(lna)]   # lna_gain repurposed as single RTL-SDR gain
+        if bias_tee:
+            cmd.append("--bias")      # power the SAWbird inline (137 MHz LRPT/ORBCOMM)
     else:
         cmd += ["--lna_gain", str(lna), "--vga_gain", str(vga), "--amp", str(amp)]
     if iq_swap:
@@ -476,12 +486,14 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
         with open(pidfile, "w") as pf:
             pf.write(str(proc.pid))
         proc.wait()
-        cadu = os.path.join(capdir, f"{pipeline}.cadu")
-        size = os.path.getsize(cadu) if os.path.exists(cadu) else 0
+        # Meteor makes .cadu; ORBCOMM makes .frm. Count whichever the pipeline produced.
+        prod = [os.path.join(dp, fn) for dp, _, fns in os.walk(capdir)
+                for fn in fns if fn.endswith((".cadu", ".frm"))]
+        size = max((os.path.getsize(p) for p in prod), default=0)
         if size > 0:
-            log(f"DONE  {label} — {size} bytes CADU — IMAGES LIKELY")
+            log(f"DONE  {label} — {size} bytes decoded ({len(prod)} product file(s))")
         else:
-            log(f"DONE  {label} — 0 bytes CADU — no lock — check {logfile}")
+            log(f"DONE  {label} — 0 bytes — no lock — check {logfile}")
         return size
     except Exception as e:
         log(f"FAIL  {label} — {e}")
@@ -491,6 +503,9 @@ def satdump_capture(capdir, duration_s, freq=137.1e6, lna=32, vga=48, amp=1, lab
             os.unlink(pidfile)
         except FileNotFoundError:
             pass
+        if source == "rtlsdr" and bias_tee:
+            # ensure the bias-tee is off after the live decode (satdump --bias may leave it on)
+            subprocess.run(["rtl_biast", "-d", "0", "-b", "0"], capture_output=True)
 
 _SATDUMP_SETTINGS = os.path.expanduser("~/.config/satdump/settings.json")
 _SATDUMP_TLES     = os.path.expanduser("~/.config/satdump/satdump_tles.txt")
@@ -1189,10 +1204,6 @@ def job_key(job):
     fire_time, ptype, kwargs = job
     return (job_fire_dt(fire_time).isoformat(timespec="minutes"), ptype, kwargs.get("label", ""))
 
-# A LEO orbital period is ~95-105 min, so two rule-generated jobs for the same
-# satellite firing within this window are necessarily the same physical pass —
-# even if a TLE refresh shifted the predicted time/elevation and changed the
-# label (which defeats exact job_key dedup; see 2026-06-11 double-fire).
 def job_end_dt(job):
     return job_fire_dt(job[0]) + datetime.timedelta(seconds=max(1, int(job[2].get("duration_s", 1))))
 
@@ -1336,8 +1347,23 @@ def run_job(ptype, kwargs):
         pipeline = run_kwargs.get("pipeline", "meteor_m2-x_lrpt")
         freq_hz  = int(run_kwargs.get("freq", 0))
 
-        if source == "rtlsdr":
-            # RTL-SDR: capture CU8 IQ then decode offline (live mode broken)
+        if source == "rtlsdr" and pipeline in LIVE_ONLY_PIPELINES:
+            # ORBCOMM (live-only pipeline): decode live straight off the RTL-SDR.
+            cadu_bytes = satdump_capture(
+                capdir     = capdir,
+                duration_s = run_kwargs.get("duration_s", 600),
+                freq       = freq_hz,
+                lna        = run_kwargs.get("lna", 40),
+                label      = run_kwargs.get("label", name),
+                samplerate = run_kwargs.get("samplerate", "2e6"),
+                iq_swap    = run_kwargs.get("iq_swap", False),
+                dc_block   = run_kwargs.get("dc_block", False),
+                pipeline   = pipeline,
+                source     = "rtlsdr",
+                bias_tee   = run_kwargs.get("bias_tee", False),
+            )
+        elif source == "rtlsdr":
+            # RTL-SDR LRPT: capture CU8 IQ then decode offline (live mode broken for LRPT)
             cadu_bytes = rtlsdr_satdump_decode(
                 capdir       = capdir,
                 duration_s   = run_kwargs.get("duration_s", 600),
