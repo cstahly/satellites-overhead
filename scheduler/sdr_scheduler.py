@@ -511,28 +511,67 @@ _SATDUMP_SETTINGS = os.path.expanduser("~/.config/satdump/settings.json")
 _SATDUMP_TLES     = os.path.expanduser("~/.config/satdump/satdump_tles.txt")
 _SCHEDULER_TLE_CACHE = os.path.join(HOME, "src", "satellites-overhead", ".tlecache", "active.tle")
 
-_TLE_SOURCES = [
-    "https://tle.ivanstanojevic.me/api/tle/?format=tle&page-size=5000",
-    "https://db.satnogs.org/api/tle/?format=tle&page_size=5000",
-]
+# satnogs 3le is the working source (2026-06-14): CelesTrak is unreachable from
+# this box, ivanstanojevic now caps page-size at 100 + IP-blocks bursts, and the
+# old satnogs ?format=tle&page_size=N endpoint 404s. ?format=3le returns the full
+# catalog with names. This MERGES into both the satdump cache AND .tlecache/active.tle
+# (the predictor's source — normally maintained by serve.py via CelesTrak, which
+# is dead), so pass timing stays fresh. Without this the TLEs silently went 7+
+# days stale and pass predictions drifted.
+_TLE_SOURCE = "https://db.satnogs.org/api/tle/?format=3le"
+
+def _parse_3le(text):
+    """Parse 3LE/TLE text into {norad: (name, line1, line2)}."""
+    out = {}
+    lines = text.splitlines()
+    for i, l in enumerate(lines):
+        if l.startswith("1 ") and l[2:7].strip().isdigit() and i + 1 < len(lines):
+            l2 = lines[i + 1]
+            if not l2.startswith("2 "):
+                continue
+            name = lines[i - 1] if i > 0 else l[2:7]
+            if name.startswith("0 "):
+                name = name[2:]
+            out[int(l[2:7])] = (name.strip(), l, l2)
+    return out
+
+def _merge_tles(path, fresh):
+    """Replace TLE lines for NORADs in `fresh`, keep everything else."""
+    lines = open(path, errors="ignore").read().splitlines() if os.path.exists(path) else []
+    out, i = [], 0
+    while i < len(lines):
+        l = lines[i]
+        if l.startswith("1 ") and l[2:7].strip().isdigit() and int(l[2:7]) in fresh and i + 1 < len(lines):
+            n = int(l[2:7]); out += [fresh[n][1], fresh[n][2]]; i += 2
+        else:
+            out.append(l); i += 1
+    seen = {int(l[2:7]) for l in out if l.startswith("1 ") and l[2:7].strip().isdigit()}
+    for n, (nm, l1, l2) in fresh.items():
+        if n not in seen:
+            out += [nm, l1, l2]
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
 
 def refresh_satdump_tles():
-    """Fetch fresh TLEs into satdump's cache and stamp them so satdump skips its own fetch."""
-    import urllib.request, shutil
-    fetched = False
-    for url in _TLE_SOURCES:
-        try:
-            with urllib.request.urlopen(url, timeout=5) as r:
-                data = r.read().decode("utf-8", errors="ignore")
-            if len(data) > 1000 and "1 " in data:
-                with open(_SATDUMP_TLES, "w") as f:
-                    f.write(data)
-                fetched = True
-                break
-        except Exception:
-            continue
-    if not fetched and os.path.exists(_SCHEDULER_TLE_CACHE):
-        shutil.copy2(_SCHEDULER_TLE_CACHE, _SATDUMP_TLES)
+    """Refresh TLEs from satnogs 3le into the satdump cache AND the predictor cache.
+    Falls back to the existing caches (no-op) on failure so a fetch outage never
+    blanks the TLEs."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(_TLE_SOURCE, headers={"User-Agent": "sdr-scheduler-tle/1"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read().decode("utf-8", errors="ignore")
+        fresh = _parse_3le(data)
+        if len(fresh) >= 100:
+            for p in (_SATDUMP_TLES, _SCHEDULER_TLE_CACHE):
+                try:
+                    _merge_tles(p, fresh)
+                except Exception as e:
+                    log(f"TLE merge fail {p} — {e}")
+        else:
+            log(f"TLE refresh — only {len(fresh)} parsed, keeping existing cache")
+    except Exception as e:
+        log(f"TLE refresh fetch failed ({e}) — keeping existing cache")
     try:
         with open(_SATDUMP_SETTINGS) as f:
             cfg = json.load(f)
