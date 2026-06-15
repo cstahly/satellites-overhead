@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-"""Parse an ORBCOMM satdump .frm (from orbcomm_stx_auto_plotter) and extract
-Fletcher-validated packets: ephemeris (satellite GPS positions), sync info,
-and a packet-type summary. Self-contained (no gr-orbcomm / external deps).
+"""Parse a satdump ORBCOMM .frm (orbcomm_stx_auto_plotter) into decoded products.
+Self-contained (no gr-orbcomm / external deps). Per pass it produces:
 
-Usage: orbcomm_ephem.py <capdir>
-Prints a summary and writes <capdir>/orbcomm_decoded.txt. Exit 0 if any
-ephemeris fix was decoded.
+  orbcomm_decoded.txt   — summary (packet taxonomy + ephemeris fixes) [also stdout/email]
+  orbcomm_messages.txt   — reassembled M2M messages + terminal codes + per-type samples
 
-Packet structure + ephemeris scaling from Frank Bieberly's ORBCOMM-receiver
-(github.com/fbieberly/ORBCOMM-receiver), reverse-engineered ORBCOMM STX downlink.
+Packet structure, Fletcher checksum, and ephemeris ECEF scaling from Frank
+Bieberly's ORBCOMM-receiver (github.com/fbieberly/ORBCOMM-receiver). Packet-type
+classifications and the message demux/terminal-code extraction were reverse-
+engineered locally 2026-06-15 (see AGENT_HANDOFF). Usage: orbcomm_ephem.py <capdir>
+Exit 0 if any ephemeris fix decoded.
 """
-import sys, os, glob, math
+import sys, os, glob, math, collections
 from datetime import datetime, timedelta
 
-HDR = {  # type-byte (hex) -> label
+HDR = {  # type-byte (hex) -> label.  *=reverse-engineered locally, not in fbieberly
     '65': 'Sync', '1a': 'Message', '1b': 'Uplink_info', '1c': 'Downlink_info',
     '1d': 'Network', '1e': 'Fill', '1f': 'Ephemeris', '22': 'Orbital',
+    '0a': 'Data2*', '0d': 'Ctrl_0d*', '0e': 'Beacon_0e*', '0b': 'Ctrl_0b*', '13': 'Status_13*',
 }
 
-def fletcher(hexs):
+def fletcher(h):
     s1 = s2 = 0
-    if len(hexs) % 2: hexs += '0'
-    for i in range(0, len(hexs) - 1, 2):
-        s1 = (s1 + int(hexs[i:i+2], 16)) % 256
+    if len(h) % 2: h += '0'
+    for i in range(0, len(h) - 1, 2):
+        s1 = (s1 + int(h[i:i+2], 16)) % 256
         s2 = (s1 + s2) % 256
     return '{:02X}{:02X}'.format(s2, s1)
 
@@ -50,21 +52,48 @@ def parse_ephem(p):
     return dict(sat_id=int(p[4:6], 16), lat=lat, lon=lon, alt_km=alt/1000.0,
                 gps=gt.strftime('%Y-%m-%d %H:%M:%S'))
 
-def decode(capdir):
+def load_valid(capdir):
     frms = glob.glob(os.path.join(capdir, "*.frm"))
     if not frms:
-        return [], {}, 0
-    raw = open(frms[0], 'rb').read()
-    hexs = raw.hex()
-    i = 0; packets = []
+        return []
+    hexs = open(frms[0], 'rb').read().hex()
+    i, packets = 0, []
     while i + 24 <= len(hexs):
         plen = 48 if hexs[i:i+2] == '1f' else 24
         packets.append(hexs[i:i+plen]); i += plen
-    valid = [p for p in packets if fletcher(p) == '0000']
-    counts = {}
+    return [p for p in packets if fletcher(p) == '0000']
+
+def demux_messages(valid):
+    """Reassemble Message (0x1a) fragments by contiguity: collect {0..total-1}
+    per `total` value, emit sorted when complete. byte1 = total(hi)/frag(lo)."""
+    msgs = [(int(p[2], 16), int(p[3], 16), p[4:20]) for p in valid if p[:2] == '1a']
+    open_m, done = {}, []
+    for t, f, d in msgs:
+        if t == 0:
+            continue
+        slot = open_m.setdefault(t, {})
+        if f in slot:
+            open_m[t] = {f: d}
+        else:
+            slot[f] = d
+        if len(open_m[t]) == t:
+            done.append(''.join(open_m[t][k] for k in sorted(open_m[t])))
+            del open_m[t]
+    return done
+
+def terminal_codes(valid):
+    """'F'-prefixed terminal codes from Uplink_info (0x1b), first 4 payload bytes."""
+    out = collections.Counter()
     for p in valid:
-        t = HDR.get(p[:2], 'UNK_0x' + p[:2])
-        counts[t] = counts.get(t, 0) + 1
+        if p[:2] == '1b':
+            raw = bytes.fromhex(p[4:12])
+            out[''.join(c if 32 <= b < 127 else '.' for b, c in zip(raw, raw.decode('latin1')))] += 1
+    return out
+
+def main():
+    capdir = sys.argv[1]
+    valid = load_valid(capdir)
+    counts = collections.Counter(HDR.get(p[:2], 'UNK_0x'+p[:2]) for p in valid)
     fixes = []
     for p in valid:
         if p[:2] == '1f' and len(p) >= 48:
@@ -74,29 +103,51 @@ def decode(capdir):
                     fixes.append(e)
             except Exception:
                 pass
-    return valid, counts, fixes
+    messages = demux_messages(valid)
+    termcodes = terminal_codes(valid)
 
-def main():
-    capdir = sys.argv[1]
-    valid, counts, fixes = decode(capdir)
-    lines = [f"ORBCOMM decode: {len(valid)} Fletcher-valid packets"]
+    # --- summary (stdout + email + orbcomm_decoded.txt) ---
+    lines = [f"ORBCOMM decode: {len(valid)} Fletcher-valid packets, "
+             f"{len(messages)} messages reassembled"]
     if counts:
-        lines.append("  types: " + ", ".join(f"{k}={v}" for k, v in
-                     sorted(counts.items(), key=lambda x: -x[1])))
+        lines.append("  types: " + ", ".join(f"{k}={v}" for k, v in counts.most_common()))
+    if termcodes:
+        lines.append("  terminal codes: " + ", ".join(f"{k}(x{v})" for k, v in termcodes.most_common(6)))
     if fixes:
         lines.append(f"  {len(fixes)} ephemeris fix(es):")
         for e in fixes:
             lines.append(f"    sat {e['sat_id']:3d}: {e['lat']:7.2f}, {e['lon']:8.2f}  "
                          f"{e['alt_km']:.0f} km  GPS {e['gps']}")
     else:
-        lines.append("  no ephemeris fixes (weak pass or no ephemeris in window)")
-    out = "\n".join(lines)
-    print(out)
+        lines.append("  no ephemeris fixes (weak pass or none in window)")
+    summary = "\n".join(lines)
+    print(summary)
     try:
         with open(os.path.join(capdir, "orbcomm_decoded.txt"), "w") as f:
-            f.write(out + "\n")
+            f.write(summary + "\n")
     except Exception:
         pass
+
+    # --- detailed message dump (orbcomm_messages.txt) ---
+    try:
+        with open(os.path.join(capdir, "orbcomm_messages.txt"), "w") as f:
+            f.write(f"# ORBCOMM reassembled messages — {len(messages)} total\n")
+            f.write("# format: [bytes] hex | ascii\n\n")
+            for m in messages:
+                asc = ''.join(c if 32 <= ord(c) < 127 else '.' for c in bytes.fromhex(m).decode('latin1'))
+                f.write(f"[{len(m)//2:2d}B] {m}  |{asc}|\n")
+            f.write("\n# terminal codes (Uplink_info, 'F'-prefixed):\n")
+            for k, v in termcodes.most_common():
+                f.write(f"  {k}  x{v}\n")
+            f.write("\n# sample packets per type:\n")
+            seen = set()
+            for p in valid:
+                t = HDR.get(p[:2], 'UNK_0x'+p[:2])
+                if t not in seen and t not in ('Fill',):
+                    seen.add(t); f.write(f"  {t:14s} {p}\n")
+    except Exception:
+        pass
+
     sys.exit(0 if fixes else 1)
 
 if __name__ == "__main__":
