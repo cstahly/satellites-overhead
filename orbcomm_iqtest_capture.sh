@@ -7,7 +7,7 @@ set -u
 export PATH=/usr/local/bin:/usr/bin:/bin:/home/cstahly/.local/bin
 CAP=/home/cstahly/noaa_captures/orbcomm_iqtest_0429.iq
 REP=/home/cstahly/noaa_captures/orbcomm_iqtest_0429.report.txt
-CENTER=137500000; FS=2000000; GAIN=40; DUR=1140   # 19 min covers AOS->LOS+margin
+CENTER=137500000; FS=2000000; GAIN=30; DUR=1140   # 19 min covers AOS->LOS+margin
 DEV=0
 
 log(){ echo "[$(date -u +%H:%M:%S)] $*"; }
