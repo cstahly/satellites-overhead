@@ -1401,6 +1401,20 @@ def run_job(ptype, kwargs):
                 source     = "rtlsdr",
                 bias_tee   = run_kwargs.get("bias_tee", False),
             )
+            # ORBCOMM post-decode: parse frames for ephemeris (sat positions) + summary, log + email
+            ephem_script = os.path.join(REPO_DIR, "orbcomm_ephem.py")
+            if capdir and os.path.exists(ephem_script):
+                try:
+                    res = subprocess.run(["python3", ephem_script, capdir],
+                                         capture_output=True, text=True, timeout=60)
+                    summary = (res.stdout or "").strip()
+                    if summary:
+                        for ln in summary.splitlines():
+                            log(f"ORBCOMM {ln.strip()}")
+                        lbl = run_kwargs.get("label", name)
+                        send_pass_email(f"SAT PASS: {lbl} — ORBCOMM decode", summary + "\n")
+                except Exception as e:
+                    log(f"ORBCOMM EPHEM FAIL {name} — {e}")
         elif source == "rtlsdr":
             # RTL-SDR LRPT: capture CU8 IQ then decode offline (live mode broken for LRPT)
             cadu_bytes = rtlsdr_satdump_decode(
