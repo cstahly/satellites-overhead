@@ -3,7 +3,8 @@ use chrono::{DateTime, Duration, Local, Utc};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+extern crate libc;
 
 const DEFAULT_URL: &str = "http://localhost:8723";
 
@@ -58,6 +59,12 @@ fn fmt_el(el: f64) -> String {
     else if el >= 20.0 { yellow(&s) }
     else { dim(&s) }
 }
+fn fmt_el_opt(v: &serde_json::Value) -> String {
+    match v.as_f64() {
+        Some(el) => fmt_el(el),
+        None     => dim("—"),
+    }
+}
 
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&s.replace('Z', "+00:00"))
@@ -104,18 +111,18 @@ fn col_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
     w
 }
 
-fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+fn print_table<W: Write>(out: &mut W, headers: &[&str], rows: &[Vec<String>]) {
     if rows.is_empty() {
-        println!("{}", dim("  (no results)"));
+        let _ = writeln!(out, "{}", dim("  (no results)"));
         return;
     }
-    let w = col_widths(headers, rows);
+    let widths = col_widths(headers, rows);
     let header_row: Vec<String> = headers.iter().enumerate()
-        .map(|(i, h)| format!("{:<width$}", h, width = w[i]))
+        .map(|(i, h)| format!("{:<width$}", h, width = widths[i]))
         .collect();
-    println!("  {}", bold(&header_row.join("  ")));
-    let sep: Vec<String> = w.iter().map(|&n| "-".repeat(n)).collect();
-    println!("{}", dim(&format!("  {}", sep.join("  "))));
+    let _ = writeln!(out, "  {}", bold(&header_row.join("  ")));
+    let sep: Vec<String> = widths.iter().map(|&n| "-".repeat(n)).collect();
+    let _ = writeln!(out, "{}", dim(&format!("  {}", sep.join("  "))));
     for row in rows {
         let cells: Vec<String> = row.iter().enumerate().map(|(i, cell)| {
             let visible_len: usize = {
@@ -128,10 +135,10 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
                 }
                 len
             };
-            let pad = if i < w.len() && w[i] > visible_len { w[i] - visible_len } else { 0 };
+            let pad = if i < widths.len() && widths[i] > visible_len { widths[i] - visible_len } else { 0 };
             format!("{}{}", cell, " ".repeat(pad))
         }).collect();
-        println!("  {}", cells.join("  "));
+        let _ = writeln!(out, "  {}", cells.join("  "));
     }
 }
 
@@ -310,6 +317,10 @@ struct Cli {
     json: bool,
     #[arg(short = 'c', global = true, value_name = "N", help = "Number of passes to show (default: all in 48h)")]
     count: Option<usize>,
+    #[arg(short = 'w', long, global = true, help = "Keep running and refresh on interval")]
+    watch: bool,
+    #[arg(short = 'i', long, global = true, value_name = "SECS", default_value_t = 5, help = "Refresh interval for --watch (seconds)")]
+    interval: u64,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -423,7 +434,7 @@ fn parse_latest_signal(log_path: &str) -> Option<SignalSample> {
     None
 }
 
-fn print_signal(s: &SignalSample) {
+fn print_signal<W: Write>(w: &mut W, s: &SignalSample) {
     let snr_str = {
         let v = format!("{:.1} dB", s.snr);
         if s.snr >= 15.0 { green(&v) } else if s.snr >= 8.0 { yellow(&v) } else { red(&v) }
@@ -431,13 +442,13 @@ fn print_signal(s: &SignalSample) {
     let ber_str = format!("{:.4}", s.ber);
     let deframer_str = if s.deframer == "SYNCED" { green("SYNCED") } else { red(&s.deframer) };
     let viterbi_str = if s.viterbi == "SYNCED" { green("SYNCED") } else { yellow(&s.viterbi) };
-    println!("  Signal     SNR {} (peak {:.1} dB)  Viterbi {}  BER {}  Deframer {}",
+    let _ = writeln!(w, "  Signal     SNR {} (peak {:.1} dB)  Viterbi {}  BER {}  Deframer {}",
         snr_str, s.peak_snr, viterbi_str, dim(&ber_str), deframer_str);
 }
 
 // ── command handlers ──────────────────────────────────────────────────────────
 
-fn cmd_status(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> anyhow::Result<()> {
+fn cmd_status<W: Write>(w: &mut W, client: &reqwest::blocking::Client, base: &str, as_json: bool) -> anyhow::Result<()> {
     let data = get(client, &format!("{}/scheduler/status", base))?;
     if as_json { println!("{}", serde_json::to_string_pretty(&data)?); return Ok(()); }
 
@@ -447,8 +458,8 @@ fn cmd_status(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> 
     let age = data["status_age_s"].as_f64();
     let age_str = age.map(|a| dim(&format!("  updated {}s ago", a as u64))).unwrap_or_default();
 
-    println!("\n  Scheduler  {}{}", state_str, age_str);
-    println!("  Queue      {} command(s) pending", data["queue_count"].as_u64().unwrap_or(0));
+    let _ = writeln!(w, "\n  Scheduler  {}{}", state_str, age_str);
+    let _ = writeln!(w, "  Queue      {} command(s) pending", data["queue_count"].as_u64().unwrap_or(0));
 
     if let Some(job) = data["current_job"].as_object() {
         let label = job.get("label").and_then(|v| v.as_str()).unwrap_or("—");
@@ -456,12 +467,12 @@ fn cmd_status(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> 
         if live {
             let freq = job.get("frequency_hz").and_then(|v| v.as_f64());
             let freq_str = freq.map(|f| format!("  {:.3} MHz", f / 1e6)).unwrap_or_default();
-            let out = job.get("output").and_then(|v| v.as_str()).unwrap_or("");
+            let output = job.get("output").and_then(|v| v.as_str()).unwrap_or("");
             let lna = job.get("lna_gain").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
             let vga = job.get("vga_gain").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
             let amp = job.get("amp").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "—".to_string());
-            println!("  Job        {}{}", bold(label), freq_str);
-            println!("  Gains      LNA={}  VGA={}  amp={}", lna, vga, amp);
+            let _ = writeln!(w, "  Job        {}{}", bold(label), freq_str);
+            let _ = writeln!(w, "  Gains      LNA={}  VGA={}  amp={}", lna, vga, amp);
             if let Some(fire) = job.get("fire_time").and_then(|v| v.as_str()) {
                 if let Some(dur) = job.get("duration_s").and_then(|v| v.as_f64()) {
                     if let Some(start) = parse_dt(fire) {
@@ -473,28 +484,28 @@ fn cmd_status(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> 
                         } else {
                             dim("finishing...")
                         };
-                        println!("  Runs until {}  {}", bold(&end_local), rem_str);
+                        let _ = writeln!(w, "  Runs until {}  {}", bold(&end_local), rem_str);
                     }
                 }
             }
-            if !out.is_empty() {
-                let log_path = format!("{}.log", out);
-                println!("  Log        {}", dim(&log_path));
+            if !output.is_empty() {
+                let log_path = format!("{}.log", output);
+                let _ = writeln!(w, "  Log        {}", dim(&log_path));
                 if let Some(sig) = parse_latest_signal(&log_path) {
-                    print_signal(&sig);
+                    print_signal(w, &sig);
                 } else {
-                    println!("  Signal     {}", dim("no samples yet — capture may be starting"));
+                    let _ = writeln!(w, "  Signal     {}", dim("no samples yet — capture may be starting"));
                 }
             }
         } else {
             let fire = job.get("fire_time").and_then(|v| v.as_str()).unwrap_or("");
             let local = if fire.is_empty() { "—".to_string() } else { fmt_local(fire) };
             let until = if fire.is_empty() { String::new() } else { time_until(fire) };
-            println!("  Next       {}  {}  {}", bold(label), local, until);
+            let _ = writeln!(w, "  Next       {}  {}  {}", bold(label), local, until);
         }
-        if !msg.is_empty() { println!("  Status     {}", dim(msg)); }
+        if !msg.is_empty() { let _ = writeln!(w, "  Status     {}", dim(msg)); }
     }
-    println!();
+    let _ = writeln!(w);
     Ok(())
 }
 
@@ -564,7 +575,7 @@ fn cmd_logs(client: &reqwest::blocking::Client, base: &str, tail: usize) -> anyh
 
             if let Some(sig) = parse_latest_signal(log_path) {
                 println!();
-                print_signal(&sig);
+                print_signal(&mut std::io::stdout(), &sig);
             }
         }
     }
@@ -573,7 +584,7 @@ fn cmd_logs(client: &reqwest::blocking::Client, base: &str, tail: usize) -> anyh
     Ok(())
 }
 
-fn cmd_overhead(client: &reqwest::blocking::Client, base: &str, min_el: f64, as_json: bool) -> anyhow::Result<()> {
+fn cmd_overhead<W: Write>(w: &mut W, client: &reqwest::blocking::Client, base: &str, min_el: f64, as_json: bool) -> anyhow::Result<()> {
     let start = (Utc::now() - Duration::hours(2)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let targets = rule_pass_targets(client, base)?;
     let passes = fetch_passes_for_targets(client, base, &targets, 2.5, min_el, Some(&start))?;
@@ -587,10 +598,10 @@ fn cmd_overhead(client: &reqwest::blocking::Client, base: &str, min_el: f64, as_
     if as_json { println!("{}", serde_json::to_string_pretty(&overhead)?); return Ok(()); }
 
     if overhead.is_empty() {
-        println!("{}", dim("  Nothing above the horizon right now."));
+        let _ = writeln!(w, "{}", dim("  Nothing above the horizon right now."));
         return Ok(());
     }
-    println!();
+    let _ = writeln!(w);
     let rows: Vec<Vec<String>> = overhead.iter().map(|p| {
         let los_ts = p["los"].as_str().and_then(|s| parse_dt(s)).map(|d| d.timestamp() as f64).unwrap_or(now_ts);
         let remaining = los_ts - now_ts;
@@ -601,8 +612,8 @@ fn cmd_overhead(client: &reqwest::blocking::Client, base: &str, min_el: f64, as_
             cyan(&format!("LOS in {}", fmt_dur(remaining))),
         ]
     }).collect();
-    print_table(&["Satellite", "NORAD", "Max El", ""], &rows);
-    println!();
+    print_table(w, &["Satellite", "NORAD", "Max El", ""], &rows);
+    let _ = writeln!(w);
     Ok(())
 }
 
@@ -634,17 +645,17 @@ fn cmd_passes(client: &reqwest::blocking::Client, base: &str, norad: Option<u32>
             duration,
         ]
     }).collect();
-    print_table(&["Satellite", "NORAD", "Start (local)", "Until", "Max El", "Duration"], &rows);
+    print_table(&mut std::io::stdout(), &["Satellite", "NORAD", "Start (local)", "Until", "Max El", "Duration"], &rows);
     println!();
     Ok(())
 }
 
-fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> anyhow::Result<()> {
+fn cmd_rules<W: Write>(w: &mut W, client: &reqwest::blocking::Client, base: &str, as_json: bool) -> anyhow::Result<()> {
     let data = get(client, &format!("{}/scheduler/rules", base))?;
     if as_json { println!("{}", serde_json::to_string_pretty(&data)?); return Ok(()); }
 
     let rules = data.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
-    if rules.is_empty() { println!("{}", dim("  No rules configured.")); return Ok(()); }
+    if rules.is_empty() { let _ = writeln!(w, "{}", dim("  No rules configured.")); return Ok(()); }
 
     // Fetch upcoming runs and index by rule_id
     let (upcoming_arr, upcoming_error) = match get(
@@ -674,7 +685,7 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
             .unwrap_or_else(|| "9999".to_string())
     });
 
-    println!();
+    let _ = writeln!(w);
     let rows: Vec<Vec<String>> = rules_sorted.iter().map(|r| {
         let id = r["id"].as_str().unwrap_or("—");
         let enabled = if r["enabled"].as_bool().unwrap_or(false) { green("yes") } else { red("no") };
@@ -722,8 +733,8 @@ fn cmd_rules(client: &reqwest::blocking::Client, base: &str, as_json: bool) -> a
             yellow(&format!("  Warning: could not load upcoming predictions: {}", error))
         );
     }
-    print_table(&["Satellite", "On", "MHz", "Profile", "Gains", "Max El", "Next fire", "Window end"], &rows);
-    println!();
+    print_table(w, &["Satellite", "On", "MHz", "Profile", "Gains", "Max El", "Next fire", "Window end"], &rows);
+    let _ = writeln!(w);
     Ok(())
 }
 
@@ -775,7 +786,7 @@ fn cmd_captures(client: &reqwest::blocking::Client, base: &str, norad: Option<u3
             dim(&id),
         ]
     }).collect();
-    print_table(&["Time", "Satellite", "Profile", "Duration", "Size", "CADU", "Report", "ID"], &rows);
+    print_table(&mut std::io::stdout(), &["Time", "Satellite", "Profile", "Duration", "Size", "CADU", "Report", "ID"], &rows);
     println!();
     Ok(())
 }
@@ -827,11 +838,11 @@ fn cmd_report(client: &reqwest::blocking::Client, base: &str, capture_id: &str) 
 
 // ── dashboard (default, no subcommand) ───────────────────────────────────────
 
-fn cmd_dashboard(client: &reqwest::blocking::Client, base: &str, count: Option<usize>) -> anyhow::Result<()> {
+fn cmd_dashboard<W: Write>(w: &mut W, client: &reqwest::blocking::Client, base: &str, count: Option<usize>) -> anyhow::Result<()> {
     let status = get(client, &format!("{}/scheduler/status", base))?;
     let live = status["live"].as_bool().unwrap_or(false);
 
-    println!();
+    let _ = writeln!(w);
 
     // ── Now running ────────────────────────────────────────────────────────────
     if live {
@@ -848,33 +859,56 @@ fn cmd_dashboard(client: &reqwest::blocking::Client, base: &str, count: Option<u
                     else { dim("finishing...") }
                 }))
                 .unwrap_or_default();
-            println!("  {}  {}{} {}", bold("NOW "), green(label), freq, remaining);
+            let _ = writeln!(w, "  {}  {}{} {}", bold("NOW "), green(label), freq, remaining);
         }
     } else {
-        println!("  {}  {}", bold("NOW "), dim("idle"));
+        let _ = writeln!(w, "  {}  {}", bold("NOW "), dim("idle"));
     }
 
-    // ── Last run ───────────────────────────────────────────────────────────────
+    // ── Recent runs ────────────────────────────────────────────────────────────
     let captures_data = get(client, &format!("{}/captures", base)).unwrap_or(serde_json::json!([]));
-    if let Some(last) = captures_data.as_array().and_then(|a| a.first()) {
-        let name = last["name"].as_str().unwrap_or("—");
-        let time = last["started_at"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
-        let size = fmt_bytes(last["size_bytes"].as_f64().unwrap_or(0.0));
-        let cadu = last["cadu_bytes"].as_f64().unwrap_or(0.0);
-        let result_str = if cadu > 0.0 { green(&format!("decoded  {}", fmt_bytes(cadu))) }
-                         else { dim("no lock") };
-        println!("  {}  {}  {}  {}  {}", bold("LAST"), dim(&time), bold(name), size, result_str);
+    if let Some(all_captures) = captures_data.as_array() {
+        let recent: Vec<_> = match count {
+            Some(n) => all_captures.iter().take(n).collect(),
+            None    => all_captures.iter().take(5).collect(),
+        };
+        let recent: Vec<_> = recent.into_iter().rev().collect();
+        if !recent.is_empty() {
+            let _ = writeln!(w, "\n  {}\n", bold("Recent"));
+            let rows: Vec<Vec<String>> = recent.iter().map(|c| {
+                let name = c["name"].as_str().unwrap_or("—").to_string();
+                let time = c["started_at"].as_str().map(fmt_local).unwrap_or_else(|| "—".to_string());
+                let el = fmt_el_opt(&c["max_el"]);
+                let dur = fmt_dur(c["ended_at"].as_str()
+                    .and_then(|e| c["started_at"].as_str().map(|s| (s, e)))
+                    .and_then(|(s, e)| parse_dt(s).and_then(|st| parse_dt(e).map(|en| (en - st).num_seconds().max(0) as f64)))
+                    .unwrap_or_else(|| c["duration_s"].as_f64().unwrap_or(0.0)));
+                let cadu = c["cadu_bytes"].as_f64().unwrap_or(0.0);
+                let result_str = if cadu > 0.0 { green(&format!("decoded  {}", fmt_bytes(cadu))) }
+                                 else { dim("no lock") };
+                vec![name, time, el, dur, result_str]
+            }).collect();
+            print_table(w, &["Satellite", "Start (local)", "Max El", "Duration", "Result"], &rows);
+        }
     }
 
     // ── Upcoming passes ────────────────────────────────────────────────────────
     let mut windows = fetch_upcoming_windows(client, base, 48.0)?;
+    let now_utc = Utc::now();
+    windows.retain(|p| {
+        p["fire_time"].as_str()
+            .or_else(|| p["aos"].as_str())
+            .and_then(|s| parse_dt(s))
+            .map(|dt| dt > now_utc)
+            .unwrap_or(true)
+    });
     windows.truncate(count.unwrap_or(10));
 
     if windows.is_empty() {
-        println!("\n{}", dim("  No passes scheduled in the next 48 hours."));
+        let _ = writeln!(w, "\n{}", dim("  No passes scheduled in the next 48 hours."));
     } else {
         let now_local = Local::now();
-        println!("\n  {} {} – {}\n",
+        let _ = writeln!(w, "\n  {} {} – {}\n",
             bold("Upcoming"),
             now_local.format("%a %b %d"),
             (now_local + chrono::Duration::days(1)).format("%a %b %d"),
@@ -893,33 +927,87 @@ fn cmd_dashboard(client: &reqwest::blocking::Client, base: &str, count: Option<u
                 duration,
             ]
         }).collect();
-        print_table(&["Satellite", "Start (local)", "Until", "Max El", "Duration"], &rows);
+        print_table(w, &["Satellite", "Start (local)", "Until", "Max El", "Duration"], &rows);
     }
 
-    println!();
+    let _ = writeln!(w);
     Ok(())
+}
+
+// ── watch loop ────────────────────────────────────────────────────────────────
+
+fn watch_loop<F>(interval: u64, mut render: F) -> anyhow::Result<()>
+where
+    F: FnMut(&mut Vec<u8>) -> anyhow::Result<()>,
+{
+    let mut started = false;
+    loop {
+        let mut buf: Vec<u8> = Vec::new();
+        let ts = dim(&Local::now().format("%H:%M:%S  Ctrl-C to exit").to_string());
+        let _ = writeln!(buf, "  {}  {}", bold("sdr --watch"), ts);
+        if let Err(e) = render(&mut buf) {
+            let _ = writeln!(buf, "\n  {}", red(&format!("Error: {}", e)));
+        }
+
+        if is_tty() {
+            if started {
+                // Restore to saved cursor position, then erase to end of screen
+                print!("\x1b[u\x1b[J");
+            } else {
+                // Save cursor position before first print
+                print!("\x1b[s");
+            }
+            std::io::stdout().flush().ok();
+        }
+
+        let text = String::from_utf8_lossy(&buf);
+        print!("{}", text);
+        std::io::stdout().flush().ok();
+        started = true;
+
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // Ignore SIGPIPE so a closed terminal doesn't kill the watch loop
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
+
     let cli = Cli::parse();
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("failed to build HTTP client");
 
-    let result = match &cli.command {
-        None => cmd_dashboard(&client, &cli.url, cli.count),
-        Some(Command::Status) => cmd_status(&client, &cli.url, cli.json),
-        Some(Command::Overhead { min_el }) => cmd_overhead(&client, &cli.url, *min_el, cli.json),
-        Some(Command::Passes { norad, hours, min_el }) => cmd_passes(&client, &cli.url, *norad, *hours, *min_el, cli.json),
-        Some(Command::Rules) => cmd_rules(&client, &cli.url, cli.json),
-        Some(Command::Rule { action, id }) => cmd_rule_toggle(&client, &cli.url, id, matches!(action, RuleAction::Enable)),
-        Some(Command::Captures { norad, limit }) => cmd_captures(&client, &cli.url, *norad, *limit, cli.json),
-        Some(Command::Scan { norad, duration }) => cmd_scan(&client, &cli.url, *norad, *duration),
-        Some(Command::Report { capture_id }) => cmd_report(&client, &cli.url, capture_id),
-        Some(Command::Logs { tail }) => cmd_logs(&client, &cli.url, *tail),
+    let mut so = std::io::stdout();
+    let result = if cli.watch {
+        let (client2, base2, count2, json2) = (&client, cli.url.clone(), cli.count, cli.json);
+        let cmd = cli.command;
+        watch_loop(cli.interval, move |buf| match &cmd {
+            None => cmd_dashboard(buf, client2, &base2, count2),
+            Some(Command::Status) => cmd_status(buf, client2, &base2, json2),
+            Some(Command::Rules) => cmd_rules(buf, client2, &base2, json2),
+            Some(Command::Overhead { min_el }) => cmd_overhead(buf, client2, &base2, *min_el, json2),
+            _ => {
+                let _ = writeln!(buf, "{}", yellow("  --watch not supported for this subcommand"));
+                Ok(())
+            }
+        })
+    } else {
+        match &cli.command {
+            None => cmd_dashboard(&mut so, &client, &cli.url, cli.count),
+            Some(Command::Status) => cmd_status(&mut so, &client, &cli.url, cli.json),
+            Some(Command::Overhead { min_el }) => cmd_overhead(&mut so, &client, &cli.url, *min_el, cli.json),
+            Some(Command::Passes { norad, hours, min_el }) => cmd_passes(&client, &cli.url, *norad, *hours, *min_el, cli.json),
+            Some(Command::Rules) => cmd_rules(&mut so, &client, &cli.url, cli.json),
+            Some(Command::Rule { action, id }) => cmd_rule_toggle(&client, &cli.url, id, matches!(action, RuleAction::Enable)),
+            Some(Command::Captures { norad, limit }) => cmd_captures(&client, &cli.url, *norad, *limit, cli.json),
+            Some(Command::Scan { norad, duration }) => cmd_scan(&client, &cli.url, *norad, *duration),
+            Some(Command::Report { capture_id }) => cmd_report(&client, &cli.url, capture_id),
+            Some(Command::Logs { tail }) => cmd_logs(&client, &cli.url, *tail),
+        }
     };
 
     if let Err(e) = result {
