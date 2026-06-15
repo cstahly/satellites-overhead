@@ -315,6 +315,20 @@ def main():
         print(f"[sat_summary] ERROR: {args.iqfile} not found", file=sys.stderr)
         sys.exit(1)
 
+    # If max_el wasn't passed, try to look it up from the captures DB by output path
+    if args.max_el == 0.0:
+        try:
+            import urllib.request
+            with urllib.request.urlopen("http://localhost:8723/captures", timeout=3) as r:
+                caps = json.load(r)
+            abs_iq = os.path.abspath(args.iqfile)
+            for c in caps:
+                if c.get("output") and os.path.abspath(c["output"]) == abs_iq and c.get("max_el"):
+                    args.max_el = float(c["max_el"])
+                    break
+        except Exception:
+            pass
+
     base       = args.iqfile.replace(".iq", "")
     wavpath    = base + ".wav"
     reportpath = base + "_summary.md"
