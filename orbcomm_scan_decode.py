@@ -16,26 +16,39 @@ import shutil
 OFFLINE = "/home/cstahly/orbcomm_offline.py"
 sz = os.path.getsize(iq)
 
-# --- 1. averaged PSD across the whole pass ---
-nfft = 8192
-acc = np.zeros(nfft); w = np.hanning(nfft); n = 0
-for frac in np.linspace(0.04, 0.96, 80):
-    off = int(sz * frac) // 2 * 2
-    raw = np.fromfile(iq, dtype=np.uint8, count=2 * nfft * 4, offset=off)
-    if raw.size < 2 * nfft:
-        continue
-    x = (raw[0::2].astype(np.float32) - 127.5) + 1j * (raw[1::2].astype(np.float32) - 127.5)
-    for k in range(len(x) // nfft):
-        acc += np.abs(np.fft.fftshift(np.fft.fft(x[k * nfft:(k + 1) * nfft] * w))) ** 2; n += 1
-psd = 10 * np.log10(acc / max(n, 1) + 1e-9)
+# --- 1. PSD with TIME-SLICE PEAK-HOLD across the pass ---
+# A bird is only overhead/transmitting for part of a 15-25 min capture, so averaging
+# the whole capture dilutes it below threshold (that's why the live scheduled passes
+# came up empty while a short hand-clipped capture decoded fine). Instead: average
+# within ~16 time slices, then peak-hold (max per bin) across slices — a signal that's
+# present in ANY slice survives at full strength.
+nfft = 8192; w = np.hanning(nfft)
+NSLICES = 16
+peak = None
+for s in range(NSLICES):
+    base = (s + 0.5) / NSLICES
+    acc = np.zeros(nfft); n = 0
+    for frac in np.linspace(max(0.01, base - 0.025), min(0.99, base + 0.025), 6):
+        off = int(sz * frac) // 2 * 2
+        raw = np.fromfile(iq, dtype=np.uint8, count=2 * nfft * 4, offset=off)
+        if raw.size < 2 * nfft:
+            continue
+        x = (raw[0::2].astype(np.float32) - 127.5) + 1j * (raw[1::2].astype(np.float32) - 127.5)
+        for k in range(len(x) // nfft):
+            acc += np.abs(np.fft.fftshift(np.fft.fft(x[k * nfft:(k + 1) * nfft] * w))) ** 2; n += 1
+    if n:
+        sl = acc / n
+        peak = sl if peak is None else np.maximum(peak, sl)
+psd = 10 * np.log10((peak if peak is not None else np.ones(nfft)) + 1e-9)
 f = np.fft.fftshift(np.fft.fftfreq(nfft, 1 / fs)) + center
-nfloor = np.median(psd[(f > 137.0e6) & (f < 138.0e6)])
-
-# --- 2. candidate channels: local PSD maxima >noise+5dB, away from DC birdie ---
-cand = []
 inband = np.where((f > 137.0e6) & (f < 138.0e6))[0]
+nfloor = np.median(psd[inband])
+
+# --- 2. candidate channels: local peak-hold maxima > noise+THR dB, away from DC birdie ---
+THR = 4.0   # lower than the old +5 — peak-hold keeps real signals well clear of this
+cand = []
 for i in sorted(inband, key=lambda j: -psd[j]):
-    if psd[i] < nfloor + 5:
+    if psd[i] < nfloor + THR:
         break
     fr = f[i]
     if abs(fr - center) < 10e3:           # skip DC/LO birdie
@@ -48,8 +61,18 @@ for i in sorted(inband, key=lambda j: -psd[j]):
     if len(cand) >= 8:
         break
 cand.sort()
-print(f"  noise {nfloor:.1f} dB; {len(cand)} candidate channels: " +
-      (", ".join(f"{c/1e6:.4f}" for c in cand) if cand else "(none above noise+5dB — weak/no signal)"))
+# top in-band peaks (for diagnosing detection even when nothing clears THR)
+_top = sorted(((f[i], psd[i] - nfloor) for i in inband), key=lambda t: -t[1])[:8]
+_summary = (f"  noise {nfloor:.1f} dB (peak-hold); {len(cand)} candidate channels (>+{THR:.0f}dB): " +
+            (", ".join(f"{c/1e6:.4f}" for c in cand) if cand else "(none — weak/no signal)") +
+            "\n  top in-band peaks (MHz +dB): " + ", ".join(f"{fr/1e6:.4f}+{db:.1f}" for fr, db in _top))
+print(_summary)
+if capdir:   # persist so a failed pass is diagnosable without keeping the 4.5 GB IQ
+    try:
+        with open(os.path.join(capdir, "bandscan_report.txt"), "w") as _rf:
+            _rf.write(_summary + "\n")
+    except Exception:
+        pass
 
 # --- 3. offline-decode each candidate ---
 total = 0
