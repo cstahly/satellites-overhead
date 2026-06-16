@@ -9,6 +9,10 @@ sys.path.insert(0, "/home/cstahly/src/satellites-overhead")
 import orbcomm_ephem as oe
 
 iq, center, fs = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+capdir = sys.argv[4] if len(sys.argv) > 4 else None   # if given, copy each channel's .frm
+                                                      # here so orbcomm_ephem (globs
+                                                      # capdir/*.frm) sees them all
+import shutil
 OFFLINE = "/home/cstahly/orbcomm_offline.py"
 sz = os.path.getsize(iq)
 
@@ -49,7 +53,7 @@ print(f"  noise {nfloor:.1f} dB; {len(cand)} candidate channels: " +
 
 # --- 3. offline-decode each candidate ---
 total = 0
-for ch in cand:
+for _i, ch in enumerate(cand):
     subprocess.run(["python3", OFFLINE, iq, str(center), str(fs), str(int(round(ch))),
                     "/tmp/orb_scan.cu8", "8", "0", "100000"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -60,6 +64,11 @@ for ch in cand:
     v = oe.load_valid(out)
     frm = glob.glob(out + "/*.frm")
     nb = os.path.getsize(frm[0]) if frm else 0
+    if capdir and frm and nb > 0:   # hand frames to orbcomm_ephem via the capture dir
+        try:
+            shutil.copy(frm[0], os.path.join(capdir, f"orbcomm_bandscan_ch{_i}.frm"))
+        except Exception:
+            pass
     print(f"    {ch/1e6:.4f} MHz: .frm {nb}B, {len(v)} Fletcher-valid packets")
     total += len(v)
 print(f"  >>> TOTAL valid packets across scan: {total}")

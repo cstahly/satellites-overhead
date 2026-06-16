@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SDR pass scheduler. Run once, handles everything, logs everything."""
-import json, subprocess, time, os, datetime, threading, uuid, sys
+import json, subprocess, time, os, datetime, threading, uuid, sys, glob
 
 HOME = os.path.expanduser("~")
 CAPDIR = os.path.join(HOME, "cosmos_captures")
@@ -1651,21 +1651,49 @@ def run_job(ptype, kwargs):
         pipeline = run_kwargs.get("pipeline", "meteor_m2-x_lrpt")
         freq_hz  = int(run_kwargs.get("freq", 0))
 
-        if source == "rtlsdr" and pipeline in LIVE_ONLY_PIPELINES:
-            # ORBCOMM (live-only pipeline): decode live straight off the RTL-SDR.
-            cadu_bytes = satdump_capture(
-                capdir     = capdir,
-                duration_s = run_kwargs.get("duration_s", 600),
-                freq       = freq_hz,
-                lna        = run_kwargs.get("lna", 40),
-                label      = run_kwargs.get("label", name),
-                samplerate = run_kwargs.get("samplerate", "2e6"),
-                iq_swap    = run_kwargs.get("iq_swap", False),
-                dc_block   = run_kwargs.get("dc_block", False),
-                pipeline   = pipeline,
-                source     = "rtlsdr",
-                bias_tee   = run_kwargs.get("bias_tee", False),
-            )
+        if source == "rtlsdr" and (pipeline in LIVE_ONLY_PIPELINES or pipeline == "orbcomm_bandscan"):
+            if pipeline == "orbcomm_bandscan":
+                # ORBCOMM band-scan: capture raw IQ, scan the band for ACTIVE channels
+                # (PSD peaks) and decode each — no TLE channel-selection blind spot, so
+                # it catches whatever's actually transmitting. Frames land in capdir for
+                # orbcomm_ephem; the 4.5 GB raw IQ is deleted right after decoding.
+                os.makedirs(capdir, exist_ok=True)
+                iqfile = capdir + ".iq"
+                rtl_sdr_capture(freq_hz, iqfile, run_kwargs.get("duration_s", 600),
+                                gain=run_kwargs.get("lna", 40),
+                                label=run_kwargs.get("label", name),
+                                # ORBCOMM needs the SAWbird powered — bias on unless
+                                # the rule explicitly set it False (FM114's rule is null)
+                                bias_tee=run_kwargs.get("bias_tee") is not False)
+                if os.path.exists(iqfile):
+                    try:
+                        subprocess.run(
+                            ["python3", os.path.join(HOME, "orbcomm_scan_decode.py"),
+                             iqfile, str(int(freq_hz)), "2000000", capdir],
+                            timeout=int(run_kwargs.get("duration_s", 600)) * 3)
+                    except Exception as e:
+                        log(f"ORBCOMM BANDSCAN FAIL {name} — {e}")
+                    try:
+                        os.unlink(iqfile)   # drop the 4.5 GB raw IQ once decoded
+                    except Exception:
+                        pass
+                cadu_bytes = sum(os.path.getsize(f)
+                                 for f in glob.glob(os.path.join(capdir, "*.frm")))
+            else:
+                # ORBCOMM (live-only pipeline): decode live straight off the RTL-SDR.
+                cadu_bytes = satdump_capture(
+                    capdir     = capdir,
+                    duration_s = run_kwargs.get("duration_s", 600),
+                    freq       = freq_hz,
+                    lna        = run_kwargs.get("lna", 40),
+                    label      = run_kwargs.get("label", name),
+                    samplerate = run_kwargs.get("samplerate", "2e6"),
+                    iq_swap    = run_kwargs.get("iq_swap", False),
+                    dc_block   = run_kwargs.get("dc_block", False),
+                    pipeline   = pipeline,
+                    source     = "rtlsdr",
+                    bias_tee   = run_kwargs.get("bias_tee", False),
+                )
             # ORBCOMM post-decode: parse frames for ephemeris (sat positions) + summary, log + email
             ephem_script = os.path.join(REPO_DIR, "orbcomm_ephem.py")
             if capdir and os.path.exists(ephem_script):
