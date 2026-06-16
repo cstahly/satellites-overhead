@@ -260,8 +260,10 @@ def log(msg):
 def send_pass_email(subject, body, attach=None):
     try:
         cmd = ["mail", "-s", subject]
-        if attach and os.path.exists(attach):
-            cmd += ["-A", attach]
+        attaches = attach if isinstance(attach, (list, tuple)) else [attach]
+        for a in attaches:
+            if a and os.path.exists(a):
+                cmd += ["-A", a]
         cmd.append(EMAIL_TO)
         proc = subprocess.Popen(
             cmd,
@@ -851,7 +853,18 @@ def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
             body += f"\nImages ({len(imgs)}):\n{img_list}\n"
             if chain_str:
                 body += f"\nChain: {chain_str}\n"
-            send_pass_email(f"SAT PASS: {label} — {result}", body, attach=wf_thumb)
+            # On a good pass, attach a web-sized composite so the image shows inline in
+            # the email (not just the waterfall); full-res still goes to the gallery.
+            comp_thumb = None
+            if "meteor_lrpt" in profile:
+                _comp = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
+                if not (os.path.exists(_comp) and os.path.getsize(_comp) > 60_000):
+                    _comp = os.path.join(capdir, "MSU-MR",
+                                         "msu_mr_rgb_AVHRR_3a21_False_Color_corrected.png")
+                if os.path.exists(_comp):
+                    comp_thumb = make_email_thumb(_comp, max_px=1400)
+            send_pass_email(f"SAT PASS: {label} — {result}", body,
+                            attach=[a for a in (comp_thumb, wf_thumb) if a])
         else:
             log(f"DECODE DONE {label} — 0 bytes CADU — no lock — check {logfile}")
             body = summary_md or f"Pass: {label}\nCADU: 0 bytes\nResult: NO LOCK\nLog: {logfile}\n"
@@ -859,6 +872,19 @@ def rtlsdr_satdump_decode(capdir, duration_s, freq=137.9e6, gain=37, label="",
                 body += f"\nChain: {chain_str}\n"
             send_pass_email(f"SAT PASS: {label} — NO LOCK", body, attach=wf_thumb)
 
+        # finalize: correct the provisional history record the loop wrote right after
+        # capture (before this decode ran), and clear the "decoding" status
+        try:
+            update_capture_record(capdir, size_bytes=size, cadu_bytes=size,
+                                  success=bool(size > 0 or imgs))
+        except Exception as _e:
+            log(f"HISTORY UPDATE FAIL {label} — {_e}")
+        _active_decodes.pop(capdir, None)
+
+    _active_decodes[capdir] = {
+        "type": "satdump", "label": label, "name": name or label, "output": capdir,
+        "frequency_hz": float(freq), "phase": "decoding", "started": time.time(),
+    }
     threading.Thread(target=_run_decode, daemon=False).start()
     return 0
 
@@ -925,6 +951,47 @@ def append_capture_record(record):
             history = []
     history.append(record)
     atomic_write_json(HISTORY_PATH, history)
+
+
+# Meteor decodes run in a background thread AFTER run_job returns (to free the radio for
+# the next pass), so the loop would otherwise write the history record before the decode
+# finishes (showing 0/no-lock for a pass that actually decoded) and report "idle" while
+# the decode is still working. These keep status + history honest during that window.
+_active_decodes = {}   # capdir -> status payload (incl "started"); non-empty => decoding
+
+def update_capture_record(output, **fields):
+    """Update the most recent history record for `output` with real decode results.
+    The loop writes a provisional record right after capture; this corrects it once the
+    threaded decode knows the real CADU size / image count."""
+    if not output or not os.path.exists(HISTORY_PATH):
+        return
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            history = json.load(f)
+        if not isinstance(history, list):
+            return
+    except Exception:
+        return
+    for rec in reversed(history):
+        if rec.get("output") == output:
+            rec.update(fields)
+            try:
+                atomic_write_json(HISTORY_PATH, history)
+            except Exception as e:
+                log(f"HISTORY UPDATE FAIL {output} — {e}")
+            return
+
+def _status_idle_or_decoding(next_job=None, idle_msg="idle"):
+    """Write 'idle' (with next-pass info) unless a background decode is still running —
+    then report 'decoding' so the CLI doesn't show idle mid-decode. Entries older than
+    10 min are ignored as a safety net in case a decode thread died without clearing."""
+    now = time.time()
+    fresh = [d for d in _active_decodes.values() if now - d.get("started", 0) < 600]
+    if fresh:
+        d = fresh[-1]
+        write_scheduler_status("running", d, f"decoding {d.get('label', '')}")
+    else:
+        write_scheduler_status("idle", next_job, idle_msg)
 
 
 def _invoke_pass_manager(capdir, kwargs):
@@ -1789,9 +1856,8 @@ def scheduler_loop():
             finally:
                 ended_at = utc_now_iso()
                 failed = bool(run_error) or not bool(run_result and run_result.get("ok"))
-                write_scheduler_status(
-                    "idle",
-                    message="last capture failed" if failed else "last capture finished",
+                _status_idle_or_decoding(
+                    idle_msg="last capture failed" if failed else "last capture finished",
                 )
                 output = kwargs.get("outfile") or kwargs.get("capdir")
                 size_bytes = 0
@@ -1872,21 +1938,21 @@ def scheduler_loop():
             next_id = job_key(job)
             if next_id != last_next:
                 log(f"Next: {job[2]['label']} at {fire_dt.strftime('%H:%M')} (in {wait:.0f}s)")
-                write_scheduler_status("idle", status_job_payload(job[0], job[1], job[2]), "next capture pending")
+                _status_idle_or_decoding(status_job_payload(job[0], job[1], job[2]), "next capture pending")
                 last_status_update = now_ts
                 last_next = next_id
             elif now_ts - last_status_update >= 30:
-                write_scheduler_status("idle", status_job_payload(job[0], job[1], job[2]), "next capture pending")
+                _status_idle_or_decoding(status_job_payload(job[0], job[1], job[2]), "next capture pending")
                 last_status_update = now_ts
             sleep_s = min(POLL_INTERVAL_S, wait, max(1, next_reload - now_ts))
         else:
             if last_next is not None:
                 log("No scheduled jobs pending.")
-                write_scheduler_status("idle", message="no scheduled jobs pending")
+                _status_idle_or_decoding(idle_msg="no scheduled jobs pending")
                 last_status_update = now_ts
                 last_next = None
             elif now_ts - last_status_update >= 30:
-                write_scheduler_status("idle", message="no scheduled jobs pending")
+                _status_idle_or_decoding(idle_msg="no scheduled jobs pending")
                 last_status_update = now_ts
             sleep_s = min(POLL_INTERVAL_S, max(1, next_reload - now_ts))
         time.sleep(max(1, sleep_s))
