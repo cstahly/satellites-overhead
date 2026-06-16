@@ -267,6 +267,37 @@ def read_audit(limit=100):
     return list(reversed(records))
 
 
+def _merge_orbcomm_runs(passes, gap_s=120, max_window_s=1500, cap=16):
+    """Mirror of the daemon's _merge_orbcomm_passes so the CLI/API show the SAME
+    constellation windows the scheduler actually fires (the auto-plotter decodes every
+    ORBCOMM bird in view, so one window per overlapping cluster, highest-el `cap` kept)."""
+    if not passes:
+        return []
+    def dt(s): return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    ps = sorted(passes, key=lambda p: p["aos"])
+    merged, cur = [], dict(ps[0])
+    for p in ps[1:]:
+        if dt(p["aos"]) <= dt(cur["los"]) + timedelta(seconds=gap_s):
+            if dt(p["los"]) > dt(cur["los"]):
+                cur["los"] = p["los"]
+            if float(p.get("max_el", 0)) > float(cur.get("max_el", 0)):
+                cur["max_el"] = p["max_el"]; cur["name"] = p.get("name", cur.get("name"))
+        else:
+            merged.append(cur); cur = dict(p)
+    merged.append(cur)
+    out = []
+    for m in merged:
+        a = dt(m["aos"]); l = dt(m["los"]); d = int((l - a).total_seconds())
+        if d > max_window_s:
+            d = max_window_s
+            m["los"] = (a + timedelta(seconds=max_window_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        m["duration_s"] = d
+        out.append(m)
+    out.sort(key=lambda m: float(m.get("max_el", 0)), reverse=True)
+    out = out[:cap]
+    out.sort(key=lambda m: m["aos"])
+    return out
+
 def upcoming_scheduler_runs(hours=24, limit_per_rule=4):
     results = []
     parsed_tles_by_group = {}
@@ -280,7 +311,14 @@ def upcoming_scheduler_runs(hours=24, limit_per_rule=4):
             if group not in parsed_tles_by_group:
                 tles_text, _ = fetch_tle(group)
                 parsed_tles_by_group[group] = parse_tles(tles_text)
-            tles = select_tles(parsed_tles_by_group[group], set(), {int(rule["norad"])})
+            is_constellation = rule.get("constellation") == "orbcomm"
+            if is_constellation:
+                # whole ORBCOMM constellation, mirroring the daemon's constellation rule
+                tles = select_tles(parsed_tles_by_group[group], {"ORBCOMM"}, set())
+                pred_min_el, pred_limit = rule.get("min_peak_el", 40), 300
+            else:
+                tles = select_tles(parsed_tles_by_group[group], set(), {int(rule["norad"])})
+                pred_min_el, pred_limit = rule.get("min_peak_el", 10), limit_per_rule
             passes = predict_passes(
                 tles,
                 lat=LAT,
@@ -288,10 +326,16 @@ def upcoming_scheduler_runs(hours=24, limit_per_rule=4):
                 alt_m=ALT_M,
                 start=start,
                 hours=hours,
-                min_el=rule.get("min_peak_el", 10),
+                min_el=pred_min_el,
                 track_step_s=60,
-                limit=limit_per_rule,
+                limit=pred_limit,
             )
+            if is_constellation:
+                passes = _merge_orbcomm_runs(
+                    passes,
+                    cap=int(rule.get("max_windows", 16)),
+                    max_window_s=int(rule.get("max_capture_s", 1500)),
+                )
             start_offset_s = int(rule.get("start_offset_s", -30))
             end_offset_s = int(rule.get("end_offset_s", 60))
             for p in passes:

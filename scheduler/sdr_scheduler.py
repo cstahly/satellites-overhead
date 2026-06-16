@@ -78,10 +78,45 @@ def make_meteor_web_image(image_path, out_path):
 
 def push_meteor_image(capdir, name, max_el, captured_at_iso):
     """Push a Meteor MSA image to sadbabyrabbit.com/meteor/ and update index.json."""
-    image_path = os.path.join(capdir, "MSU-MR", "msu_mr_rgb_MSA_corrected_map.png")
-    if not os.path.exists(image_path):
-        log(f"PUSH SKIP — no MSA image in {capdir}/MSU-MR/")
+    # Prefer the MSA corrected+map image, but only if it actually has imagery.
+    # When Meteor isn't transmitting the IR channel, MSA renders blank (~10KB)
+    # while the visible AVHRR false-color composite is full — fall back to that so
+    # the gallery never pushes a blank. Objective size check only; no editorial
+    # choice (gradient/crossfade composites stay a manual, human decision).
+    _msu = os.path.join(capdir, "MSU-MR")
+    _msa = os.path.join(_msu, "msu_mr_rgb_MSA_corrected_map.png")
+    _avhrr = os.path.join(_msu, "msu_mr_rgb_AVHRR_3a21_False_Color_corrected.png")
+    _BLANK = 60000  # blank composites ~10KB; real imagery is 100KB+
+    if os.path.exists(_msa) and os.path.getsize(_msa) > _BLANK:
+        image_path = _msa
+    elif os.path.exists(_avhrr) and os.path.getsize(_avhrr) > _BLANK:
+        image_path = _avhrr
+        log(f"PUSH — MSA blank, using AVHRR false-color for {os.path.basename(capdir)}")
+    else:
+        log(f"PUSH SKIP — no usable composite in {capdir}/MSU-MR/")
         return
+
+    # Meteor LRPT renders upside-down on ASCENDING (northbound) passes. Re-predict
+    # the pass direction from its start time and rotate 180° so the gallery is
+    # always north-up (verified 2026-06-16: every user-flagged-inverted pass was
+    # ascending; descending passes were already correct). Rotate into a temp so the
+    # operation is idempotent and never mutates the satdump source.
+    _norad = {"METEOR-M2 3": 57166, "METEOR-M2 4": 59051}.get(name)
+    if _norad:
+        try:
+            _raw = subprocess.check_output(
+                ["python3", PREDICTOR, "--lat", str(LAT), "--lon", str(LON), "--alt-m", str(ALT_M),
+                 "--hours", "3", "--min-el", "5", "--norad", str(_norad),
+                 "--start", captured_at_iso, "--limit", "1", "--track-step-s", "120"],
+                text=True, timeout=30, stderr=subprocess.DEVNULL)
+            _trk = json.loads(_raw)[0]["track"]
+            if _trk[-1]["sub_lat"] > _trk[0]["sub_lat"]:   # ascending → upside down → flip
+                _rot = os.path.join(_msu, "_push_oriented.png")
+                subprocess.run(["magick", image_path, "-rotate", "180", _rot], check=True, timeout=60)
+                image_path = _rot
+                log(f"PUSH — ascending pass, rotated 180° for {os.path.basename(capdir)}")
+        except Exception as _e:
+            log(f"PUSH — orient check failed ({_e}); pushing as-is")
 
     ssh_opts = ["-o", "StrictHostKeyChecking=no", "-q", "-i", EC2_METEOR_KEY]
     scp_opts = ["-o", "StrictHostKeyChecking=no", "-i", EC2_METEOR_KEY]
@@ -552,17 +587,130 @@ def _merge_tles(path, fresh):
     with open(path, "w") as f:
         f.write("\n".join(out) + "\n")
 
+# satnogs 3le omits ORBCOMM, and CelesTrak (full catalog) is unreachable from this
+# box, so ORBCOMM TLEs silently go 10+ days stale -> pass-time predictions drift by
+# tens of minutes -> phantom passes / duplicate captures / 0-packet failure emails.
+# tle.ivanstanojevic.me IS reachable and per-NORAD queries dodge its page-size cap,
+# but it IP-blocks bursts. So we top up ONLY the enabled sats satnogs can't supply,
+# at most once / 12h per NORAD (purely time-gated — NOT epoch-gated, since a source
+# whose TLE never advances would otherwise be re-fetched forever). The throttle
+# stores a per-NORAD "next allowed" time and is bumped BEFORE the request, so a
+# crash/failure can't storm the API. With ~2 ORBCOMM birds that's <=4 requests/day.
+_IVAN_THROTTLE  = os.path.join(HOME, "src", "satellites-overhead", ".tlecache", "ivan_last.json")
+_IVAN_REFRESH_S = 12 * 3600   # on success, don't re-fetch this NORAD for 12h
+_IVAN_RETRY_S   = 1 * 3600    # on failure, allow a retry after 1h (not the full 12h)
+_IVAN_MAX_PER_CYCLE = 4       # cap fetches per refresh — spreads the ~17 ORBCOMM sats
+                              # over several cycles so we never burst the API (it
+                              # IP-blocks bursts; per-NORAD 12h throttle does the rest)
+
+def _tle_epoch_from_l1(l1):
+    """Epoch (UTC datetime) parsed from a TLE line-1, or None."""
+    try:
+        y = 2000 + int(l1[18:20]); doy = float(l1[20:32])
+        return datetime.datetime(y, 1, 1, tzinfo=datetime.timezone.utc) + \
+               datetime.timedelta(days=doy - 1)
+    except Exception:
+        return None
+
+def _cached_tle_epoch(path, norad):
+    """Epoch (UTC datetime) of the cached TLE for `norad`, or None if absent."""
+    if not os.path.exists(path):
+        return None
+    for l in open(path, errors="ignore").read().splitlines():
+        if l.startswith("1 ") and l[2:7].strip().isdigit() and int(l[2:7]) == norad:
+            return _tle_epoch_from_l1(l)
+    return None
+
+def _enabled_rule_norads():
+    try:
+        data = json.load(open(RULES_PATH))
+        rules = data if isinstance(data, list) else data.get("rules", [])
+        return [int(r["norad"]) for r in rules if r.get("enabled") and r.get("norad")]
+    except Exception:
+        return []
+
+def _orbcomm_cache_norads():
+    """Every ORBCOMM NORAD in the satdump cache. The orbcomm auto-plotter picks
+    which channels to demod from which sats it computes overhead (TLE-driven), so
+    ALL of them must stay fresh — not just the enabled rule's bird. Stale ones make
+    it target dead channels and decode nothing even on a strong signal."""
+    out = []
+    try:
+        lines = open(_SATDUMP_TLES, errors="ignore").read().splitlines()
+        for i, l in enumerate(lines):
+            if l.strip().upper().startswith("ORBCOMM") and i + 1 < len(lines) \
+               and lines[i + 1].startswith("1 ") and lines[i + 1][2:7].strip().isdigit():
+                out.append(int(lines[i + 1][2:7]))
+    except Exception:
+        pass
+    return out
+
+def _supplement_tles_from_ivan(satnogs_norads):
+    """Top up enabled sats satnogs can't supply (ORBCOMM) from ivanstanojevic, per
+    NORAD. Rate-limit safe: each NORAD is fetched at most once / 12h (faster only to
+    retry a failure), and the merge is newer-only so a stale source copy can never
+    downgrade a fresher cached TLE."""
+    import urllib.request
+    need = set(_enabled_rule_norads()) | set(_orbcomm_cache_norads())
+    need = [n for n in need if n not in satnogs_norads]
+    if not need:
+        return
+    try:
+        nxt = json.load(open(_IVAN_THROTTLE)) if os.path.exists(_IVAN_THROTTLE) else {}
+    except Exception:
+        nxt = {}
+    now = time.time()
+    # only those past their per-NORAD cooldown, stalest cached TLE first, capped per cycle
+    def _stale_key(n):
+        ep = _cached_tle_epoch(_SCHEDULER_TLE_CACHE, n)
+        return ep.timestamp() if ep else 0.0   # missing/oldest = highest priority
+    eligible = sorted((n for n in need if now >= float(nxt.get(str(n), 0))), key=_stale_key)
+    for norad in eligible[:_IVAN_MAX_PER_CYCLE]:
+        nxt[str(norad)] = now + _IVAN_RETRY_S   # anti-storm: block fast retry even if this fails
+        try:
+            req = urllib.request.Request(f"https://tle.ivanstanojevic.me/api/tle/{norad}",
+                                         headers={"User-Agent": "sdr-scheduler-tle/1"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.load(r)
+            l1, l2, nm = d.get("line1", ""), d.get("line2", ""), d.get("name", str(norad)).strip()
+            if not (l1.startswith("1 ") and l2.startswith("2 ") and int(l1[2:7]) == norad):
+                log(f"TLE ivan top-up — bad payload for {norad}")
+                continue
+            new_ep = _tle_epoch_from_l1(l1)
+            cached_ep = _cached_tle_epoch(_SCHEDULER_TLE_CACHE, norad)
+            if cached_ep and new_ep and new_ep <= cached_ep:
+                log(f"TLE ivan {nm} ({norad}) — source not newer than cache, kept")
+            else:
+                for p in (_SATDUMP_TLES, _SCHEDULER_TLE_CACHE):
+                    try:
+                        _merge_tles(p, {norad: (nm, l1, l2)})
+                    except Exception as e:
+                        log(f"TLE ivan merge fail {p} norad {norad} — {e}")
+                log(f"TLE ivan top-up — {nm} ({norad}) refreshed (satnogs lacks it)")
+            nxt[str(norad)] = now + _IVAN_REFRESH_S   # success: don't re-fetch for 12h
+        except Exception as e:
+            log(f"TLE ivan fetch failed norad {norad} ({e}) — keeping cached")
+        time.sleep(2)   # be gentle between per-NORAD requests
+    try:
+        with open(_IVAN_THROTTLE, "w") as f:
+            json.dump(nxt, f)
+    except Exception:
+        pass
+
 def refresh_satdump_tles():
     """Refresh TLEs from satnogs 3le into the satdump cache AND the predictor cache.
     Falls back to the existing caches (no-op) on failure so a fetch outage never
-    blanks the TLEs."""
+    blanks the TLEs. ORBCOMM (absent from satnogs) is topped up per-NORAD from
+    ivanstanojevic afterward."""
     import urllib.request
+    satnogs_norads = set()
     try:
         req = urllib.request.Request(_TLE_SOURCE, headers={"User-Agent": "sdr-scheduler-tle/1"})
         with urllib.request.urlopen(req, timeout=15) as r:
             data = r.read().decode("utf-8", errors="ignore")
         fresh = _parse_3le(data)
         if len(fresh) >= 100:
+            satnogs_norads = set(fresh)
             for p in (_SATDUMP_TLES, _SCHEDULER_TLE_CACHE):
                 try:
                     _merge_tles(p, fresh)
@@ -572,6 +720,11 @@ def refresh_satdump_tles():
             log(f"TLE refresh — only {len(fresh)} parsed, keeping existing cache")
     except Exception as e:
         log(f"TLE refresh fetch failed ({e}) — keeping existing cache")
+    # ORBCOMM & anything else satnogs can't supply: per-NORAD top-up (rate-limited)
+    try:
+        _supplement_tles_from_ivan(satnogs_norads)
+    except Exception as e:
+        log(f"TLE ivan supplement error ({e})")
     try:
         with open(_SATDUMP_SETTINGS) as f:
             cfg = json.load(f)
@@ -1045,7 +1198,47 @@ def load_scheduler_rules():
         data = json.load(f)
     return data if isinstance(data, list) else []
 
+def _merge_orbcomm_passes(passes, gap_s=120, max_window_s=1500, cap=16):
+    """Merge overlapping/adjacent constellation passes into single capture windows,
+    keep the highest-elevation `cap`, return sorted by time. The auto-plotter decodes
+    every ORBCOMM bird in view during a window, so one window per overlapping cluster
+    is all we need. Meteor (priority 1) still wins any device conflict downstream."""
+    if not passes:
+        return []
+    def dt(s): return datetime.datetime.fromisoformat(s)
+    ps = sorted(passes, key=lambda p: p["aos"])
+    merged, cur = [], dict(ps[0])
+    for p in ps[1:]:
+        if dt(p["aos"]) <= dt(cur["los"]) + datetime.timedelta(seconds=gap_s):
+            if dt(p["los"]) > dt(cur["los"]):
+                cur["los"] = p["los"]
+            if float(p.get("max_el", 0)) > float(cur.get("max_el", 0)):
+                cur["max_el"] = p["max_el"]; cur["name"] = p.get("name", cur.get("name"))
+        else:
+            merged.append(cur); cur = dict(p)
+    merged.append(cur)
+    for m in merged:
+        m["duration_s"] = min(int((dt(m["los"]) - dt(m["aos"])).total_seconds()), max_window_s)
+    merged.sort(key=lambda m: float(m.get("max_el", 0)), reverse=True)
+    merged = merged[:cap]
+    merged.sort(key=lambda m: m["aos"])
+    return merged
+
 def predict_rule_passes(rule, hours=24, limit=4):
+    # Constellation rule (ORBCOMM): the live auto-plotter decodes every bird in view,
+    # so we capture whenever ANY constellation member is high — predict them all and
+    # merge into windows. Requires all their TLEs fresh (see _supplement_tles_from_ivan).
+    if rule.get("constellation") == "orbcomm":
+        norads = _orbcomm_cache_norads() or [int(rule["norad"])]
+        cmd = ["python3", PREDICTOR, "--lat", str(LAT), "--lon", str(LON), "--alt-m", str(ALT_M),
+               "--hours", str(hours), "--min-el", str(rule.get("min_peak_el", 40)),
+               "--track-step-s", "120", "--limit", "300"]
+        for n in norads:
+            cmd += ["--norad", str(n)]
+        raw = subprocess.check_output(cmd, text=True)
+        return _merge_orbcomm_passes(json.loads(raw),
+                                     cap=int(rule.get("max_windows", 16)),
+                                     max_window_s=int(rule.get("max_capture_s", 1500)))
     cmd = [
         "python3", PREDICTOR,
         "--lat", str(LAT), "--lon", str(LON), "--alt-m", str(ALT_M),
@@ -1063,13 +1256,18 @@ def build_rule_jobs(rule, hours=24, limit=4):
         start_offset_s = int(rule.get("start_offset_s", -30))
         end_offset_s = int(rule.get("end_offset_s", 60))
         fire_dt = iso_to_local_dt(p["aos"]) + datetime.timedelta(seconds=start_offset_s)
-        fire_time = fire_dt.strftime("%H:%M")
+        # Keep the FULL dated datetime (manual jobs already do — see build_scan_now_job).
+        # A bare "HH:MM" lost the date, so job_fire_dt() resolved it against today, and
+        # predict_rule_passes returns ~4 passes spanning 24-30h: a NEXT-DAY pass at the
+        # same clock time (Meteor drifts ~22 min/day) aliased onto TODAY and fired ~22 min
+        # early as a phantom carrying the wrong day's elevation. That was every "duplicate".
+        fire_time = fire_dt
         lna = int(rule.get("lna_gain", 32))
         vga = int(rule.get("vga_gain", 48))
         amp = int(rule.get("amp", 1))
         if float(p.get("max_el", 0)) >= 60:
             vga = max(0, vga - 12)
-        aos_local = fire_time.replace(":", "")
+        aos_local = fire_dt.strftime("%H%M")
         duration_s = max(1, int(p["duration_s"]) - start_offset_s + end_offset_s)
         freq = float(rule["frequency_hz"])
         label = f"{rule.get('name', p['name'])} {float(p['max_el']):.1f}deg"
@@ -1412,7 +1610,29 @@ def run_job(ptype, kwargs):
                         for ln in summary.splitlines():
                             log(f"ORBCOMM {ln.strip()}")
                         lbl = run_kwargs.get("label", name)
-                        send_pass_email(f"SAT PASS: {lbl} — ORBCOMM decode", summary + "\n")
+                        # Subject must reflect the outcome — it was always "ORBCOMM decode",
+                        # so a 3049-packet/14-fix success and a 0-packet dud looked identical
+                        # in the inbox (you could never tell a success from a failure).
+                        pkts = fixes = 0
+                        for ln in summary.splitlines():
+                            s = ln.strip()
+                            if s.startswith("ORBCOMM decode:"):
+                                try:
+                                    pkts = int(s.split("ORBCOMM decode:")[1].split("Fletcher")[0])
+                                except Exception:
+                                    pass
+                            elif "ephemeris fix(es)" in s:
+                                try:
+                                    fixes = int(s.split("ephemeris fix(es)")[0])
+                                except Exception:
+                                    pass
+                        if fixes > 0:
+                            tag = f"DECODED — {fixes} fix{'es' if fixes != 1 else ''}, {pkts} pkts"
+                        elif pkts > 0:
+                            tag = f"partial — {pkts} pkts, no fixes"
+                        else:
+                            tag = "NO DATA"
+                        send_pass_email(f"SAT PASS: {lbl} — ORBCOMM {tag}", summary + "\n")
                 except Exception as e:
                     log(f"ORBCOMM EPHEM FAIL {name} — {e}")
         elif source == "rtlsdr":
@@ -1523,13 +1743,14 @@ def scheduler_loop():
                 last_next = None
             next_reload = now_ts + RELOAD_INTERVAL_S
 
-        # NOTE: deliberately NO same-satellite "pass dedup" here. A TLE refresh can
-        # produce two predictions for one pass at different times/elevations; they
-        # are NOT redundant — one may be wrong (empty window) and the other real.
-        # Suppressing the "duplicate" once cost us the only good M2-4 pass of the
-        # week (2026-06-14). job_key (fire-minute + label) still stops a single
-        # job double-firing; that's all the dedup we want. Capture both windows —
-        # disk is cheap, missed intermittent passes are not.
+        # NOTE: the "two predictions for one pass" we used to see was NOT a TLE-refresh
+        # artifact — it was the date-less HH:MM bug above: next-day passes aliased onto
+        # today and fired ~22 min early as phantoms. That also explains why adding
+        # same-sat dedup once "cost us" the 2026-06-14 M2-4 pass — the phantom fires
+        # FIRST, so dedup marked the sat done and skipped the REAL pass. With dated
+        # fire_times the phantom is gone and job_key is date-qualified, so no extra
+        # dedup is needed: a real pass and any genuine back-to-back pass keep distinct
+        # keys, and a single job still can't double-fire.
         due = [job for job in jobs
                if job_key(job) not in completed
                and job_fire_dt(job[0]) <= now]
